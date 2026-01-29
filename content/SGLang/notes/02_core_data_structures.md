@@ -10,6 +10,38 @@
 
 SGLang 的批次数据在不同层级有不同的表示：
 
+```mermaid
+flowchart TB
+    subgraph Input["用户输入"]
+        GRI["GenerateReqInput<br/>(text, image, sampling_params)"]
+    end
+    
+    subgraph Tokenize["Tokenize 层"]
+        TGRI["TokenizedGenerateReqInput<br/>(input_ids, mm_inputs)"]
+    end
+    
+    subgraph Schedule["调度层 (CPU)"]
+        REQ["Req<br/>单请求完整状态"]
+        SB["ScheduleBatch<br/>批次抽象"]
+    end
+    
+    subgraph Worker["Worker 层"]
+        MWB["ModelWorkerBatch<br/>传递给 TPWorker"]
+    end
+    
+    subgraph GPU["GPU 层"]
+        FB["ForwardBatch<br/>GPU Tensor + Attention"]
+    end
+    
+    GRI --> |"TokenizerManager"| TGRI
+    TGRI --> |"Scheduler.handle_generate_request()"| REQ
+    REQ --> |"ScheduleBatch.init_new()"| SB
+    SB --> |"batch.get_model_worker_batch()"| MWB
+    MWB --> |"ForwardBatch.init_new()"| FB
+```
+
+**详细层级关系**:
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                          数据流转换流程                                      │

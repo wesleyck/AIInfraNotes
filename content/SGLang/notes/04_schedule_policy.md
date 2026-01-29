@@ -22,7 +22,7 @@
 │  │    (缓存感知策略)            │   │    (缓存无关策略)                   │  │
 │  │                             │   │                                     │  │
 │  │  • LPM (longest prefix      │   │  • FCFS (first come first serve)   │  │
-│  │    match) ★ 默认            │   │    先进先出                         │  │
+│  │    match)                   │   │    先进先出 ★ 默认                  │  │
 │  │  • DFS_WEIGHT               │   │  • LOF (longest output first)      │  │
 │  │    深度优先权重              │   │    最长输出优先                     │  │
 │  │                             │   │  • RANDOM 随机                      │  │
@@ -62,6 +62,39 @@ class SchedulePolicy:
 
 ### 2.2 calc_priority 流程
 
+```mermaid
+flowchart TB
+    Start["calc_priority(waiting_queue)"] --> FCFS_Check{"policy == FCFS?"}
+    
+    FCFS_Check -->|Yes| PrioritySort{"enable_priority<br/>_scheduling?"}
+    PrioritySort -->|Yes| SortFCFS["_sort_by_priority_and_fcfs()"]
+    PrioritySort -->|No| Return1["return (保持 FCFS 顺序)"]
+    SortFCFS --> Return1
+    
+    FCFS_Check -->|No| Degrade{"LPM && queue > 128?"}
+    Degrade -->|Yes| ToFCFS["降级为 FCFS"]
+    Degrade -->|No| PolicyType{"策略类型?"}
+    
+    ToFCFS --> Return1
+    
+    PolicyType -->|CacheAwarePolicy| ComputePrefix["_compute_prefix_matches()"]
+    PolicyType -->|CacheAgnosticPolicy| Agnostic{"具体策略?"}
+    
+    ComputePrefix --> CacheAware{"具体策略?"}
+    CacheAware -->|LPM| SortLPM["_sort_by_longest_prefix()"]
+    CacheAware -->|DFS_WEIGHT| SortDFS["_sort_by_dfs_weight()"]
+    
+    Agnostic -->|LOF| SortLOF["_sort_by_longest_output()"]
+    Agnostic -->|RANDOM| SortRandom["_sort_randomly()"]
+    
+    SortLPM --> Return2["return"]
+    SortDFS --> Return2
+    SortLOF --> Return2
+    SortRandom --> Return2
+```
+
+**详细流程图**:
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                    calc_priority() 流程                                      │
@@ -97,7 +130,7 @@ class SchedulePolicy:
 
 ## 3. LPM 策略 (Longest Prefix Match)
 
-**默认策略**，优先选择与现有缓存匹配最长前缀的请求。
+优先选择与现有缓存匹配最长前缀的请求，适用于高缓存命中率场景。
 
 ### 3.1 前缀匹配计算
 
@@ -105,7 +138,7 @@ class SchedulePolicy:
 def _compute_prefix_matches(self, waiting_queue: List[Req], policy):
     for r in waiting_queue:
         prefix_ids = r.origin_input_ids + r.output_ids
-        extra_key = r.extra_key  # 多模态 hash
+        extra_key = r.extra_key  # LoRA adapter ID 或 cache_salt
 
         # 查询 tree_cache 获取匹配结果
         match_result = self.tree_cache.match_prefix(
@@ -487,7 +520,7 @@ total_tokens = req.extend_input_len + min(
 
 | 参数 | 默认值 | 环境变量 | 说明 |
 |------|--------|----------|------|
-| `schedule_policy` | "lpm" | - | 调度策略 |
+| `schedule_policy` | "fcfs" | - | 调度策略 |
 | `CLIP_MAX_NEW_TOKENS` | 4096 | `SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION` | max_new_tokens 裁剪 |
 | `IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD` | 32 | 同名 | In-batch 检查阈值 |
 | `IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD` | 32 | 同名 | In-batch 降优先级阈值 |
@@ -497,7 +530,7 @@ total_tokens = req.extend_input_len + min(
 
 | 场景 | 推荐策略 | 原因 |
 |------|----------|------|
-| 通用场景 | LPM (默认) | 最大化缓存命中 |
+| 通用场景 | FCFS (默认) | 先到先服务，保证公平 |
 | 长队列 (>128) | 自动降级 FCFS | LPM 计算开销大 |
 | 树状对话 | DFS-WEIGHT | 优化缓存局部性 |
 | 公平性要求高 | FCFS | 先到先服务 |

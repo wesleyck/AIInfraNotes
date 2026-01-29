@@ -121,6 +121,30 @@ def forward(
 
 **执行流程**:
 
+```mermaid
+flowchart TB
+    Start["forward(forward_batch)"] --> GraphCheck{"可以使用<br/>CUDA Graph?"}
+    
+    GraphCheck -->|Yes| Replay["graph_runner.replay()"]
+    GraphCheck -->|No| ModeCheck{"forward_mode?"}
+    
+    ModeCheck -->|DECODE| Decode["forward_decode()"]
+    ModeCheck -->|EXTEND| Extend["forward_extend()"]
+    ModeCheck -->|SPLIT_PREFILL| Split["forward_split_prefill()"]
+    ModeCheck -->|IDLE| Idle["forward_idle()"]
+    
+    Decode --> Output["ModelRunnerOutput<br/>(logits_output)"]
+    Extend --> Output
+    Split --> Output
+    Idle --> Output
+    Replay --> Output
+    
+    style Replay fill:#90EE90
+    style Output fill:#87CEEB
+```
+
+**详细流程图**:
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                         ModelRunner.forward 流程                             │

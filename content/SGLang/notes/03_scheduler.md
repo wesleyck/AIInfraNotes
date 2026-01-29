@@ -289,6 +289,37 @@ def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
 
 这是调度的统一入口，决定下一个要运行的批次。
 
+```mermaid
+flowchart TB
+    Start["get_next_batch_to_run()"] --> ChunkedCheck{"chunked_req<br/>存在?"}
+    
+    ChunkedCheck -->|Yes| CacheChunked["缓存 chunked_req 到 tree_cache<br/>释放 req_pool_idx"]
+    ChunkedCheck -->|No| MergeCheck
+    CacheChunked --> MergeCheck
+    
+    MergeCheck{"last_batch 是<br/>EXTEND 模式?"}
+    MergeCheck -->|Yes| MergeBatch["filter_batch() 移除已完成请求<br/>running_batch.merge_batch(last_batch)"]
+    MergeCheck -->|No| GetPrefill
+    MergeBatch --> GetPrefill
+    
+    GetPrefill["new_batch = get_new_batch_prefill()"]
+    GetPrefill --> PrefillCheck{"new_batch<br/>不为 None?"}
+    
+    PrefillCheck -->|Yes| ReturnPrefill["return new_batch<br/>(优先 Prefill)"]
+    PrefillCheck -->|No| RunningCheck{"running_batch<br/>不为空?"}
+    
+    RunningCheck -->|Yes| UpdateDecode["update_running_batch()<br/>return running_batch"]
+    RunningCheck -->|No| ReturnNone["return None (空闲)"]
+    
+    style ReturnPrefill fill:#90EE90
+    style UpdateDecode fill:#87CEEB
+    style ReturnNone fill:#FFB6C1
+```
+
+**调度优先级**: **Prefill > Decode**
+
+**详细流程图**:
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                     get_next_batch_to_run() 流程图                          │

@@ -280,6 +280,49 @@ waiting_queue → get_new_batch_prefill() → prefill 完成 → 合并到 runni
 
 一个包含图像的生成请求的完整流程：
 
+```mermaid
+sequenceDiagram
+    participant User
+    participant HTTP as HTTP Server
+    participant TM as TokenizerManager
+    participant Sched as Scheduler
+    participant GPU as TPWorker (GPU)
+    participant Detok as Detokenizer
+
+    User->>HTTP: POST /generate (text + image)
+    HTTP->>TM: handle_generate_request()
+    
+    Note over TM: tokenize(text) → input_ids
+    Note over TM: QwenVLImageProcessor<br/>处理图像/计算 M-ROPE
+    
+    TM->>Sched: ZMQ send (TokenizedGenerateReqInput)
+    
+    Note over Sched: 创建 Req, 加入 waiting_queue
+    
+    loop Event Loop
+        Sched->>Sched: get_next_batch_to_run()
+        
+        alt Prefill Phase
+            Note over Sched: get_new_batch_prefill()<br/>查询 RadixCache, 分配 KV
+            Sched->>GPU: run_batch(EXTEND)
+            GPU-->>Sched: logits → sample → next_token
+        else Decode Phase
+            Note over Sched: update_running_batch()
+            Sched->>GPU: run_batch(DECODE)
+            GPU-->>Sched: next_token
+        end
+        
+        Sched->>Sched: process_batch_result()<br/>更新 output_ids, 检查终止
+        Sched->>Detok: ZMQ send (token_ids)
+    end
+    
+    Detok->>TM: ZMQ send (decoded text)
+    TM->>HTTP: return
+    HTTP->>User: Response (stream/complete)
+```
+
+**详细步骤分解**:
+
 ```
 1. 用户请求到达 (包含图像 + 文本)
    │

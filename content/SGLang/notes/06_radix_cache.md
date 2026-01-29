@@ -97,6 +97,25 @@ class TreeNode:
 
 ### 2.3 Radix Tree 结构示例
 
+```mermaid
+graph TD
+    Root["[root]"] --> Node12["[1, 2]<br/>KV: [idx0, idx1]"]
+    Root --> Node8["[8,9,10,11,12]<br/>KV: [idx4..idx8]"]
+    
+    Node12 --> Node3["[3]<br/>KV: [idx2]"]
+    Node12 --> Node4567["[4,5,6,7]<br/>KV: [idx3..idx6]"]
+    
+    Node3 --> Node45["[4, 5]<br/>KV: [idx7, idx8]"]
+    
+    style Root fill:#f9f,stroke:#333
+    style Node12 fill:#bbf,stroke:#333
+    style Node3 fill:#bfb,stroke:#333
+    style Node4567 fill:#bfb,stroke:#333
+    style Node45 fill:#fbf,stroke:#333
+    style Node8 fill:#bbf,stroke:#333
+```
+
+**插入序列说明**:
 ```
 插入序列:
   [1, 2, 3]
@@ -142,6 +161,25 @@ def match_prefix(self, key: RadixKey, **kwargs) -> MatchResult:
 ```
 
 **匹配流程**:
+
+```mermaid
+flowchart LR
+    subgraph Input
+        Key["key = [1, 2, 3, 4, 5, 6]"]
+    end
+    
+    Root["root"] --> |"children[1]"| N12["[1,2]<br/>✓ 匹配 2"]
+    N12 --> |"children[3]"| N3["[3]<br/>✓ 匹配 1"]
+    N3 --> |"children[4]"| N45["[4,5]<br/>✓ 匹配 2"]
+    N45 --> |"children[6]"| Miss["❌ 不存在"]
+    
+    Miss --> Result["返回: 5 个 token 的 KV 索引"]
+    
+    style Result fill:#90EE90
+    style Miss fill:#FFB6C1
+```
+
+**详细步骤**:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐

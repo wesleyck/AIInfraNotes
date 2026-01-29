@@ -12,6 +12,33 @@
 - `srt/mem_cache/memory_pool_host.py` - Host 内存池
 - `srt/mem_cache/radix_cache.py` - 前缀缓存 (Tree Cache)
 
+```mermaid
+graph TB
+    subgraph Layer1["Layer 1: Request → Token 映射"]
+        RTP["ReqToTokenPool<br/>req_to_token: [size, max_context_len]<br/>free_slots: List[int]"]
+    end
+    
+    subgraph Layer2["Layer 2: Token → KV Cache"]
+        ALLOC["TokenToKVPoolAllocator<br/>free_pages: Tensor[int64]"]
+        KV["KVCache<br/>k_buffer: [layer_num × (size, H, D)]<br/>v_buffer: [layer_num × (size, H, D)]"]
+    end
+    
+    subgraph Cache["缓存管理"]
+        TC["Tree Cache (RadixCache)<br/>• 管理前缀共享<br/>• LRU 逐出策略"]
+    end
+    
+    RTP --> |"KV 索引"| ALLOC
+    ALLOC --> |"物理位置"| KV
+    TC --> |"持有引用"| ALLOC
+    TC --> |"逐出时释放"| ALLOC
+    
+    style Layer1 fill:#e1f5fe
+    style Layer2 fill:#fff3e0
+    style Cache fill:#f3e5f5
+```
+
+**详细架构图**:
+
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │                           内存池两层架构                                      │

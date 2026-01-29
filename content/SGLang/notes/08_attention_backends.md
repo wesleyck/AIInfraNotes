@@ -563,6 +563,30 @@ def forward_extend(self, q, k, v, layer, forward_batch, save_kv_cache=True):
 
 ### 8.1 自动选择优先级
 
+```mermaid
+flowchart TB
+    Start["后端选择"] --> Platform{"平台检测"}
+    
+    Platform -->|"NVIDIA SM100+"| TRTLLM["trtllm_mha"]
+    Platform -->|"NVIDIA SM90"| FA3["fa3"]
+    Platform -->|"NVIDIA SM80+"| NVIDIA{"模型类型?"}
+    Platform -->|"AMD HIP"| AITER["aiter"]
+    Platform -->|"Intel XPU"| INTEL_XPU["intel_xpu"]
+    Platform -->|"Intel CPU"| INTEL_AMX["intel_amx"]
+    Platform -->|"华为 NPU"| ASCEND["ascend"]
+    Platform -->|其他| TRITON["triton"]
+    
+    NVIDIA -->|"MLA 模型"| FLASHINFER_MLA["flashinfer_mla"]
+    NVIDIA -->|"NSA 模型"| NSA["nsa"]
+    NVIDIA -->|"通用"| FLASHINFER["flashinfer"]
+    
+    style FLASHINFER fill:#90EE90
+    style FA3 fill:#87CEEB
+    style TRITON fill:#FFB6C1
+```
+
+**详细路由图**:
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                      后端自动选择逻辑                                        │

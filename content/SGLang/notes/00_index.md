@@ -55,9 +55,10 @@ Phase 6: Kernel 实现
 
 ### Phase 5: 高级特性
 - [x] `11_chunked_prefill.md` - 分块预填充
-- [ ] `12_speculative_decoding.md` - EAGLE、NGram 投机解码
-- [ ] `13_parallel_strategies.md` - TP/PP/EP/DP 并行策略
-- [ ] `14_pd_disaggregation.md` - Prefill-Decode 分离
+- [x] `12_speculative_decoding.md` - EAGLE、NGram 投机解码
+- [x] `13_parallel_strategies.md` - TP/PP/EP/DP 并行策略
+- [x] `14_pd_disaggregation.md` - Prefill-Decode 分离
+
 
 ### Phase 6: Kernel 实现
 - [ ] `15_sgl_kernel_overview.md` - sgl-kernel 架构
