@@ -450,83 +450,16 @@ def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
     return batch
 ```
 
-## 5. PrefillAdder 详解
+## 5. PrefillAdder
 
 **文件**: `schedule_policy.py:316`
 
-PrefillAdder 负责选择要 prefill 的请求，管理 token 预算。
+PrefillAdder 负责选择要 prefill 的请求，管理三层 token 预算 (总预算 / 输入预算 / 分块预算)。核心流程：
+- 计算每个请求的 token 需求 (`extend_input_len + max_new_tokens`)
+- 在预算允许范围内依次添加请求到 `can_run_list`
+- 支持 chunked prefill：预算不够时截断请求
 
-### 5.1 Token 预算管理
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         PrefillAdder Token 预算                             │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  rem_total_tokens = available_tokens + evictable_tokens - reserved_tokens   │
-│                                                                              │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │ 预算组成:                                                            │    │
-│  │                                                                       │    │
-│  │ available_tokens   = token_to_kv_pool_allocator.available_size()    │    │
-│  │                      (空闲的 KV cache slots)                         │    │
-│  │                                                                       │    │
-│  │ evictable_tokens   = tree_cache.evictable_size()                    │    │
-│  │                      (可驱逐的缓存 token)                            │    │
-│  │                                                                       │    │
-│  │ reserved_tokens    = running_batch 请求的预估新 token                │    │
-│  │                      (new_token_ratio * max_new_tokens)              │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                                                              │
-│  预算检查:                                                                   │
-│  ├─ rem_total_tokens > 0      → 总 token 预算                               │
-│  ├─ rem_input_tokens > 0      → 输入 token 预算 (max_prefill_tokens)        │
-│  └─ rem_chunk_tokens > 0      → 分块 token 预算 (chunked_prefill_size)      │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-### 5.2 add_one_req 流程
-
-```python
-def add_one_req(self, req: Req, has_chunked_req: bool, ...):
-    # 1. 计算 token 需求
-    total_tokens = req.extend_input_len + min(max_new_tokens, CLIP_MAX_NEW_TOKENS)
-
-    # 2. 检查总预算
-    if total_tokens >= self.rem_total_tokens:
-        return AddReqResult.NO_TOKEN
-
-    # 3. 检查输入预算
-    if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
-        return AddReqResult.OTHER
-
-    # 4. 锁定前缀节点 (防止被驱逐)
-    with self._lock_node(req.last_node):
-        # 5a. 非 chunked prefill
-        if self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
-            self.can_run_list.append(req)
-            self.tree_cache.inc_lock_ref(req.last_node)
-            self._update_prefill_budget(prefix_len, input_tokens, max_new_tokens)
-
-        # 5b. Chunked prefill
-        else:
-            trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
-            req.set_extend_input_len(trunc_len)
-            self.can_run_list.append(req)
-            self.new_chunked_req = req
-
-    return self.budget_state()
-```
-
-### 5.3 AddReqResult 状态
-
-```python
-class AddReqResult(Enum):
-    CONTINUE = auto()    # 可以继续添加请求
-    NO_TOKEN = auto()    # token 预算不足
-    OTHER = auto()       # 其他原因 (如达到批次限制)
-```
+> **详细说明**: PrefillAdder 的预算计算、`add_one_req` 流程、chunked prefill 分块逻辑及 AddReqResult 状态见 **04_schedule_policy.md**。
 
 ## 6. 调度策略 (SchedulePolicy)
 
@@ -1066,5 +999,5 @@ logger.error(f"Grammar accept_token failed for req {req.rid}")
 ## 21. 下一步
 
 - **04**: 调度策略深入 (DFS-weight、In-batch prefix caching)
-- **05**: KV Cache 管理与 RadixCache
-- **06**: Chunked Prefill 与动态分块
+- **05**: 内存池设计 (ReqToTokenPool, KVCache)
+- **06**: RadixCache 前缀缓存

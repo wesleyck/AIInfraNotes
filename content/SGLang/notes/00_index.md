@@ -11,6 +11,37 @@
 > - Overlap Schedule (`event_loop_overlap`)
 > - 多模态缓存 (Multimodal Cache)
 
+## 端到端 Pipeline
+
+```
+HTTP Request
+    │
+    ▼
+┌────────────────┐     ┌─────────────────┐     ┌───────────────┐
+│  HTTP Server   │────►│ TokenizerManager │────►│   Scheduler   │
+│  (FastAPI)     │     │  (tokenize +     │ ZMQ │  (调度批次)    │
+│                │     │   多模态预处理)   │     │               │
+└────────────────┘     └─────────────────┘     └───────┬───────┘
+                                                        │
+                              ┌──────────────────────────┘
+                              ▼
+                       ┌─────────────┐     ┌──────────────┐
+                       │ ModelRunner │────►│   Sampling    │
+                       │ (模型前向)   │     │ (logits→token)│
+                       └─────────────┘     └──────┬───────┘
+                                                   │
+                              ┌─────────────────────┘
+                              ▼
+                       ┌──────────────┐     ┌───────────────┐
+                       │  Constrained │────►│ Detokenizer   │
+                       │  Generation  │     │ (token→text)  │
+                       │ (Grammar/    │     │               │
+                       │  StructTag)  │     └───────┬───────┘
+                       └──────────────┘             │
+                                                    ▼
+                                              HTTP Response
+```
+
 ## 学习路线
 
 学习采用**自顶向下**的方式：先理解全局架构，再逐层深入细节。
@@ -29,6 +60,8 @@ Phase 4: 模型执行层
 Phase 5: 高级特性
     ↓
 Phase 6: Kernel 实现
+    ↓
+Phase 7: 生成与约束
 ```
 
 ## 笔记目录
@@ -59,11 +92,17 @@ Phase 6: Kernel 实现
 - [x] `13_parallel_strategies.md` - TP/PP/EP/DP 并行策略
 - [x] `14_pd_disaggregation.md` - Prefill-Decode 分离
 
-
 ### Phase 6: Kernel 实现
-- [ ] `15_sgl_kernel_overview.md` - sgl-kernel 架构
-- [ ] `16_attention_kernels.md` - Attention kernel 实现
-- [ ] `17_moe_kernels.md` - MoE kernel 实现
+- [x] `15_sgl_kernel_overview.md` - sgl-kernel 架构
+- [x] `16_attention_kernels.md` - Attention kernel 实现
+- [x] `17_moe_kernels.md` - MoE kernel 实现
+- [x] `18_quantization.md` - 量化实现详解
+
+### Phase 7: 生成与约束
+- [x] `19_sampling_and_generation.md` - 采样参数、惩罚机制、LogitsProcessor、Sampler
+- [x] `20_constrained_generation.md` - Grammar Backend、JSON Schema、词表掩码、跳跃解码
+- [x] `21_reasoning_and_function_call.md` - 推理解析 (ReasoningParser)、函数调用 (FunctionCallParser)
+- [ ] `22_lora.md` - LoRA 适配器 (S-LoRA, Punica) *(待编写)*
 
 ## 核心文件速查
 
@@ -84,6 +123,15 @@ Phase 6: Kernel 实现
 | 多模态 | `srt/multimodal/processors/qwen_vl.py` | 223 | QwenVLImageProcessor |
 | Attention | `srt/layers/attention/` | - | 各种 Attention 后端 |
 | 投机 | `srt/speculative/eagle_worker.py` | - | EAGLE 实现 |
+| 采样 | `srt/sampling/sampling_params.py` | - | SamplingParams 定义 |
+| 采样 | `srt/sampling/sampling_batch_info.py` | - | 批次采样状态 |
+| 采样 | `srt/layers/sampler.py` | - | Sampler (logits→token) |
+| 惩罚 | `srt/sampling/penaltylib/` | - | 频率/存在/最小长度惩罚 |
+| 约束 | `srt/constrained/base_grammar_backend.py` | - | Grammar 后端基类 |
+| 约束 | `srt/constrained/xgrammar_backend.py` | - | XGrammar 后端 |
+| 推理解析 | `srt/parser/reasoning_parser.py` | - | ReasoningParser |
+| 函数调用 | `srt/function_call/function_call_parser.py` | - | FunctionCallParser |
+| 函数调用 | `srt/function_call/base_format_detector.py` | - | 检测器基类 |
 
 ## 学习建议
 

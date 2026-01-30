@@ -385,113 +385,13 @@ sequenceDiagram
 SGLang 的批次数据在不同层级有不同的表示，形成完整的转换链：
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          数据结构转换链                                      │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  GenerateReqInput (用户输入)                                                 │
-│       │  io_struct.py                                                        │
-│       │  - text, image_data, video_data, sampling_params                     │
-│       ▼                                                                      │
-│  TokenizedGenerateReqInput (tokenize 后)                                    │
-│       │  io_struct.py                                                        │
-│       │  - rid, input_ids, mm_inputs, sampling_params                        │
-│       ▼                                                                      │
-│  Req (请求级别) ★ 调度核心数据结构                                           │
-│       │  schedule_batch.py:484                                               │
-│       │  - 单个请求的完整生命周期状态                                        │
-│       │  - origin_input_ids, output_ids, fill_ids                            │
-│       │  - multimodal_inputs, prefix_indices                                 │
-│       │  - kv_committed_len, kv_allocated_len                                │
-│       │  - finished_reason, sampling_params                                  │
-│       ▼                                                                      │
-│  ScheduleBatch (调度级别)                                                    │
-│       │  schedule_batch.py:1156                                              │
-│       │  - Scheduler 管理的批次抽象                                          │
-│       │  - reqs: List[Req]                                                   │
-│       │  - forward_mode, multimodal_inputs                                   │
-│       │  - req_pool_indices, seq_lens, out_cache_loc                         │
-│       ▼  batch.get_model_worker_batch()                                      │
-│  ModelWorkerBatch (Worker 级别)                                              │
-│       │  schedule_batch.py:2189                                              │
-│       │  - 传递给 TPWorker 的数据                                            │
-│       │  - 去除调度层专属信息 (tree_cache, req_to_token_pool)                │
-│       ▼  ForwardBatch.init_new(batch, model_runner)                          │
-│  ForwardBatch (GPU 级别) ★ 模型前向核心数据结构                              │
-│       forward_batch_info.py:227                                              │
-│       - ModelRunner 管理的 GPU Tensor                                        │
-│       - positions, attn_backend, token_to_kv_pool                            │
-│       - mrope_positions (Qwen3-VL M-ROPE)                                    │
-│       - extend_start_loc, extend_prefix_lens                                 │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
+GenerateReqInput → TokenizedGenerateReqInput → Req → ScheduleBatch
+    → ModelWorkerBatch → ForwardBatch
 ```
 
-### 5.1 Req - 请求级别核心
+> **详细说明**: 各数据结构的字段定义、转换方法及生命周期管理见 **02_core_data_structures.md**。
 
-**文件**: `schedule_batch.py:484`
-
-```python
-class Req:
-    """单个请求的完整生命周期状态"""
-
-    # 输入输出
-    rid: str                              # 请求唯一 ID
-    origin_input_ids: List[int]           # 原始输入 token IDs
-    output_ids: List[int]                 # 生成的 token IDs
-    fill_ids: List[int]                   # origin_input_ids + output_ids
-
-    # KV Cache 管理
-    req_pool_idx: int                     # 在内存池中的索引
-    kv_committed_len: int                 # 已确认的 KV 长度
-    kv_allocated_len: int                 # 已分配的 KV 长度
-
-    # 前缀缓存
-    prefix_indices: torch.Tensor          # 命中缓存的 KV 索引
-    extend_input_len: int                 # 需要计算的 token 数
-
-    # 多模态 (Qwen3-VL)
-    multimodal_inputs: MultimodalInputs   # 图像/视频特征 + M-ROPE 位置
-
-    # 完成状态
-    finished_reason: BaseFinishReason     # EOS/LENGTH/STOP_STR/ABORT
-```
-
-### 5.2 ForwardBatch - GPU 级别核心
-
-**文件**: `forward_batch_info.py:227`
-
-```python
-class ForwardBatch:
-    """存储模型前向所需的全部 GPU Tensor"""
-
-    # 基础信息
-    forward_mode: ForwardMode             # EXTEND/DECODE/MIXED
-    batch_size: int
-    input_ids: torch.Tensor               # [total_tokens]
-    positions: torch.Tensor               # 位置编码
-
-    # KV Cache
-    req_pool_indices: torch.Tensor        # 请求在内存池的索引
-    seq_lens: torch.Tensor                # 每个请求的序列长度
-    out_cache_loc: torch.Tensor           # KV 写入位置
-
-    # Attention 后端
-    attn_backend: AttentionBackend        # FlashInfer/FlashAttention
-    req_to_token_pool: ReqToTokenPool     # 请求→token 映射
-    token_to_kv_pool: KVCache             # token→KV 映射
-
-    # 多模态 (Qwen3-VL)
-    mm_inputs: List[MultimodalInputs]
-    mrope_positions: torch.Tensor         # [3, seq_len] M-ROPE 位置
-
-    # Extend 专用
-    extend_num_tokens: int                # 需要计算的 token 数
-    extend_start_loc: torch.Tensor        # 每个请求的起始位置
-    extend_prefix_lens: torch.Tensor      # 每个请求的前缀长度
-```
-
-### 5.3 输出数据
+**输出数据**:
 
 ```python
 # Token 输出 (io_struct.py)

@@ -714,7 +714,7 @@ for req in running_batch.reqs:
 
 ## 9. 下一步
 
-- **03**: 调度策略与 PrefillAdder
-- **04**: KV Cache 管理与 RadixCache
-- **05**: 多模态处理流程 (Qwen3-VL)
-- **06**: PD 分离架构
+- **03**: Scheduler 事件循环、批次调度、retraction
+- **04**: 调度策略与 PrefillAdder
+- **05**: 内存池设计 (ReqToTokenPool, KVCache)
+- **06**: RadixCache 前缀缓存

@@ -749,5 +749,5 @@ python -m sglang.launch_server ... \
 
 ## 13. 下一步
 
-- **09**: Chunked Prefill 详解
-- **10**: 投机解码 (EAGLE, NGram)
+- **09**: 模型加载、权重处理、量化支持
+- **10**: 多模态完整生命周期 (Qwen3-VL)
