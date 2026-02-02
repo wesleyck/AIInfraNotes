@@ -4,29 +4,19 @@
 
 Attention 后端是 SGLang 中负责执行注意力计算的核心组件。不同的后端针对不同的硬件和场景进行了优化。
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        Attention Backend 架构                                │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  ModelRunner                                                                 │
-│      │                                                                       │
-│      └── attn_backend: AttentionBackend                                     │
-│              │                                                               │
-│              ├── FlashInferAttnBackend (默认, NVIDIA SM80+)                 │
-│              ├── FlashAttentionBackend (FA3/FA4, SM80-SM90)                 │
-│              ├── TritonAttnBackend (跨平台)                                  │
-│              ├── AiterAttnBackend (AMD Hip)                                 │
-│              ├── FlashMLABackend (MLA 专用)                                  │
-│              ├── TRTLLMMLABackend (TensorRT-LLM MLA)                        │
-│              ├── NativeSparseAttnBackend (NSA)                              │
-│              └── ...更多后端                                                 │
-│                                                                              │
-│  RadixAttention (Layer)                                                      │
-│      │                                                                       │
-│      └── forward() → attn_backend.forward(q, k, v, layer, forward_batch)   │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    MR["ModelRunner"] --> AB["attn_backend: AttentionBackend"]
+    AB --> FI["FlashInferAttnBackend (默认, NVIDIA SM80+)"]
+    AB --> FA["FlashAttentionBackend (FA3/FA4, SM80-SM90)"]
+    AB --> TR["TritonAttnBackend (跨平台)"]
+    AB --> AI["AiterAttnBackend (AMD Hip)"]
+    AB --> FM["FlashMLABackend (MLA 专用)"]
+    AB --> TM["TRTLLMMLABackend (TensorRT-LLM MLA)"]
+    AB --> NS["NativeSparseAttnBackend (NSA)"]
+    AB --> MORE["...更多后端"]
+
+    RA["RadixAttention (Layer)"] --> FWD["forward() -> attn_backend.forward(q, k, v, layer, forward_batch)"]
 ```
 
 ## 2. 基础接口 (AttentionBackend)
@@ -35,29 +25,29 @@ Attention 后端是 SGLang 中负责执行注意力计算的核心组件。不�
 
 ```python
 class AttentionBackend(ABC):
-    
+
     @abstractmethod
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """每次 forward 前初始化元数据"""
         pass
-    
+
     def forward(self, q, k, v, layer, forward_batch, save_kv_cache=True):
         """主入口，根据 forward_mode 分发到具体方法"""
         if forward_batch.forward_mode.is_decode():
             return self.forward_decode(...)
         else:
             return self.forward_extend(...)
-    
+
     @abstractmethod
     def forward_decode(self, q, k, v, layer, forward_batch, save_kv_cache=True):
         """Decode 阶段 (单 token 生成)"""
         pass
-    
+
     @abstractmethod
     def forward_extend(self, q, k, v, layer, forward_batch, save_kv_cache=True):
         """Extend/Prefill 阶段 (多 token 处理)"""
         pass
-    
+
     # CUDA Graph 支持
     def init_cuda_graph_state(self, max_bs, max_num_tokens): ...
     def init_forward_metadata_capture_cuda_graph(...): ...
@@ -144,28 +134,17 @@ if (
 
 ### 5.2 核心架构
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                     FlashInferAttnBackend 架构                               │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  workspace_buffer (全局共享, 256MB-512MB)                                   │
-│      │                                                                       │
-│      ├── prefill_wrapper_ragged (RaggedKVCache)                             │
-│      │   └── 用于纯 Prefill (无前缀缓存)                                    │
-│      │                                                                       │
-│      ├── prefill_wrappers_paged[] (PagedKVCache)                            │
-│      │   └── 用于 Extend (有前缀缓存)                                       │
-│      │                                                                       │
-│      └── decode_wrappers[] (PagedKVCache)                                   │
-│          └── 用于 Decode (单 token 生成)                                    │
-│                                                                              │
-│  num_wrappers:                                                               │
-│  ├── 1: 标准模型                                                            │
-│  ├── 2: Sliding Window (全局 + 滑动窗口)                                    │
-│  └── 2: Encoder-Decoder (self-attn + cross-attn)                           │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    WB["workspace_buffer (全局共享, 256MB-512MB)"] --> PWR["prefill_wrapper_ragged (RaggedKVCache)<br/>用于纯 Prefill (无前缀缓存)"]
+    WB --> PWP["prefill_wrappers_paged[] (PagedKVCache)<br/>用于 Extend (有前缀缓存)"]
+    WB --> DW["decode_wrappers[] (PagedKVCache)<br/>用于 Decode (单 token 生成)"]
+
+    subgraph num_wrappers
+        NW1["1: 标准模型"]
+        NW2["2: Sliding Window (全局 + 滑动窗口)"]
+        NW3["2: Encoder-Decoder (self-attn + cross-attn)"]
+    end
 ```
 
 ### 5.3 Wrapper 类型
@@ -199,13 +178,13 @@ class PrefillMetadata:
 def forward_decode(self, q, k, v, layer, forward_batch, save_kv_cache=True):
     # 1. 获取对应的 decode wrapper
     decode_wrapper = self.forward_metadata.decode_wrappers[self._get_wrapper_idx(layer)]
-    
+
     # 2. 保存新生成 token 的 KV 到 cache
     if save_kv_cache:
         forward_batch.token_to_kv_pool.set_kv_buffer(
             layer, cache_loc, k, v, layer.k_scale, layer.v_scale
         )
-    
+
     # 3. 调用 FlashInfer decode kernel
     o = decode_wrapper.forward(
         q.view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -215,7 +194,7 @@ def forward_decode(self, q, k, v, layer, forward_batch, save_kv_cache=True):
         k_scale=layer.k_scale_float,  # 必须用 float 避免 D2H copy
         v_scale=layer.v_scale_float,
     )
-    
+
     return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 ```
 
@@ -224,16 +203,16 @@ def forward_decode(self, q, k, v, layer, forward_batch, save_kv_cache=True):
 ```python
 def forward_extend(self, q, k, v, layer, forward_batch, save_kv_cache=True):
     prefill_wrapper = self.forward_metadata.prefill_wrappers[...]
-    
+
     if not self.forward_metadata.use_ragged:
         # 情况 1: 有前缀命中 -> 使用 Paged wrapper
         forward_batch.token_to_kv_pool.set_kv_buffer(...)
         o = prefill_wrapper.forward(...)
-        
+
     elif self.forward_metadata.extend_no_prefix:
         # 情况 2: 无前缀 -> 使用 Ragged wrapper (最优)
         o = self.prefill_wrapper_ragged.forward(q, k, v, causal=True)
-        
+
     else:
         # 情况 3: 部分前缀命中 -> Cascade: Ragged + Paged 合并
         o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(q, k, v)  # 新 KV
@@ -247,7 +226,7 @@ FlashInfer 使用 `IndicesUpdater` 来计算 wrapper 需要的索引数据：
 
 ```python
 class FlashInferIndicesUpdaterDecode:
-    def update(self, req_pool_indices, seq_lens, seq_lens_cpu, seq_lens_sum, 
+    def update(self, req_pool_indices, seq_lens, seq_lens_cpu, seq_lens_sum,
                decode_wrappers, encoder_lens, spec_info, ...):
         # 1. 计算 kv_indptr (KV 累积位置)
         # 2. 计算 kv_indices (实际 KV 位置)
@@ -270,41 +249,29 @@ class FlashInferIndicesUpdaterPrefill:
 
 ### 6.1 调用关系图
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    CUDA Graph 组件调用关系                                   │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  ModelRunner                                                                 │
-│      │                                                                       │
-│      └── CudaGraphRunner (编排器)                                           │
-│              │                                                               │
-│              ├── [初始化阶段]                                               │
-│              │   attn_backend.init_cuda_graph_state(max_bs, max_num_tokens) │
-│              │   └── 预分配 FlashInfer 需要的固定 buffer                    │
-│              │                                                               │
-│              ├── [捕获阶段] capture_one_batch_size()                        │
-│              │   │                                                           │
-│              │   ├── attn_backend.init_forward_metadata_capture_cuda_graph()│
-│              │   │   └── 创建 use_cuda_graph=True 的 wrapper                │
-│              │   │                                                           │
-│              │   └── torch.cuda.graph.capture:                              │
-│              │       └── model.forward() ──────────────────────────┐        │
-│              │           └── RadixAttention.forward()              │        │
-│              │               └── attn_backend.forward_decode()     │ 捕获   │
-│              │                   └── decode_wrapper.forward()      │        │
-│              │                                                     ▼        │
-│              │                                               [CUDA Graph]   │
-│              │                                                               │
-│              └── [重放阶段] replay()                                        │
-│                  │                                                           │
-│                  ├── attn_backend.init_forward_metadata_replay_cuda_graph() │
-│                  │   └── 更新已捕获 wrapper 的索引数据                       │
-│                  │                                                           │
-│                  └── graph.replay()                                         │
-│                      └── 执行已捕获的 CUDA kernel 序列                       │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    MR["ModelRunner"] --> CGR["CudaGraphRunner (编排器)"]
+
+    CGR --> INIT["初始化阶段"]
+    INIT --> INIT_CG["attn_backend.init_cuda_graph_state(max_bs, max_num_tokens)"]
+    INIT_CG --> INIT_DESC["预分配 FlashInfer 需要的固定 buffer"]
+
+    CGR --> CAPTURE["捕获阶段: capture_one_batch_size()"]
+    CAPTURE --> CAP_META["attn_backend.init_forward_metadata_capture_cuda_graph()"]
+    CAP_META --> CAP_DESC["创建 use_cuda_graph=True 的 wrapper"]
+    CAPTURE --> GRAPH_CAP["torch.cuda.graph.capture"]
+    GRAPH_CAP --> MODEL_FWD["model.forward()"]
+    MODEL_FWD --> RADIX["RadixAttention.forward()"]
+    RADIX --> ATTN_FWD["attn_backend.forward_decode()"]
+    ATTN_FWD --> DEC_WRP["decode_wrapper.forward()"]
+    DEC_WRP --> CG_RESULT["CUDA Graph 已捕获"]
+
+    CGR --> REPLAY["重放阶段: replay()"]
+    REPLAY --> REP_META["attn_backend.init_forward_metadata_replay_cuda_graph()"]
+    REP_META --> REP_DESC["更新已捕获 wrapper 的索引数据"]
+    REPLAY --> GRAPH_REP["graph.replay()"]
+    GRAPH_REP --> EXEC["执行已捕获的 CUDA kernel 序列"]
 ```
 
 ### 6.2 关键代码对应
@@ -320,7 +287,7 @@ class FlashInferIndicesUpdaterPrefill:
 
 ```python
 class FlashInferAttnBackend:
-    
+
     def init_cuda_graph_state(self, max_bs, max_num_tokens):
         """预分配固定大小 buffer (捕获前调用一次)"""
         # kv_indices: 存储所有可能的 KV 位置
@@ -329,7 +296,7 @@ class FlashInferAttnBackend:
         )
         # custom_mask: 投机解码时的 tree mask
         self.cuda_graph_custom_mask = torch.zeros(...)
-    
+
     def init_forward_metadata_capture_cuda_graph(self, bs, num_tokens, ...):
         """捕获时创建 use_cuda_graph=True 的 wrapper"""
         decode_wrappers = []
@@ -343,18 +310,18 @@ class FlashInferAttnBackend:
                 paged_kv_last_page_len_buffer=self.kv_last_page_len[:num_tokens],
             )
             decode_wrappers.append(wrapper)
-        
+
         # 使用预分配 buffer 更新 wrapper
         self.indices_updater_decode.update(...)
         self.decode_cuda_graph_metadata[bs] = decode_wrappers
-    
+
     def init_forward_metadata_replay_cuda_graph(self, bs, ...):
         """重放时仅更新索引数据，不创建新 wrapper"""
         # 复用已捕获的 wrapper
         wrappers = self.decode_cuda_graph_metadata[bs]
         # 仅更新变化的内容 (seq_lens, kv_indices 等)
         self.indices_updater_decode.update(..., decode_wrappers=wrappers)
-    
+
     def get_cuda_graph_seq_len_fill_value(self):
         """Padding 请求的 seq_len 填充值"""
         return 1  # FlashInfer 需要 1 (不能是 0，否则 kernel 会出错)
@@ -380,7 +347,7 @@ class FlashInferAttnBackend:
 class FlashAttentionBackend(AttentionBackend):
     def __init__(self, model_runner, fa_impl_ver=3):
         self.fa_impl_ver = fa_impl_ver  # 3 或 4
-        
+
         # 用于 merge 多个 attention 结果
         from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
@@ -391,7 +358,7 @@ class FlashAttentionMetadata:
     seq_lens_int32: torch.Tensor       # [bs], 序列长度
     page_table: torch.Tensor           # [bs, max_pages], 页表
     max_seq_len_k: int
-    
+
     # Local Attention 支持 (chunked prefill)
     local_attn_metadata: Optional[LocalAttentionMetadata] = None
 ```
@@ -426,9 +393,9 @@ def forward_extend(self, q, k, v, layer, forward_batch, save_kv_cache=True):
     # 保存 KV
     if save_kv_cache:
         forward_batch.token_to_kv_pool.set_kv_buffer(...)
-    
+
     metadata = self.forward_metadata
-    
+
     if metadata.local_attn_metadata is not None:
         # Local Attention (chunked)
         o = flash_attn_varlen_func(
@@ -447,7 +414,7 @@ def forward_extend(self, q, k, v, layer, forward_batch, save_kv_cache=True):
             block_table=metadata.page_table,
             causal=True,
         )
-    
+
     return o
 
 def forward_decode(self, q, k, v, layer, forward_batch, save_kv_cache=True):
@@ -473,7 +440,7 @@ class TritonAttnBackend(AttentionBackend):
         self.num_kv_splits = get_int_env_var(
             "SGLANG_TRITON_ATTENTION_NUM_KV_SPLITS", 8
         )
-        
+
         # 用于 split attention 的输出 buffer
         self.attn_logits = None
         self.attn_lse = None  # Log-sum-exp
@@ -488,7 +455,7 @@ class ForwardMetadata:
     kv_indices: torch.Tensor         # KV 实际索引
     qo_indptr: torch.Tensor          # Query 索引指针
     custom_mask: torch.Tensor        # 自定义 mask (投机解码)
-    
+
     # Sliding Window Attention
     window_kv_indptr: torch.Tensor
     window_kv_indices: torch.Tensor
@@ -502,7 +469,7 @@ def get_num_kv_splits(self, num_kv_splits, seq_lens):
     """计算每个请求需要的 KV 分片数"""
     # 长序列分成多段并行计算
     # 然后用 log-sum-exp 合并结果
-    
+
     for i, seq_len in enumerate(seq_lens):
         if seq_len <= split_tile_size:
             num_kv_splits[i] = 1
@@ -520,12 +487,12 @@ def forward_decode(self, q, k, v, layer, forward_batch, save_kv_cache=True):
     # 保存 KV
     if save_kv_cache:
         forward_batch.token_to_kv_pool.set_kv_buffer(...)
-    
+
     # 调用 Triton kernel
     from sglang.srt.layers.attention.triton_ops.decode_attention import (
         decode_attention_fwd
     )
-    
+
     decode_attention_fwd(
         q, k_cache, v_cache,
         o,
@@ -537,7 +504,7 @@ def forward_decode(self, q, k, v, layer, forward_batch, save_kv_cache=True):
         sm_scale=layer.scaling,
         logit_cap=layer.logit_cap,
     )
-    
+
     return o
 
 def forward_extend(self, q, k, v, layer, forward_batch, save_kv_cache=True):
@@ -545,7 +512,7 @@ def forward_extend(self, q, k, v, layer, forward_batch, save_kv_cache=True):
     from sglang.srt.layers.attention.triton_ops.prefill_attention import (
         context_attention_fwd
     )
-    
+
     context_attention_fwd(
         q, k, v, o,
         qo_indptr=metadata.qo_indptr,
@@ -555,7 +522,7 @@ def forward_extend(self, q, k, v, layer, forward_batch, save_kv_cache=True):
         logit_cap=layer.logit_cap,
         causal=True,
     )
-    
+
     return o
 ```
 
@@ -566,7 +533,7 @@ def forward_extend(self, q, k, v, layer, forward_batch, save_kv_cache=True):
 ```mermaid
 flowchart TB
     Start["后端选择"] --> Platform{"平台检测"}
-    
+
     Platform -->|"NVIDIA SM100+"| TRTLLM["trtllm_mha"]
     Platform -->|"NVIDIA SM90"| FA3["fa3"]
     Platform -->|"NVIDIA SM80+"| NVIDIA{"模型类型?"}
@@ -575,11 +542,11 @@ flowchart TB
     Platform -->|"Intel CPU"| INTEL_AMX["intel_amx"]
     Platform -->|"华为 NPU"| ASCEND["ascend"]
     Platform -->|其他| TRITON["triton"]
-    
+
     NVIDIA -->|"MLA 模型"| FLASHINFER_MLA["flashinfer_mla"]
     NVIDIA -->|"NSA 模型"| NSA["nsa"]
     NVIDIA -->|"通用"| FLASHINFER["flashinfer"]
-    
+
     style FLASHINFER fill:#90EE90
     style FA3 fill:#87CEEB
     style TRITON fill:#FFB6C1
@@ -587,31 +554,31 @@ flowchart TB
 
 **详细路由图**:
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                      后端自动选择逻辑                                        │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  平台检测:                                                                   │
-│  ├── NVIDIA SM100+: trtllm_mha                                              │
-│  ├── NVIDIA SM90: fa3                                                       │
-│  ├── AMD HIP: aiter                                                         │
-│  ├── Intel XPU: intel_xpu                                                   │
-│  ├── Intel CPU: intel_amx                                                   │
-│  ├── 华为 NPU: ascend                                                       │
-│  └── 其他: triton                                                           │
-│                                                                              │
-│  模型特化:                                                                   │
-│  ├── MLA 模型 (DeepSeek-V2/3): flashinfer_mla / trtllm_mla / flashmla      │
-│  ├── NSA 模型: nsa                                                          │
-│  ├── Llama4/Falcon-H: fa3 / triton (不支持 flashinfer)                     │
-│  ├── Encoder-Decoder: flashinfer (不支持 triton)                           │
-│  └── 通用: flashinfer                                                       │
-│                                                                              │
-│  命令行覆盖:                                                                 │
-│  └── --attention-backend <backend>                                          │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph platform["平台检测"]
+        P1["NVIDIA SM100+ -> trtllm_mha"]
+        P2["NVIDIA SM90 -> fa3"]
+        P3["AMD HIP -> aiter"]
+        P4["Intel XPU -> intel_xpu"]
+        P5["Intel CPU -> intel_amx"]
+        P6["华为 NPU -> ascend"]
+        P7["其他 -> triton"]
+    end
+
+    subgraph model["模型特化"]
+        M1["MLA 模型 (DeepSeek-V2/3) -> flashinfer_mla / trtllm_mla / flashmla"]
+        M2["NSA 模型 -> nsa"]
+        M3["Llama4/Falcon-H -> fa3 / triton (不支持 flashinfer)"]
+        M4["Encoder-Decoder -> flashinfer (不支持 triton)"]
+        M5["通用 -> flashinfer"]
+    end
+
+    subgraph override["命令行覆盖"]
+        O1["--attention-backend backend_name"]
+    end
+
+    platform --> model --> override
 ```
 
 ### 8.2 相关配置参数
@@ -640,21 +607,21 @@ class AttentionBackend:
         self.cuda_graph_kv_indptr = torch.zeros(max_bs + 1, ...)
         self.cuda_graph_kv_indices = torch.zeros(max_num_tokens, ...)
         # ...
-    
+
     def init_forward_metadata_capture_cuda_graph(
         self, bs, num_tokens, req_pool_indices, seq_lens, ...
     ):
         """捕获 Graph 时初始化 metadata"""
         # 使用预分配 buffer
         # 设置为当前 batch 的值
-    
+
     def init_forward_metadata_replay_cuda_graph(
         self, bs, req_pool_indices, seq_lens, seq_lens_sum, ...
     ):
         """重放 Graph 时更新 metadata"""
         # 仅更新变化的值 (如 seq_lens)
         # 不能分配新内存
-    
+
     def get_cuda_graph_seq_len_fill_value(self):
         """Padding 的 seq_len 填充值, 通常是 0 或 1"""
         return 1  # FlashInfer 需要 1, 其他通常 0
@@ -667,12 +634,12 @@ class AttentionBackend:
 ```python
 class HybridLinearAttnBackend(AttentionBackend):
     """混合注意力后端, 支持 Mamba-style 线性注意力 + Full Attention"""
-    
+
     def __init__(self, full_attn_backend, linear_attn_backend, full_attn_layers):
         self.full_attn_backend = full_attn_backend    # 如 FlashInfer
         self.linear_attn_backend = linear_attn_backend # 如 Mamba2Backend
         self.full_attn_layers = set(full_attn_layers)  # Full attention 层索引
-    
+
     def forward(self, q, k, v, layer, forward_batch, ...):
         if layer.layer_id in self.full_attn_layers:
             return self.full_attn_backend.forward(...)
@@ -685,7 +652,7 @@ class HybridLinearAttnBackend(AttentionBackend):
 ```python
 class DoubleSparseAttnBackend(AttentionBackend):
     """双稀疏注意力, 用于长上下文优化"""
-    
+
     # 只保留 "heavy" channel 和 "heavy" token
     # 大幅减少内存和计算
 ```
@@ -695,7 +662,7 @@ class DoubleSparseAttnBackend(AttentionBackend):
 ```python
 class NativeSparseAttnBackend(AttentionBackend):
     """原生稀疏注意力, 用于 NSA 模型"""
-    
+
     # 支持多种实现: flashmla_sparse, fa3, tilelang, aiter
 ```
 

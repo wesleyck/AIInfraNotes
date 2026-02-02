@@ -13,55 +13,32 @@
 
 ## 端到端 Pipeline
 
-```
-HTTP Request
-    │
-    ▼
-┌────────────────┐     ┌─────────────────┐     ┌───────────────┐
-│  HTTP Server   │────►│ TokenizerManager │────►│   Scheduler   │
-│  (FastAPI)     │     │  (tokenize +     │ ZMQ │  (调度批次)    │
-│                │     │   多模态预处理)   │     │               │
-└────────────────┘     └─────────────────┘     └───────┬───────┘
-                                                        │
-                              ┌──────────────────────────┘
-                              ▼
-                       ┌─────────────┐     ┌──────────────┐
-                       │ ModelRunner │────►│   Sampling    │
-                       │ (模型前向)   │     │ (logits→token)│
-                       └─────────────┘     └──────┬───────┘
-                                                   │
-                              ┌─────────────────────┘
-                              ▼
-                       ┌──────────────┐     ┌───────────────┐
-                       │  Constrained │────►│ Detokenizer   │
-                       │  Generation  │     │ (token→text)  │
-                       │ (Grammar/    │     │               │
-                       │  StructTag)  │     └───────┬───────┘
-                       └──────────────┘             │
-                                                    ▼
-                                              HTTP Response
+```mermaid
+flowchart LR
+    A["HTTP Request"] --> B["HTTP Server<br/>(FastAPI)"]
+    B --> C["TokenizerManager<br/>(tokenize +<br/>多模态预处理)"]
+    C -->|"ZMQ"| D["Scheduler<br/>(调度批次)"]
+    D --> E["ModelRunner<br/>(模型前向)"]
+    E --> F["Sampling<br/>(logits→token)"]
+    F --> G["Constrained<br/>Generation<br/>(Grammar/StructTag)"]
+    G --> H["Detokenizer<br/>(token→text)"]
+    H --> I["HTTP Response"]
 ```
 
 ## 学习路线
 
 学习采用**自顶向下**的方式：先理解全局架构，再逐层深入细节。
 
-```
-Phase 0: 全局架构
-    ↓
-Phase 1: 数据结构与请求流
-    ↓
-Phase 2: 调度系统
-    ↓
-Phase 3: 内存管理 (KV Cache)
-    ↓
-Phase 4: 模型执行层
-    ↓
-Phase 5: 高级特性
-    ↓
-Phase 6: Kernel 实现
-    ↓
-Phase 7: 生成与约束
+```mermaid
+flowchart TD
+    P0["Phase 0: 全局架构"] --> P1["Phase 1: 数据结构与请求流"]
+    P1 --> P2["Phase 2: 调度系统"]
+    P2 --> P3["Phase 3: 内存管理 (KV Cache)"]
+    P3 --> P4["Phase 4: 模型执行层"]
+    P4 --> P5["Phase 5: 高级特性"]
+    P5 --> P6["Phase 6: Kernel 实现"]
+    P6 --> P7["Phase 7: 生成与约束"]
+    P7 --> P8["Phase 8: 特殊模型与适配"]
 ```
 
 ## 笔记目录
@@ -102,7 +79,10 @@ Phase 7: 生成与约束
 - [x] `19_sampling_and_generation.md` - 采样参数、惩罚机制、LogitsProcessor、Sampler
 - [x] `20_constrained_generation.md` - Grammar Backend、JSON Schema、词表掩码、跳跃解码
 - [x] `21_reasoning_and_function_call.md` - 推理解析 (ReasoningParser)、函数调用 (FunctionCallParser)
-- [ ] `22_lora.md` - LoRA 适配器 (S-LoRA, Punica) *(待编写)*
+
+### Phase 8: 特殊模型与适配
+- [x] `22_embedding_and_rerank.md` - Embedding/Rerank 模型 (Pooler, CrossEncodingPooler, SparsePooler)
+- [x] `23_lora.md` - LoRA 适配器 (S-LoRA, Punica, 内存池, 多后端)
 
 ## 核心文件速查
 
@@ -132,6 +112,13 @@ Phase 7: 生成与约束
 | 推理解析 | `srt/parser/reasoning_parser.py` | - | ReasoningParser |
 | 函数调用 | `srt/function_call/function_call_parser.py` | - | FunctionCallParser |
 | 函数调用 | `srt/function_call/base_format_detector.py` | - | 检测器基类 |
+| Embedding | `srt/layers/pooler.py` | - | Pooler, CrossEncodingPooler |
+| Embedding | `srt/entrypoints/openai/serving_embedding.py` | - | /v1/embeddings 端点 |
+| Rerank | `srt/entrypoints/openai/serving_rerank.py` | - | /v1/rerank 端点 |
+| LoRA | `srt/lora/lora_manager.py` | - | LoRA 核心管理器 |
+| LoRA | `srt/lora/lora_registry.py` | - | LoRA 注册表 (请求路由) |
+| LoRA | `srt/lora/mem_pool.py` | - | LoRA GPU 内存池 |
+| LoRA | `srt/lora/layers.py` | - | LoRA 模块替换层 |
 
 ## 学习建议
 

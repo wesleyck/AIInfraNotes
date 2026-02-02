@@ -8,31 +8,29 @@
 
 SGLang 采用多进程架构，核心进程包括：
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Main Process                              │
-│  ┌─────────────┐  ┌─────────────────┐  ┌──────────────────┐    │
-│  │ HTTP Server │──│ TokenizerManager │──│ TemplateManager  │    │
-│  │  (FastAPI)  │  │   (tokenize)     │  │  (chat template) │    │
-│  └─────────────┘  └────────┬────────┘  └──────────────────┘    │
-│                            │ ZMQ                                 │
-└────────────────────────────┼────────────────────────────────────┘
-                             │
-        ┌────────────────────┴────────────────────┐
-        │                                          │
-        ▼                                          ▼
-┌───────────────────┐                    ┌─────────────────────┐
-│ Scheduler Process │                    │ Detokenizer Process │
-│  ┌─────────────┐  │                    │  ┌───────────────┐  │
-│  │  Scheduler  │  │                    │  │ Detokenizer   │  │
-│  │  (调度批次)  │  │◄───────────────────│  │  (解码token)  │  │
-│  └──────┬──────┘  │       ZMQ          │  └───────────────┘  │
-│         │         │                    └─────────────────────┘
-│  ┌──────▼──────┐  │
-│  │  TPWorker   │  │
-│  │ (模型执行)   │  │
-│  └─────────────┘  │
-└───────────────────┘
+```mermaid
+flowchart TD
+    subgraph MainProcess["Main Process"]
+        HTTP["HTTP Server (FastAPI)"]
+        TM["TokenizerManager (tokenize)"]
+        Template["TemplateManager (chat template)"]
+        HTTP --- TM --- Template
+    end
+
+    TM -->|ZMQ| Sched
+    TM -->|ZMQ| Detok
+
+    subgraph SchedProcess["Scheduler Process"]
+        Sched["Scheduler (调度批次)"]
+        TPW["TPWorker (模型执行)"]
+        Sched --> TPW
+    end
+
+    subgraph DetokProcess["Detokenizer Process"]
+        Detok["Detokenizer (解码token)"]
+    end
+
+    Detok -->|ZMQ| Sched
 ```
 
 ### 1.1 各进程职责
@@ -136,20 +134,26 @@ SGLang 默认使用 **overlap 模式** 的事件循环，通过 CPU/GPU 重叠�
 
 ### 3.1 Overlap 机制原理
 
-```
-时间线:
-├── Batch N-1 ──────────────────────┤
-│   GPU: forward()                   │
-│                                    │
-│        ├── Batch N ───────────────────────────┤
-│        │   CPU: recv_requests()                │
-│        │   CPU: get_next_batch_to_run()        │
-│        │   CPU: process_batch_result(N-1)      │  ← 处理上一批结果
-│        │   GPU: forward()                      │
-│        │                                       │
-│        │        ├── Batch N+1 ────────────────────────┤
-│        │        │   CPU: recv_requests()               │
-│        │        │   ...                                │
+```mermaid
+gantt
+    title CPU/GPU Overlap Pipeline
+    dateFormat X
+    axisFormat %s
+
+    section Batch N-1
+    GPU forward              :a1, 0, 6
+
+    section Batch N
+    CPU recv_requests        :a2, 3, 5
+    CPU get_next_batch       :a3, 5, 7
+    CPU process_result N-1   :a4, 7, 9
+    GPU forward              :a5, 9, 15
+
+    section Batch N+1
+    CPU recv_requests        :a6, 12, 14
+    CPU get_next_batch       :a7, 14, 16
+    CPU process_result N     :a8, 16, 18
+    GPU forward              :a9, 18, 24
 ```
 
 **核心思想**: 当 GPU 执行当前批次的 forward 时，CPU 同时处理上一批次的结果，实现流水线并行。
@@ -269,11 +273,14 @@ SGLang 的设计中，decode 批次不需要单独创建函数：
 - **update_running_batch()** 负责更新 decode 批次（检查内存、处理 retraction 等）
 - `running_batch` 会持续进行 decode 直到请求完成
 
-```
-请求生命周期:
-waiting_queue → get_new_batch_prefill() → prefill 完成 → 合并到 running_batch
-                                                              ↓
-                                          update_running_batch() → decode 循环 → 完成
+```mermaid
+flowchart LR
+    A["waiting_queue"] --> B["get_new_batch_prefill()"]
+    B --> C["prefill 完成"]
+    C --> D["合并到 running_batch"]
+    D --> E["update_running_batch()"]
+    E --> F["decode 循环"]
+    F --> G["完成"]
 ```
 
 ## 4. 请求生命周期 (以 Qwen3-VL 多模态请求为例)
@@ -291,17 +298,17 @@ sequenceDiagram
 
     User->>HTTP: POST /generate (text + image)
     HTTP->>TM: handle_generate_request()
-    
+
     Note over TM: tokenize(text) → input_ids
     Note over TM: QwenVLImageProcessor<br/>处理图像/计算 M-ROPE
-    
+
     TM->>Sched: ZMQ send (TokenizedGenerateReqInput)
-    
+
     Note over Sched: 创建 Req, 加入 waiting_queue
-    
+
     loop Event Loop
         Sched->>Sched: get_next_batch_to_run()
-        
+
         alt Prefill Phase
             Note over Sched: get_new_batch_prefill()<br/>查询 RadixCache, 分配 KV
             Sched->>GPU: run_batch(EXTEND)
@@ -311,11 +318,11 @@ sequenceDiagram
             Sched->>GPU: run_batch(DECODE)
             GPU-->>Sched: next_token
         end
-        
+
         Sched->>Sched: process_batch_result()<br/>更新 output_ids, 检查终止
         Sched->>Detok: ZMQ send (token_ids)
     end
-    
+
     Detok->>TM: ZMQ send (decoded text)
     TM->>HTTP: return
     HTTP->>User: Response (stream/complete)
@@ -323,70 +330,64 @@ sequenceDiagram
 
 **详细步骤分解**:
 
-```
-1. 用户请求到达 (包含图像 + 文本)
-   │
-   ▼
-2. HTTP Server 接收 (http_server.py)
-   │
-   ▼
-3. TokenizerManager 处理
-   ├─ tokenize(text) → input_ids
-   ├─ QwenVLImageProcessor.process_mm_data_async()
-   │   ├─ 加载图像/视频数据
-   │   ├─ smart_resize() 调整图像尺寸
-   │   ├─ 计算 mrope_positions (多模态旋转位置编码)
-   │   └─ 构造 MultimodalInputs
-   └─ 构造 TokenizedGenerateReqInput
-   │
-   ▼ ZMQ send
-4. Scheduler 接收 (handle_generate_request)
-   ├─ 创建 Req 对象
-   │   └─ req.multimodal_inputs = MultimodalInputs
-   ├─ 加入 waiting_queue
-   │
-   ▼ 事件循环
-5. Scheduler.event_loop_overlap()
-   │
-   ├─ get_next_batch_to_run()
-   │   ├─ get_new_batch_prefill()
-   │   │   ├─ 从 waiting_queue 选取请求
-   │   │   ├─ 查询 RadixCache (前缀复用)
-   │   │   ├─ 分配 KV Cache
-   │   │   └─ 构造 ScheduleBatch (forward_mode=EXTEND)
-   │   │
-   │   └─ 或 update_running_batch() (用于 decode)
-   │       ├─ 检查内存，必要时 retract
-   │       └─ 准备 decode 批次
-   │
-   ├─ run_batch(batch)
-   │   ├─ batch.get_model_worker_batch() → ModelWorkerBatch
-   │   └─ model_worker.forward_batch_generation()
-   │       ├─ 模型前向 (包含视觉编码器)
-   │       ├─ logits → 采样 → next_token
-   │       └─ 返回 GenerationBatchResult
-   │
-   └─ process_batch_result()
-       ├─ 更新 req.output_ids
-       ├─ 检查终止条件 (EOS, max_tokens)
-       └─ 发送结果到 Detokenizer
-   │
-   ▼ ZMQ send
-6. Detokenizer 解码
-   ├─ decode(token_ids) → text
-   └─ 发送回 TokenizerManager
-   │
-   ▼ ZMQ send
-7. 返回给用户
+```mermaid
+flowchart TD
+    A["1: 用户请求到达 (包含图像 + 文本)"] --> B["2: HTTP Server 接收 (http_server.py)"]
+    B --> C["3: TokenizerManager 处理"]
+    C --> C1["tokenize(text) -> input_ids"]
+    C --> C2["QwenVLImageProcessor.process_mm_data_async()"]
+    C2 --> C2a["加载图像/视频数据"]
+    C2 --> C2b["smart_resize() 调整图像尺寸"]
+    C2 --> C2c["计算 mrope_positions (多模态旋转位置编码)"]
+    C2 --> C2d["构造 MultimodalInputs"]
+    C1 --> C3["构造 TokenizedGenerateReqInput"]
+    C2d --> C3
+
+    C3 -->|"ZMQ send"| D["4: Scheduler 接收 (handle_generate_request)"]
+    D --> D1["创建 Req 对象 (req.multimodal_inputs = MultimodalInputs)"]
+    D1 --> D2["加入 waiting_queue"]
+
+    D2 -->|"事件循环"| E["5: Scheduler.event_loop_overlap()"]
+    E --> E1["get_next_batch_to_run()"]
+    E1 --> E1a["get_new_batch_prefill()"]
+    E1a --> E1a1["从 waiting_queue 选取请求"]
+    E1a --> E1a2["查询 RadixCache (前缀复用)"]
+    E1a --> E1a3["分配 KV Cache"]
+    E1a --> E1a4["构造 ScheduleBatch (forward_mode=EXTEND)"]
+    E1 --> E1b["或 update_running_batch() (用于 decode)"]
+    E1b --> E1b1["检查内存, 必要时 retract"]
+    E1b --> E1b2["准备 decode 批次"]
+
+    E --> E2["run_batch(batch)"]
+    E2 --> E2a["batch.get_model_worker_batch() -> ModelWorkerBatch"]
+    E2 --> E2b["model_worker.forward_batch_generation()"]
+    E2b --> E2b1["模型前向 (包含视觉编码器)"]
+    E2b --> E2b2["logits -> 采样 -> next_token"]
+    E2b --> E2b3["返回 GenerationBatchResult"]
+
+    E --> E3["process_batch_result()"]
+    E3 --> E3a["更新 req.output_ids"]
+    E3 --> E3b["检查终止条件 (EOS, max_tokens)"]
+    E3 --> E3c["发送结果到 Detokenizer"]
+
+    E3c -->|"ZMQ send"| F["6: Detokenizer 解码"]
+    F --> F1["decode(token_ids) -> text"]
+    F1 --> F2["发送回 TokenizerManager"]
+
+    F2 -->|"ZMQ send"| G["7: 返回给用户"]
 ```
 
 ## 5. 核心数据结构与转换链
 
 SGLang 的批次数据在不同层级有不同的表示，形成完整的转换链：
 
-```
-GenerateReqInput → TokenizedGenerateReqInput → Req → ScheduleBatch
-    → ModelWorkerBatch → ForwardBatch
+```mermaid
+flowchart LR
+    A["GenerateReqInput"] --> B["TokenizedGenerateReqInput"]
+    B --> C["Req"]
+    C --> D["ScheduleBatch"]
+    D --> E["ModelWorkerBatch"]
+    E --> F["ForwardBatch"]
 ```
 
 > **详细说明**: 各数据结构的字段定义、转换方法及生命周期管理见 **02_core_data_structures.md**。

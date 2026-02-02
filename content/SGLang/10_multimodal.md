@@ -4,43 +4,20 @@
 
 SGLang 的多模态系统处理图像、视频、音频等非文本输入，支持 Qwen3-VL、LLaVA、InternVL 等模型。
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                      多模态完整生命周期                                      │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  1. 请求接收 (HTTP/API)                                                     │
-│     └── images=[base64/URL], text="<image> Describe this"                   │
-│                                                                              │
-│  2. 预处理 (Tokenizer Manager)                                              │
-│     ├── 加载图像 (PIL/decord)                                               │
-│     ├── 调整尺寸 (smart_resize)                                             │
-│     ├── 计算 grid_thw (temporal, height, width)                             │
-│     └── 生成 hash (用于缓存)                                                │
-│                                                                              │
-│  3. Tokenizer                                                               │
-│     ├── 替换 <image> → <|image_pad|> * num_patches                          │
-│     └── 构建 input_ids + image_offsets                                      │
-│                                                                              │
-│  4. Scheduler 调度                                                          │
-│     ├── 检查 MultimodalCache 命中                                           │
-│     └── 分配 mm_embedding 位置                                              │
-│                                                                              │
-│  5. VIT 编码 (ModelRunner)                                                  │
-│     ├── 像素值 → Vision Encoder                                             │
-│     ├── patch_embedding + position_embedding                                │
-│     ├── Transformer Blocks (可使用 CUDA Graph)                              │
-│     └── 输出 image_embeddings [num_patches, hidden_size]                    │
-│                                                                              │
-│  6. 嵌入融合                                                                │
-│     ├── text_embeddings = embed_tokens(input_ids)                           │
-│     ├── text_embeddings[image_offsets] = image_embeddings                  │
-│     └── 合并后的 hidden_states                                              │
-│                                                                              │
-│  7. LLM 推理                                                                │
-│     └── Prefill / Decode (使用融合后的 embeddings)                          │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph Lifecycle["多模态完整生命周期"]
+        direction TB
+        S1["1: 请求接收 HTTP/API<br/>images=base64/URL<br/>text='&lt;image&gt; Describe this'"]
+        S2["2: 预处理 Tokenizer Manager<br/>- 加载图像 PIL/decord<br/>- 调整尺寸 smart_resize<br/>- 计算 grid_thw<br/>- 生成 hash 用于缓存"]
+        S3["3: Tokenizer<br/>- 替换 &lt;image&gt; 为 &lt;|image_pad|&gt; * num_patches<br/>- 构建 input_ids + image_offsets"]
+        S4["4: Scheduler 调度<br/>- 检查 MultimodalCache 命中<br/>- 分配 mm_embedding 位置"]
+        S5["5: VIT 编码 ModelRunner<br/>- 像素值 -> Vision Encoder<br/>- patch_embedding + position_embedding<br/>- Transformer Blocks 可使用 CUDA Graph<br/>- 输出 image_embeddings"]
+        S6["6: 嵌入融合<br/>- text_embeddings = embed_tokens input_ids<br/>- text_embeddings 中 image_offsets 替换为 image_embeddings<br/>- 合并后的 hidden_states"]
+        S7["7: LLM 推理<br/>Prefill / Decode 使用融合后的 embeddings"]
+
+        S1 --> S2 --> S3 --> S4 --> S5 --> S6 --> S7
+    end
 ```
 
 ## 2. 核心类层次
@@ -51,26 +28,26 @@ SGLang 的多模态系统处理图像、视频、音频等非文本输入，支�
 # base_processor.py L162-901
 class BaseMultimodalProcessor(ABC):
     """Base class for all multimodal processors."""
-    
+
     models = []  # 支持的模型类列表
-    
+
     def __init__(self, hf_config, server_args, _processor, transport_mode, *args, **kwargs):
         self.hf_config = hf_config
         self._processor = _processor  # HuggingFace AutoProcessor
         self.multimodal_tokens = MultimodalSpecialTokens(...)  # 特殊 token
-        
+
         # 缓存配置
         self.mm_cache_enabled = server_args.mm_cache_enabled
         self.mm_feature_cache = LRUCache(maxsize=MM_FEATURE_CACHE_SIZE)
-        
+
         # 并行处理
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
-    
+
     @abstractmethod
     def process_mm_data(self, input_text, images=None, videos=None, audios=None):
         """Process multimodal data with transformers AutoProcessor."""
         raise NotImplementedError
-    
+
     def get_mm_data(self, prompt, embeddings, img_grid_thw):
         """Get multimodal metadata for scheduling."""
         return {
@@ -87,20 +64,20 @@ class BaseMultimodalProcessor(ABC):
 @dataclass
 class MultimodalSpecialTokens:
     """Manages special tokens for multimodal inputs."""
-    
+
     image_token: Optional[Union[str, List[str]]] = None   # "<image>"
     video_token: Optional[Union[str, List[str]]] = None   # "<video>"
     audio_token: Optional[Union[str, List[str]]] = None   # "<audio>"
     image_token_id: Optional[int] = None
     video_token_id: Optional[int] = None
     audio_token_id: Optional[int] = None
-    
+
     def get_modality_of_token(self, token: str) -> Optional[Modality]:
         """返回 token 对应的模态类型"""
         if token == self.image_token:
             return Modality.IMAGE
         ...
-    
+
     def get_combined_regex(self) -> str:
         """构建用于分割输入的正则表达式"""
         patterns = []
@@ -116,7 +93,7 @@ class MultimodalSpecialTokens:
 # processors/qwen_vl.py L223-417
 class QwenVLImageProcessor(BaseMultimodalProcessor):
     """Compatible with Qwen-VL & Qwen-Omni Series."""
-    
+
     models = [
         Qwen2VLForConditionalGeneration,
         Qwen2_5_VLForConditionalGeneration,
@@ -124,41 +101,41 @@ class QwenVLImageProcessor(BaseMultimodalProcessor):
         Qwen3VLMoeForConditionalGeneration,
         Qwen3OmniMoeForConditionalGeneration,
     ]
-    
+
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(...)
-        
+
         # Qwen 特有配置
         self.image_factor = IMAGE_FACTOR  # 28
         self.min_pixels = MIN_PIXELS      # 4 * 28 * 28
         self.max_pixels = MAX_PIXELS      # 16384 * 28 * 28
-        
+
         # 特殊 token
         self.multimodal_tokens = MultimodalSpecialTokens(
             image_token="<|image_pad|>",
             video_token="<|video_pad|>",
         )
-    
+
     def process_mm_data_async(self, image_data, input_text, request_obj, **kwargs):
         """异步处理多模态数据"""
-        
+
         # 1. 并行加载图像
         futures = [
             self.executor.submit(self._load_single_item, img, Modality.IMAGE)
             for img in image_data
         ]
-        
+
         # 2. 调整尺寸 (smart_resize)
         for future in concurrent.futures.as_completed(futures):
             image = future.result()
             height, width = image.size
-            new_h, new_w = smart_resize(height, width, self.image_factor, 
+            new_h, new_w = smart_resize(height, width, self.image_factor,
                                         self.min_pixels, self.max_pixels)
             image = image.resize((new_w, new_h))
-        
+
         # 3. 计算 grid_thw
         grid_thw = self._compute_grid_thw(images)
-        
+
         # 4. 调用 HuggingFace processor
         return self._processor(
             text=input_text,
@@ -186,11 +163,11 @@ def smart_resize(
     2. Total pixels within [min_pixels, max_pixels]
     3. Aspect ratio maintained
     """
-    
+
     # 调整到 factor 的倍数
     h_bar = max(factor, round_by_factor(height, factor))
     w_bar = max(factor, round_by_factor(width, factor))
-    
+
     # 检查像素限制
     if h_bar * w_bar > max_pixels:
         # 缩小
@@ -202,7 +179,7 @@ def smart_resize(
         beta = math.sqrt(min_pixels / (height * width))
         h_bar = ceil_by_factor(height * beta, factor)
         w_bar = ceil_by_factor(width * beta, factor)
-    
+
     return h_bar, w_bar
 ```
 
@@ -230,26 +207,26 @@ def _compute_grid_thw(images):
 # processors/qwen_vl.py L146-219
 def preprocess_video(vr, image_factor=28, video_config={}):
     """Process video for Qwen-VL."""
-    
+
     total_frames = len(vr)
     video_fps = vr.get_avg_fps()
-    
+
     # 1. 计算采样帧数
     nframes = smart_nframes(video_config, total_frames, video_fps)
-    
+
     # 2. 均匀采样
     frame_indices = np.linspace(0, total_frames - 1, nframes, dtype=int)
     frames = vr.get_batch(frame_indices).asnumpy()
-    
+
     # 3. 调整尺寸 (考虑总像素限制)
     h, w = frames.shape[1:3]
     new_h, new_w = smart_resize(
-        h, w, 
+        h, w,
         factor=image_factor,
         min_pixels=VIDEO_MIN_PIXELS,
         max_pixels=VIDEO_MAX_PIXELS // nframes,  # 分摊到每帧
     )
-    
+
     return frames, (nframes, new_h // image_factor, new_w // image_factor)
 ```
 
@@ -261,19 +238,19 @@ def preprocess_video(vr, image_factor=28, video_config={}):
 # mem_cache/multimodal_cache.py
 class MultimodalCache(ABC):
     """Abstract base for multimodal embedding cache."""
-    
+
     @staticmethod
     def combine_hashes(mm_hashes: List[int]) -> Optional[int]:
         """Combine multiple item hashes into one."""
         if not mm_hashes:
             return None
         return hash(tuple(mm_hashes))
-    
+
     @abstractmethod
     def get(self, mm_hashes: List[int], combined_hash=None) -> Optional[torch.Tensor]:
         """Get cached embedding by hash."""
         raise NotImplementedError
-    
+
     @abstractmethod
     def set(self, mm_hash: int, embedding: torch.Tensor, allocator) -> bool:
         """Store embedding with hash."""
@@ -281,22 +258,22 @@ class MultimodalCache(ABC):
 
 class MultiModalStaticCache(MultimodalCache):
     """LRU cache for multimodal embeddings."""
-    
+
     def __init__(self, max_size: int):
         self.max_size = max_size
         self.mm_cache: OrderedDict[int, torch.Tensor] = OrderedDict()
         self.current_size = 0
-    
+
     def set(self, mm_hash, embedding, loc=None):
         data_size = embedding.element_size() * embedding.numel()
-        
+
         # LRU 逐出
         while self.current_size + data_size > self.max_size:
             if not self.mm_cache:
                 return False
             lru_hash, lru_embedding = self.mm_cache.popitem(last=False)
             self.current_size -= _get_tensor_size(lru_embedding)
-        
+
         self.mm_cache[mm_hash] = embedding
         self.current_size += data_size
         return True
@@ -309,13 +286,13 @@ class MultiModalStaticCache(MultimodalCache):
 def handle_multimodal_request(req):
     # 1. 计算 hash
     mm_hash = MultimodalCache.combine_hashes(req.mm_hashes)
-    
+
     # 2. 检查缓存
     cached = self.mm_cache.get(req.mm_hashes, mm_hash)
     if cached is not None:
         req.mm_embeddings = cached
         return
-    
+
     # 3. 未命中: 需要 VIT 编码
     req.need_mm_encode = True
 ```
@@ -329,29 +306,29 @@ def handle_multimodal_request(req):
 class ViTCudaGraphRunner:
     """
     Generic ViT CUDA Graph Runner.
-    
+
     Captures "blocks + merger + deepstack merger" into CUDA graph.
     Lazily captures graphs for each unique sequence length.
     """
-    
+
     def __init__(self, vit: nn.Module):
         self.vit = vit
         self.graphs: Dict[int, torch.cuda.CUDAGraph] = {}
         self.graph_inputs: Dict[int, Dict] = {}
         self.graph_outputs: Dict[int, torch.Tensor] = {}
-        
+
         # 启用条件
         self.enabled = get_global_server_args().vit_enable_cuda_graph
-    
+
     def _get_graph_key(self, x_3d: torch.Tensor) -> int:
         """Graph key = sequence length."""
         return x_3d.shape[0]
-    
+
     def run(self, x, cu_seqlens, cu_window_seqlens, position_embeddings, ...):
         """Run VIT with CUDA Graph if available."""
-        
+
         graph_key = self._get_graph_key(x)
-        
+
         if graph_key not in self.graphs:
             # 首次遇到此 shape: 捕获 graph
             return self.create_graph(x, cu_seqlens, ...)
@@ -365,19 +342,19 @@ class ViTCudaGraphRunner:
 ```python
 def _create_graph(self, graph_key, position_embeddings, ...):
     """Capture VIT forward as CUDA Graph."""
-    
+
     # 1. 分配输入 buffer
     x_buffer = torch.empty((graph_key, 1, self.hidden_size), ...)
-    
+
     # 2. warmup
     with torch.no_grad():
         _ = self._run_vit_forward(x_buffer, ...)
-    
+
     # 3. 捕获
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         output = self._run_vit_forward(x_buffer, ...)
-    
+
     self.graphs[graph_key] = graph
     self.graph_inputs[graph_key] = {"x": x_buffer, ...}
     self.graph_outputs[graph_key] = output
@@ -401,7 +378,7 @@ export SGLANG_VIT_ENABLE_CUDA_GRAPH=1
 ```python
 # models/qwen3_vl.py
 class Qwen3VLForConditionalGeneration(nn.Module):
-    
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -414,19 +391,19 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         if pixel_values is not None:
             # VIT 编码
             image_embeds = self.visual(
-                pixel_values, 
+                pixel_values,
                 grid_thw=image_grid_thw
             )
-        
+
         # 2. 获取文本嵌入
         inputs_embeds = self.language_model.embed_tokens(input_ids)
-        
+
         # 3. 融合 (替换 image pad token 位置)
         if image_embeds is not None:
             # 找到 <|image_pad|> 的位置
             image_mask = (input_ids == self.image_token_id)
             inputs_embeds[image_mask] = image_embeds.flatten(0, 1)
-        
+
         # 4. 送入 LLM
         return self.language_model(
             input_ids=None,
@@ -447,22 +424,22 @@ def get_rope_index(
     attention_mask: torch.Tensor,
 ):
     """Calculate 3D position indices for mrope."""
-    
+
     # 文本 token: [0, 1, 2, 3, ...]
     # 图像 token: [t, h, w] 坐标
-    
+
     position_ids = torch.zeros((batch_size, seq_len, 3), ...)
-    
+
     for i, (t, h, w) in enumerate(image_grid_thw):
         # 图像 patches 的 3D 位置
         temporal = torch.arange(t).repeat_interleave(h * w)
         height = torch.arange(h).repeat(t * w)
         width = torch.arange(w).repeat(t * h)
-        
+
         position_ids[i, image_start:image_end, 0] = temporal
         position_ids[i, image_start:image_end, 1] = height
         position_ids[i, image_start:image_end, 2] = width
-    
+
     return position_ids
 ```
 
@@ -494,44 +471,18 @@ class Modality(Enum):
 
 ## 8. 数据流转
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        多模态数据流转                                        │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  HTTP Request                                                                │
-│  ├── images: ["base64:...", "http://..."]                                   │
-│  └── messages: [{"role": "user", "content": "<image> Describe"}]            │
-│                                                                              │
-│       ↓                                                                      │
-│                                                                              │
-│  Tokenizer Manager (process_mm_data_async)                                  │
-│  ├── images: [PIL.Image, PIL.Image, ...]                                    │
-│  ├── pixel_values: [B, C, H, W] tensor                                      │
-│  ├── image_grid_thw: [[1, 24, 32], [1, 16, 20], ...]                        │
-│  └── input_ids: [1, 2, 3, IMG_PAD, IMG_PAD, ..., 100, 101]                  │
-│                                                                              │
-│       ↓                                                                      │
-│                                                                              │
-│  Req 对象                                                                   │
-│  ├── mm_data: {"pixel_values": tensor, "image_grid_thw": tensor}            │
-│  ├── mm_hashes: [hash1, hash2, ...]                                         │
-│  └── image_offsets: [3, 4, 5, 6, ...]  # IMG_PAD 位置                       │
-│                                                                              │
-│       ↓                                                                      │
-│                                                                              │
-│  Scheduler (ScheduleBatch → ModelWorkerBatch)                               │
-│  ├── 检查 MultimodalCache                                                   │
-│  └── 分配 mm_embedding_loc                                                  │
-│                                                                              │
-│       ↓                                                                      │
-│                                                                              │
-│  ModelRunner (ForwardBatch)                                                 │
-│  ├── VIT 编码: pixel_values → image_embeddings                             │
-│  ├── 缓存: mm_cache.set(hash, embeddings)                                   │
-│  └── 融合 + LLM forward                                                    │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph DataFlow["多模态数据流转"]
+        direction TB
+        HTTP["HTTP Request<br/>images: base64/URL<br/>messages: role=user, content='&lt;image&gt; Describe'"]
+        TM["Tokenizer Manager<br/>process_mm_data_async<br/>- images: PIL.Image list<br/>- pixel_values: B,C,H,W tensor<br/>- image_grid_thw<br/>- input_ids with IMG_PAD"]
+        REQ["Req 对象<br/>- mm_data: pixel_values + image_grid_thw<br/>- mm_hashes<br/>- image_offsets: IMG_PAD 位置"]
+        SCHED["Scheduler<br/>ScheduleBatch -> ModelWorkerBatch<br/>- 检查 MultimodalCache<br/>- 分配 mm_embedding_loc"]
+        MR["ModelRunner ForwardBatch<br/>- VIT 编码: pixel_values -> image_embeddings<br/>- 缓存: mm_cache.set hash, embeddings<br/>- 融合 + LLM forward"]
+
+        HTTP --> TM --> REQ --> SCHED --> MR
+    end
 ```
 
 ## 9. 优化策略
@@ -567,22 +518,31 @@ python -m sglang.launch_server \
 
 默认情况下，VIT 编码在每个 TP rank 上执行完全相同的计算（冗余），浪费计算资源：
 
-```
-默认模式 (无 DP)：每个 GPU 处理所有图像
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  GPU_0: VIT([img1, img2, img3, img4]) → [emb1, emb2, emb3, emb4]           │
-│  GPU_1: VIT([img1, img2, img3, img4]) → [emb1, emb2, emb3, emb4]  (冗余)   │
-│  GPU_2: VIT([img1, img2, img3, img4]) → [emb1, emb2, emb3, emb4]  (冗余)   │
-│  GPU_3: VIT([img1, img2, img3, img4]) → [emb1, emb2, emb3, emb4]  (冗余)   │
-└─────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph NoDP["默认模式 无 DP: 每个 GPU 处理所有图像"]
+        ND0["GPU_0: VIT img1,img2,img3,img4 -> emb1,emb2,emb3,emb4"]
+        ND1["GPU_1: VIT img1,img2,img3,img4 -> emb1,emb2,emb3,emb4 冗余"]
+        ND2["GPU_2: VIT img1,img2,img3,img4 -> emb1,emb2,emb3,emb4 冗余"]
+        ND3["GPU_3: VIT img1,img2,img3,img4 -> emb1,emb2,emb3,emb4 冗余"]
+    end
 
-DP 模式：每个 GPU 处理部分图像，然后 All-Gather
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  GPU_0: VIT([img1])        → [emb1]        ─┐                              │
-│  GPU_1: VIT([img2])        → [emb2]         │    All-Gather                │
-│  GPU_2: VIT([img3])        → [emb3]         ├─────────────→ 全部 embeddings│
-│  GPU_3: VIT([img4])        → [emb4]        ─┘                              │
-└─────────────────────────────────────────────────────────────────────────────┘
+    subgraph DPMode["DP 模式: 每个 GPU 处理部分图像, 然后 All-Gather"]
+        D0["GPU_0: VIT img1 -> emb1"]
+        D1["GPU_1: VIT img2 -> emb2"]
+        D2["GPU_2: VIT img3 -> emb3"]
+        D3["GPU_3: VIT img4 -> emb4"]
+        AG["All-Gather -> 全部 embeddings"]
+        D0 --> AG
+        D1 --> AG
+        D2 --> AG
+        D3 --> AG
+    end
+
+    NoDP -->|"效率提升"| DPMode
+
+    style NoDP fill:#ffcccc
+    style DPMode fill:#ccffcc
 ```
 
 #### 9.3.2 负载均衡算法
@@ -597,36 +557,36 @@ def get_dp_encoder_lb_assignment(
 ) -> tuple[list[int], list[int], list[int]]:
     """
     贪心算法：按图像大小负载均衡分配到 GPU。
-    
+
     Example:
         sizes = [1000, 100, 200, 50]  # 4 张图像的 patch 数
         num_gpus = 2
-        
+
         # 按大小降序排列: [1000, 200, 100, 50] → 索引 [0, 2, 1, 3]
         # 贪心分配：
         #   GPU_0: [1000] (图像 0)
         #   GPU_1: [200, 100, 50] (图像 2, 1, 3)
-        
+
         Returns:
             shuffle_indices = [0, 2, 1, 3]  # 重排序索引
             gpu_sample_counts = [1, 3]       # 每 GPU 分配的图像数
             grouped_sizes = [1000, 350]      # 每 GPU 的总 patch 数
     """
-    
+
     # 1. 按大小降序排列
     large_to_small_indices = sorted(
         range(len(sizes)), key=lambda i: sizes[i], reverse=True
     )
-    
+
     # 2. 贪心分配：每次分配给当前负载最小的 GPU
     gpu_loads = [0] * num_gpus
     gpu_assignments = [[] for _ in range(num_gpus)]
-    
+
     for idx in large_to_small_indices:
         min_gpu = min(range(num_gpus), key=lambda i: gpu_loads[i])
         gpu_assignments[min_gpu].append(idx)
         gpu_loads[min_gpu] += sizes[idx]
-    
+
     return shuffle_indices, gpu_sample_counts, gpu_loads
 ```
 
@@ -642,7 +602,7 @@ def run_dp_sharded_mrope_vision_model(
 ):
     """
     在 TP 组上并行执行 VIT 编码。
-    
+
     执行流程:
     1. 计算每张图像的 patch 数
     2. 负载均衡分配
@@ -651,46 +611,46 @@ def run_dp_sharded_mrope_vision_model(
     5. All-Gather 收集所有 rank 的结果
     6. 按原始顺序重组 embeddings
     """
-    
+
     tp_size = get_tensor_model_parallel_world_size()
     tp_rank = get_tensor_model_parallel_rank()
-    
+
     # 1. 计算每张图像的 patch 数
     patches_per_image = [t * h * w for t, h, w in grid_thw_list]
     cum_patches = [0, *itertools.accumulate(patches_per_image)]
-    
+
     # 2. 负载均衡分配
     (image_to_tp_rank, gpu_sample_counts, grouped_pixel_values_len) = \
         get_dp_encoder_lb_assignment(patches_per_image, tp_size)
-    
+
     # 3. 提取本 rank 负责的图像索引
     cum_gpu_sample_counts = [0, *itertools.accumulate(gpu_sample_counts)]
     image_idxs_local = image_to_tp_rank[
         cum_gpu_sample_counts[tp_rank]:cum_gpu_sample_counts[tp_rank + 1]
     ]
-    
+
     # 4. 提取本 rank 负责的 pixel_values
     pixel_values_local = torch.cat([
         pixel_values[cum_patches[i]:cum_patches[i + 1]]
         for i in image_idxs_local
     ])
     local_grid_thw = [grid_thw_list[i] for i in image_idxs_local]
-    
+
     # 5. 执行 VIT 编码
     image_embeds_local = vision_model(pixel_values_local, torch.tensor(local_grid_thw))
-    
+
     # 6. Padding + All-Gather
     max_len = max(grouped_pixel_values_len) // embed_dim_reduction_factor
     padded = pad_to_length(image_embeds_local, max_len)
     gathered_embeds = tensor_model_parallel_all_gather(padded, dim=0)
-    
+
     # 7. 按原始顺序重组
     original_order_embeddings = [None] * len(grid_thw_list)
     for rank in range(tp_size):
         rank_images = get_images_for_rank(rank)
         for img_idx, embed in zip(rank_images, split_embeddings(rank)):
             original_order_embeddings[img_idx] = embed
-    
+
     return torch.cat(original_order_embeddings, dim=0)
 ```
 
@@ -894,7 +854,7 @@ flowchart TB
     end
 
     NoDP -.-x|"效率低"| DP
-    
+
     style NoDP fill:#ffcccc
     style DP fill:#ccffcc
 ```

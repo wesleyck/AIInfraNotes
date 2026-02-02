@@ -168,11 +168,11 @@ SGLang 使用 Orchestrator 模式管理三种惩罚器。
 
 ### 4.1 架构
 
-```
-BatchedPenalizerOrchestrator
-    ├── BatchedFrequencyPenalizer   # 频率惩罚
-    ├── BatchedPresencePenalizer    # 存在惩罚
-    └── BatchedMinNewTokensPenalizer # 最小长度惩罚
+```mermaid
+flowchart TD
+    Orch["BatchedPenalizerOrchestrator"] --> Freq["BatchedFrequencyPenalizer<br/>频率惩罚"]
+    Orch --> Pres["BatchedPresencePenalizer<br/>存在惩罚"]
+    Orch --> MinT["BatchedMinNewTokensPenalizer<br/>最小长度惩罚"]
 ```
 
 ### 4.2 频率惩罚 (Frequency Penalty)
@@ -294,65 +294,34 @@ class LogitsProcessorOutput:
 
 ### 6.1 完整流程
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          Sampler.forward() 流程                             │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │ Step 1: 预处理                                                        │   │
-│  │ ├─ 应用 custom_logit_processor (如 ThinkingBudget)                   │   │
-│  │ └─ 检测并处理 NaN (替换为 -1e5)                                      │   │
-│  └──────────────────────────────────────────────────────────────────────┘   │
-│                              │                                               │
-│                              ▼                                               │
-│  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │ Step 2: 分支                                                          │   │
-│  │                                                                        │   │
-│  │  is_all_greedy?                                                       │   │
-│  │  ├─ Yes → torch.argmax(logits, -1) ★ 快速路径                       │   │
-│  │  └─ No  → 继续                                                       │   │
-│  └──────────────────────────────────────────────────────────────────────┘   │
-│                              │                                               │
-│                              ▼                                               │
-│  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │ Step 3: 温度缩放                                                      │   │
-│  │ logits /= temperatures   # [batch_size, 1]                            │   │
-│  └──────────────────────────────────────────────────────────────────────┘   │
-│                              │                                               │
-│                              ▼                                               │
-│  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │ Step 4: Softmax → 概率                                                │   │
-│  │ probs = torch.softmax(logits, dim=-1)                                 │   │
-│  └──────────────────────────────────────────────────────────────────────┘   │
-│                              │                                               │
-│                              ▼                                               │
-│  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │ Step 5: 概率过滤 + 采样 (三种后端)                                    │   │
-│  │                                                                        │   │
-│  │  FlashInfer 后端 (最快):                                              │   │
-│  │  ├─ top_k_renorm_prob(probs, top_ks)                                 │   │
-│  │  ├─ top_p_renorm_prob(probs, top_ps)                                 │   │
-│  │  └─ min_p_sampling_from_probs(probs, min_ps)                         │   │
-│  │  或:                                                                   │   │
-│  │  └─ top_k_top_p_sampling_from_probs(probs, top_ks, top_ps)          │   │
-│  │                                                                        │   │
-│  │  PyTorch 后端 (通用):                                                 │   │
-│  │  ├─ sort → cumsum → mask (top-k, top-p, min-p)                       │   │
-│  │  └─ torch.multinomial(probs_filtered)                                 │   │
-│  └──────────────────────────────────────────────────────────────────────┘   │
-│                              │                                               │
-│                              ▼                                               │
-│  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │ Step 6: TP 同步 (多 GPU)                                              │   │
-│  │ if SYNC_TOKEN_IDS_ACROSS_TP:                                          │   │
-│  │     all_reduce(token_ids, op=MIN)                                     │   │
-│  └──────────────────────────────────────────────────────────────────────┘   │
-│                              │                                               │
-│                              ▼                                               │
-│                     return batch_next_token_ids                              │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph SamplerForward["Sampler.forward() 流程"]
+        S1["Step 1: 预处理<br/>- 应用 custom_logit_processor<br/>- 检测并处理 NaN, 替换为 -1e5"]
+        S1 --> S2{"Step 2: is_all_greedy?"}
+        S2 -->|Yes| S2Y["torch.argmax logits, -1<br/>快速路径"]
+        S2 -->|No| S3["Step 3: 温度缩放<br/>logits /= temperatures"]
+        S3 --> S4["Step 4: Softmax<br/>probs = torch.softmax logits, dim=-1"]
+        S4 --> S5["Step 5: 概率过滤 + 采样"]
+        S5 --> S6["Step 6: TP 同步<br/>if SYNC_TOKEN_IDS_ACROSS_TP:<br/>all_reduce token_ids, op=MIN"]
+        S2Y --> Result["return batch_next_token_ids"]
+        S6 --> Result
+    end
+
+    subgraph FlashInfer["FlashInfer 后端 - 最快"]
+        F1["top_k_renorm_prob probs, top_ks"]
+        F2["top_p_renorm_prob probs, top_ps"]
+        F3["min_p_sampling_from_probs probs, min_ps"]
+        F4["或: top_k_top_p_sampling_from_probs"]
+    end
+
+    subgraph PyTorch["PyTorch 后端 - 通用"]
+        P1["sort -> cumsum -> mask"]
+        P2["torch.multinomial probs_filtered"]
+    end
+
+    S5 --> FlashInfer
+    S5 --> PyTorch
 ```
 
 ### 6.2 Top-K / Top-P / Min-P 过滤算法
@@ -451,37 +420,15 @@ min_p_sampling_from_probs(            # min-p 采样
 
 ## 9. 端到端数据流示例
 
-```
-请求到达 (temperature=0.7, top_p=0.9, frequency_penalty=0.5)
-    │
-    ▼
-SamplingBatchInfo.from_schedule_batch()
-    ├─ temperatures = tensor([[0.7]])
-    ├─ top_ps = tensor([0.9])
-    ├─ is_all_greedy = False
-    └─ penalizer_orchestrator 初始化 (frequency_penalty=0.5)
-    │
-    ▼
-模型 forward → hidden_states
-    │
-    ▼
-LogitsProcessor._get_logits()
-    └─ logits = hidden_states @ lm_head.weight.T   # [1, vocab_size]
-    │
-    ▼
-SamplingBatchInfo.apply_logits_bias(logits)
-    └─ logits -= cumulated_frequency_penalties   # 频率惩罚
-    │
-    ▼
-Sampler.forward()
-    ├─ logits /= 0.7                              # 温度缩放
-    ├─ probs = softmax(logits)                     # → 概率
-    ├─ top_k_top_p_sampling(probs, top_p=0.9)     # 过滤+采样
-    └─ → token_id = 42
-    │
-    ▼
-penalizer_orchestrator.cumulate_output_tokens([42])
-    └─ cumulated_frequency_penalties[0, 42] += 0.5  # 下轮 token 42 惩罚 +0.5
+```mermaid
+flowchart TD
+    Req["请求到达<br/>temperature=0.7, top_p=0.9,<br/>frequency_penalty=0.5"]
+    Req --> Batch["SamplingBatchInfo.from_schedule_batch()<br/>temperatures = tensor 0.7<br/>top_ps = tensor 0.9<br/>is_all_greedy = False<br/>penalizer_orchestrator 初始化"]
+    Batch --> Forward["模型 forward -> hidden_states"]
+    Forward --> Logits["LogitsProcessor._get_logits()<br/>logits = hidden_states @ lm_head.weight.T"]
+    Logits --> Bias["SamplingBatchInfo.apply_logits_bias<br/>logits -= cumulated_frequency_penalties"]
+    Bias --> Sampler["Sampler.forward()<br/>logits /= 0.7 温度缩放<br/>probs = softmax logits<br/>top_k_top_p_sampling probs, top_p=0.9<br/>-> token_id = 42"]
+    Sampler --> Update["penalizer_orchestrator.cumulate_output_tokens<br/>cumulated_frequency_penalties 0,42 += 0.5<br/>下轮 token 42 惩罚 +0.5"]
 ```
 
 ## 10. 下一步

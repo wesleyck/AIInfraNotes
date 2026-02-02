@@ -57,18 +57,18 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-    subgraph Stage1["1. Bootstrap Queue"]
+    subgraph Stage1["1: Bootstrap Queue"]
         Init["初始化 Sender"]
         Handshake["握手: 与 Decode 协商"]
         Prealloc["预分配: 确认 KV 空间"]
     end
     
-    subgraph Stage2["2. Waiting Queue"]
+    subgraph Stage2["2: Waiting Queue"]
         Pop["PrefillAdder.add_one_req()"]
         Forward["运行 Forward"]
     end
     
-    subgraph Stage3["3. Inflight Queue"]
+    subgraph Stage3["3: Inflight Queue"]
         Poll["轮询 Sender 状态"]
         Done["传输完成"]
     end
@@ -84,23 +84,23 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-    subgraph Stage1["1. Prealloc Queue"]
+    subgraph Stage1["1: Prealloc Queue"]
         InitR["初始化 Receiver"]
         HS["握手: 与 Prefill 协商"]
         Alloc["预分配 KV 空间"]
     end
     
-    subgraph Stage2["2. Transfer Queue"]
+    subgraph Stage2["2: Transfer Queue"]
         PollT["轮询接收状态"]
         Recv["接收 KV 数据"]
     end
     
-    subgraph Stage3["3. Waiting Queue"]
+    subgraph Stage3["3: Waiting Queue"]
         Prebuilt["构建 PrebuiltExtendBatch"]
         Skip["跳过 Prefill Forward"]
     end
     
-    subgraph Stage4["4. Running Batch"]
+    subgraph Stage4["4: Running Batch"]
         Merge["合并到 Running Batch"]
         Decode["运行 Decode"]
     end

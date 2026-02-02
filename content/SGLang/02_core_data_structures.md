@@ -42,37 +42,18 @@ flowchart TB
 
 **详细层级关系**:
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          数据流转换流程                                      │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│   Req (请求级别) ★ 调度核心                                                  │
-│     │  schedule_batch.py:484                                                 │
-│     │  - 单个请求的完整生命周期状态                                          │
-│     │  - 包含输入、输出、KV Cache、多模态等                                  │
-│     │                                                                        │
-│     ▼                                                                        │
-│   ScheduleBatch (调度级别)                                                   │
-│     │  schedule_batch.py:1156                                                │
-│     │  - 由 Scheduler 管理                                                   │
-│     │  - 包含多个 Req 的批次信息                                             │
-│     │  - 主要在 CPU 上                                                       │
-│     │                                                                        │
-│     ▼  batch.get_model_worker_batch()                                       │
-│   ModelWorkerBatch (执行级别)                                                │
-│     │  schedule_batch.py:2189                                                │
-│     │  - 传递给 TPWorker                                                     │
-│     │  - 去除调度层专属信息                                                  │
-│     │                                                                        │
-│     ▼  ForwardBatch.init_new(batch, model_runner)                           │
-│   ForwardBatch (GPU 级别) ★ 前向核心                                         │
-│      forward_batch_info.py:227                                               │
-│      - 由 ModelRunner 管理                                                   │
-│      - 全部是 GPU Tensor                                                     │
-│      - 包含 attention backend、位置编码等                                    │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph Pipeline["数据流转换流程"]
+        REQ["<b>Req</b> (请求级别) ★ 调度核心<br/>schedule_batch.py:484<br/>- 单个请求的完整生命周期状态<br/>- 包含输入、输出、KV Cache、多模态等"]
+        SB["<b>ScheduleBatch</b> (调度级别)<br/>schedule_batch.py:1156<br/>- 由 Scheduler 管理<br/>- 包含多个 Req 的批次信息<br/>- 主要在 CPU 上"]
+        MWB["<b>ModelWorkerBatch</b> (执行级别)<br/>schedule_batch.py:2189<br/>- 传递给 TPWorker<br/>- 去除调度层专属信息"]
+        FB["<b>ForwardBatch</b> (GPU 级别) ★ 前向核心<br/>forward_batch_info.py:227<br/>- 由 ModelRunner 管理<br/>- 全部是 GPU Tensor<br/>- 包含 attention backend、位置编码等"]
+
+        REQ --> SB
+        SB -->|"batch.get_model_worker_batch()"| MWB
+        MWB -->|"ForwardBatch.init_new(batch, model_runner)"| FB
+    end
 ```
 
 **文件位置**:

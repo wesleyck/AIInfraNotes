@@ -4,35 +4,19 @@
 
 SGLang 的模型加载系统负责从各种格式（SafeTensors、PyTorch、GGUF 等）加载模型权重，并处理量化、分片等需求。
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        模型加载完整流程                                      │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  1. 确定加载格式                                                             │
-│     LoadFormat: AUTO | SAFETENSORS | PT | GGUF | DUMMY | SHARDED...         │
-│                                                                              │
-│  2. 选择 ModelLoader                                                        │
-│     ├── DefaultModelLoader (通用)                                           │
-│     ├── LayeredModelLoader (逐层量化)                                       │
-│     ├── QuantizedRLModelLoader (FP8 RL)                                     │
-│     ├── BitsAndBytesModelLoader (BNB 4/8bit)                                │
-│     ├── GGUFModelLoader (GGUF 格式)                                         │
-│     └── ShardedStateLoader (分片加载)                                       │
-│                                                                              │
-│  3. 准备权重                                                                │
-│     _prepare_weights() → 下载 / 定位本地文件                                │
-│                                                                              │
-│  4. 初始化模型                                                               │
-│     _initialize_model() → 创建模型结构 (带 quant_config)                    │
-│                                                                              │
-│  5. 加载权重                                                                │
-│     model.load_weights(weights_iterator)                                    │
-│                                                                              │
-│  6. 后处理                                                                  │
-│     quant_method.process_weights_after_loading()                            │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    A["1: 确定加载格式<br/>LoadFormat: AUTO | SAFETENSORS | PT | GGUF | DUMMY | SHARDED..."] --> B["2: 选择 ModelLoader"]
+    B --> B1["DefaultModelLoader (通用)"]
+    B --> B2["LayeredModelLoader (逐层量化)"]
+    B --> B3["QuantizedRLModelLoader (FP8 RL)"]
+    B --> B4["BitsAndBytesModelLoader (BNB 4/8bit)"]
+    B --> B5["GGUFModelLoader (GGUF 格式)"]
+    B --> B6["ShardedStateLoader (分片加载)"]
+    B1 & B2 & B3 & B4 & B5 & B6 --> C["3: 准备权重<br/>_prepare_weights() - 下载 / 定位本地文件"]
+    C --> D["4: 初始化模型<br/>_initialize_model() - 创建模型结构 (带 quant_config)"]
+    D --> E["5: 加载权重<br/>model.load_weights(weights_iterator)"]
+    E --> F["6: 后处理<br/>quant_method.process_weights_after_loading()"]
 ```
 
 ## 2. 核心类层次
@@ -303,10 +287,12 @@ def get_config(model, trust_remote_code, revision=None, ...):
 ```
 
 **配置加载流程：**
-```
-model_path → AutoConfig.from_pretrained() → config.json → hf_config
-                                                           ↓
-                                            ModelConfig(hf_config=config)
+```mermaid
+flowchart LR
+    A["model_path"] --> B["AutoConfig.from_pretrained()"]
+    B --> C["config.json"]
+    C --> D["hf_config"]
+    D --> E["ModelConfig(hf_config=config)"]
 ```
 
 ### 5.2 Tokenizer/Processor：依赖 Transformers

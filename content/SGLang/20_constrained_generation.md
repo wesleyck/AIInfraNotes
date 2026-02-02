@@ -55,20 +55,23 @@ def create_grammar_backend(server_args, tokenizer, vocab_size, eos_token_ids):
 
 ## 3. 类体系
 
-```
-BaseGrammarBackend (后端基类)
-    │
-    ├── XGrammarGrammarBackend      → XGrammarGrammar
-    ├── OutlinesGrammarBackend      → OutlinesGrammar
-    ├── GuidanceBackend             → GuidanceGrammar
-    └── ReasonerGrammarBackend      → ReasonerGrammarObject (包装器)
+```mermaid
+flowchart TB
+    subgraph "BaseGrammarBackend (后端基类)"
+        BGB["BaseGrammarBackend"]
+        BGB --> XGB["XGrammarGrammarBackend -> XGrammarGrammar"]
+        BGB --> OGB["OutlinesGrammarBackend -> OutlinesGrammar"]
+        BGB --> GB["GuidanceBackend -> GuidanceGrammar"]
+        BGB --> RGB["ReasonerGrammarBackend -> ReasonerGrammarObject (包装器)"]
+    end
 
-BaseGrammarObject (语法对象基类)
-    │
-    ├── XGrammarGrammar             # bitmask, C++ FSM
-    ├── OutlinesGrammar             # boolean mask, Python FSM
-    ├── GuidanceGrammar             # bitmask
-    └── ReasonerGrammarObject       # 包装其他语法对象
+    subgraph "BaseGrammarObject (语法对象基类)"
+        BGO["BaseGrammarObject"]
+        BGO --> XG["XGrammarGrammar: bitmask, C++ FSM"]
+        BGO --> OG["OutlinesGrammar: boolean mask, Python FSM"]
+        BGO --> GG["GuidanceGrammar: bitmask"]
+        BGO --> RGO["ReasonerGrammarObject: 包装其他语法对象"]
+    end
 ```
 
 ### 3.1 BaseGrammarObject 核心接口
@@ -124,32 +127,25 @@ apply_token_bitmask_inplace_triton(logits, bitmask, vocab_size)
 
 Grammar 编译可能耗时较长，SGLang 使用 `grammar_queue` 异步处理：
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    Grammar 异步编译流程                                      │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  请求到达 (json_schema="...")                                                │
-│      │                                                                       │
-│      ▼                                                                       │
-│  handle_generate_request()                                                   │
-│      ├─ key = ("json", schema_string)                                       │
-│      ├─ value, cache_hit = backend.get_cached_or_future_value(key)          │
-│      │                                                                       │
-│      ├─ if cache_hit:                                                       │
-│      │      req.grammar = compiled_grammar    → waiting_queue              │
-│      │                                                                       │
-│      └─ if cache miss:                                                      │
-│             req.grammar = Future[grammar]     → grammar_queue              │
-│             └─ ThreadPoolExecutor 异步编译                                  │
-│                                                                              │
-│  每轮事件循环:                                                               │
-│      move_ready_req_from_grammar_queue_to_waiting_queue()                   │
-│      ├─ future.result(timeout=0.03) 非阻塞检查                             │
-│      ├─ 编译完成 → 缓存结果 → 移入 waiting_queue                           │
-│      └─ 超时 (300s) → abort 请求                                           │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    A["请求到达 (json_schema=...)"] --> B["handle_generate_request()"]
+    B --> C["key = (json, schema_string)"]
+    C --> D["backend.get_cached_or_future_value(key)"]
+    D --> E{cache_hit?}
+
+    E -- "cache hit" --> F["req.grammar = compiled_grammar"]
+    F --> G["waiting_queue"]
+
+    E -- "cache miss" --> H["req.grammar = Future grammar"]
+    H --> I["grammar_queue"]
+    I --> J["ThreadPoolExecutor 异步编译"]
+
+    K["每轮事件循环"] --> L["move_ready_req_from_grammar_queue_to_waiting_queue()"]
+    L --> M["future.result timeout=0.03 非阻塞检查"]
+    M --> N{"编译完成?"}
+    N -- "完成" --> O["缓存结果 -> 移入 waiting_queue"]
+    N -- "超时 300s" --> P["abort 请求"]
 ```
 
 ### 5.2 关键配置
