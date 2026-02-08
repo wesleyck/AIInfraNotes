@@ -45,14 +45,17 @@ flowchart TB
 ```mermaid
 flowchart TD
     subgraph Pipeline["数据流转换流程"]
-        REQ["<b>Req</b> (请求级别) ★ 调度核心<br/>schedule_batch.py:484<br/>- 单个请求的完整生命周期状态<br/>- 包含输入、输出、KV Cache、多模态等"]
-        SB["<b>ScheduleBatch</b> (调度级别)<br/>schedule_batch.py:1156<br/>- 由 Scheduler 管理<br/>- 包含多个 Req 的批次信息<br/>- 主要在 CPU 上"]
-        MWB["<b>ModelWorkerBatch</b> (执行级别)<br/>schedule_batch.py:2189<br/>- 传递给 TPWorker<br/>- 去除调度层专属信息"]
-        FB["<b>ForwardBatch</b> (GPU 级别) ★ 前向核心<br/>forward_batch_info.py:227<br/>- 由 ModelRunner 管理<br/>- 全部是 GPU Tensor<br/>- 包含 attention backend、位置编码等"]
+        REQ["<b>Req</b> (请求级别) 调度核心<br/>schedule_batch.py:484<br/>• 单个请求的完整生命周期状态<br/>• 包含输入、输出、KV Cache、多模态等"]
+        
+        SB["<b>ScheduleBatch</b> (调度级别)<br/>schedule_batch.py:1156<br/>• 由 Scheduler 管理<br/>• 包含多个 Req 的批次信息<br/>• 主要在 CPU 上"]
+        
+        MWB["<b>ModelWorkerBatch</b> (执行级别)<br/>schedule_batch.py:2189<br/>• 传递给 TPWorker<br/>• 去除调度层专属信息"]
+        
+        FB["<b>ForwardBatch</b> (GPU 级别) ★ 前向核心<br/>forward_batch_info.py:227<br/>• 由 ModelRunner 管理<br/>• 全部是 GPU Tensor<br/>• 包含 attention backend、位置编码等"]
 
         REQ --> SB
-        SB -->|"batch.get_model_worker_batch()"| MWB
-        MWB -->|"ForwardBatch.init_new(batch, model_runner)"| FB
+        SB -->|batch.get_model_worker_batch| MWB
+        MWB -->|ForwardBatch.init_new| FB
     end
 ```
 
@@ -78,7 +81,7 @@ class Req:
 
         # ========== 输入信息 ==========
         self.origin_input_text = origin_input_text  # 原始输入文本
-        self.origin_input_ids = origin_input_ids    # tokenize 后的 ID 列表
+        self.origin_input_ids = origin_input_ids    # tokenize 后的 ID list
         self.origin_input_ids_unpadded = ...        # 图像 padding 前的 ID
 
         # ========== 输出信息 ==========
@@ -87,7 +90,7 @@ class Req:
                                                     # 用于下一轮输入
 
         # ========== 采样参数 ==========
-        self.sampling_params = sampling_params      # 温度、top_p 等
+        self.sampling_params = sampling_params      # temperature、top_p etc..
 ```
 
 #### KV Cache 管理
@@ -241,14 +244,22 @@ class ForwardMode(IntEnum):
     IDLE = auto()           # 空闲: DP attention 某些 worker 无任务
 
     TARGET_VERIFY = auto()  # Speculative: 目标模型验证
-    DRAFT_EXTEND = auto()   # Speculative: 草稿模型扩展
+    DRAFT_EXTEND = auto()   # Speculative: 草稿模型扩展 (v1)
+    DRAFT_EXTEND_V2 = auto()  # Speculative: 草稿模型扩展 (v2, Eagle)
     PREBUILT = auto()       # 分离式解码: KV cache 已就绪
     SPLIT_PREFILL = auto()  # PD 复用: 分割 prefill
     DLLM_EXTEND = auto()    # Diffusion LLM
 
-    def is_extend(self):
-        """是否是 extend 类型 (需要处理多个输入 token)"""
-        return self in [EXTEND, MIXED, DRAFT_EXTEND, TARGET_VERIFY, SPLIT_PREFILL, DLLM_EXTEND]
+    def is_extend(self, include_draft_extend_v2: bool = False):
+        """是否是 extend 类型 (需要处理多个输入 token)
+        include_draft_extend_v2: 是否将 DRAFT_EXTEND_V2 也视为 extend
+                                 默认 False, 因为 V2 有独立的处理路径"""
+        return (
+            self == EXTEND or self == MIXED or self == DRAFT_EXTEND
+            or (include_draft_extend_v2 and self == DRAFT_EXTEND_V2)
+            or self == TARGET_VERIFY or self == SPLIT_PREFILL
+            or self == DLLM_EXTEND
+        )
 
     def is_decode(self):
         """是否是 decode 类型 (每个请求仅 1 个 token)"""
@@ -385,7 +396,7 @@ class ModelWorkerBatch:
     out_cache_loc: torch.Tensor       # [total_new_tokens], KV 写入位置
 
     # ========== 辅助信息 ==========
-    seq_lens_cpu: Optional[torch.Tensor]  # CPU 副本
+    seq_lens_cpu: Optional[torch.Tensor]  # CPU copy
     seq_lens_sum: int                     # 总 token 数
 
     # ========== Logprob ==========
@@ -432,22 +443,34 @@ class MultimodalInputs:
     mm_items: List[MultimodalDataItem] = None
     # MultimodalDataItem 包含:
     #   - modality: Modality (IMAGE/VIDEO/AUDIO)
-    #   - offsets: List[int]  # 在 input_ids 中的位置
-    #   - feature: torch.Tensor  # pixel_values 或 audio_features
+    #   - offsets: List[int]         # 在 input_ids 中的位置
+    #   - feature: torch.Tensor      # pixel_values 或 audio_features
+    #   - format: MultimodalInputFormat  # NORMAL / PRECOMPUTED_EMBEDDINGS
+    #   - precomputed_embeddings: Optional[Tensor]  # 预计算的编码器 embeddings
+    #   - model_specific_data: dict  # 模型特有数据 (如 attention_mask)
 
     # ========== 图像 Padding ==========
     image_pad_len: List[int] = None
+    num_image_tokens: Optional[int] = None    # 图像 token 总数
+
+    # ========== Image Token ID ==========
+    im_token_id: Optional[int] = None
+    im_start_id: Optional[int] = None
+    im_end_id: Optional[int] = None
+    slice_start_id: Optional[int] = None      # 图像切片开始 token
+    slice_end_id: Optional[int] = None        # 图像切片结束 token
+
+    # ========== Video Token ID ==========
+    video_token_id: Optional[int] = None
+
+    # ========== Audio Token ID ==========
+    audio_token_id: Optional[int] = None
+    audio_start_id: Optional[int] = None      # 音频开始 token
+    audio_end_id: Optional[int] = None        # 音频结束 token
 
     # ========== Qwen 系列特有: M-ROPE 位置编码 ==========
     mrope_positions: Optional[torch.Tensor] = None    # [3, seq_len]
     mrope_position_delta: Optional[torch.Tensor] = None
-
-    # ========== Token ID ==========
-    im_start_id: Optional[int] = None
-    im_end_id: Optional[int] = None
-    im_token_id: Optional[int] = None
-    video_token_id: Optional[int] = None
-    audio_token_id: Optional[int] = None
 ```
 
 ### M-ROPE 位置编码 (Qwen3-VL)
@@ -573,7 +596,7 @@ def init_new(cls, batch: ModelWorkerBatch, model_runner: ModelRunner):
 
 ## 7. 数据流转示例
 
-### 6.1 Prefill 阶段 (Qwen3-VL 图像请求)
+### 7.1 Prefill 阶段 (Qwen3-VL 图像请求)
 
 ```python
 # 1. 用户请求到达
@@ -620,7 +643,7 @@ worker_batch = batch.get_model_worker_batch()
 result = tp_worker.forward_batch_generation(worker_batch)
 ```
 
-### 6.2 Decode 阶段
+### 7.2 Decode 阶段
 
 ```python
 # Prefill 完成后，请求合并到 running_batch

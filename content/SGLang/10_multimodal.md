@@ -297,6 +297,290 @@ def handle_multimodal_request(req):
     req.need_mm_encode = True
 ```
 
+### 4.3 DP 模式下的 VIT Cache 架构
+
+本节详细分析启用 Data Parallel (`--mm-enable-dp-encoder`) 时 VIT embedding 缓存的存储位置、数据分布和传输机制。
+
+#### 4.3.1 Cache 存放位置
+
+**核心发现**：Cache 存储在 **CPU 内存**，使用时动态加载到 GPU。
+
+```python
+# managers/mm_utils.py L759-769
+def get_embedding_and_mask(...):
+    # 缓存存储时：移动到 CPU
+    embedding_for_cache = embedding_per_chunk.detach().cpu()
+    if not embedding_cache.set(embedding_items_hash, embedding_for_cache):
+        print("[WARN] Multimodal embedding cache is full...")
+
+    # 使用时：从 CPU 加载到目标 GPU
+    target_device = embedding_items_per_req[0].feature.device
+    if embedding_per_chunk.device != target_device:
+        embedding_per_chunk = embedding_per_chunk.to(target_device)
+```
+
+```mermaid
+flowchart TB
+    subgraph Storage["存储位置演变"]
+        direction LR
+        PV["pixel_values<br/>GPU (输入)"]
+        VIT["VIT Forward<br/>GPU"]
+        EMB["embedding<br/>GPU (输出)"]
+        CACHE["embedding_cache<br/>**CPU 内存**"]
+        USE["使用时<br/>GPU (目标设备)"]
+
+        PV --> VIT --> EMB
+        EMB -->|"detach().cpu()"| CACHE
+        CACHE -->|".to(target_device)"| USE
+    end
+
+    style CACHE fill:#fff3cd,stroke:#ffc107,stroke-width:2px
+```
+
+#### 4.3.2 每个 Rank 的数据分布
+
+**结论**：每个 Rank 处理 **部分图像** (不是全量)，通过 All-Gather 聚合。
+
+```mermaid
+flowchart TB
+    subgraph DP_Distribution["DP 模式数据分布 (4张图像, 4个 GPU)"]
+        direction TB
+
+        subgraph Input["输入数据"]
+            I0["img0: 1250 patches"]
+            I1["img1: 100 patches"]
+            I2["img2: 200 patches"]
+            I3["img3: 50 patches"]
+        end
+
+        subgraph LB["负载均衡分配"]
+            LB_ALG["get_dp_encoder_lb_assignment()<br/>贪心算法: 大图像优先分配到负载最轻的 GPU"]
+        end
+
+        subgraph Ranks["各 Rank 处理部分数据"]
+            R0["Rank 0: img0<br/>**部分数据**<br/>patches=1250"]
+            R1["Rank 1: img2<br/>**部分数据**<br/>patches=200"]
+            R2["Rank 2: img1<br/>**部分数据**<br/>patches=100"]
+            R3["Rank 3: img3<br/>**部分数据**<br/>patches=50"]
+        end
+
+        subgraph Gather["All-Gather 后"]
+            ALL["每个 Rank 拥有<br/>**全量 embeddings**"]
+        end
+
+        Input --> LB --> Ranks
+        R0 --> ALL
+        R1 --> ALL
+        R2 --> ALL
+        R3 --> ALL
+    end
+
+    style Ranks fill:#e6f3ff,stroke:#0066cc
+    style Gather fill:#d4edda,stroke:#28a745
+```
+
+#### 4.3.3 数据流转: pixel_value → VIT embedding → embedding
+
+完整的数据流转分为 3 个阶段：
+
+```mermaid
+flowchart TB
+    subgraph Phase1["阶段 1: 输入分发"]
+        direction TB
+        P1_IN["pixel_values<br/>[total_patches, C]"]
+        P1_LB["负载均衡分配"]
+        P1_R0["Rank 0: pixel_values_local"]
+        P1_R1["Rank 1: pixel_values_local"]
+        P1_RN["Rank N: pixel_values_local"]
+
+        P1_IN --> P1_LB
+        P1_LB --> P1_R0
+        P1_LB --> P1_R1
+        P1_LB --> P1_RN
+    end
+
+    subgraph Phase2["阶段 2: 并行 VIT 编码"]
+        direction TB
+        P2_R0["Rank 0: VIT(pixel_local)<br/>→ embed_local [N0, D]"]
+        P2_R1["Rank 1: VIT(pixel_local)<br/>→ embed_local [N1, D]"]
+        P2_RN["Rank N: VIT(pixel_local)<br/>→ embed_local [Nn, D]"]
+    end
+
+    subgraph Phase3["阶段 3: 聚合与缓存"]
+        direction TB
+        P3_PAD["Padding 到 max_len"]
+        P3_AG["NCCL All-Gather<br/>GPU → GPU"]
+        P3_REORDER["去 Padding + 恢复原始顺序"]
+        P3_CACHE["存入 CPU Cache<br/>embedding.detach().cpu()"]
+        P3_FUSE["融合到 input_embeds<br/>送入 LLM"]
+
+        P3_PAD --> P3_AG --> P3_REORDER
+        P3_REORDER --> P3_CACHE
+        P3_REORDER --> P3_FUSE
+    end
+
+    P1_R0 --> P2_R0
+    P1_R1 --> P2_R1
+    P1_RN --> P2_RN
+
+    P2_R0 --> P3_PAD
+    P2_R1 --> P3_PAD
+    P2_RN --> P3_PAD
+
+    style Phase2 fill:#d4edda,stroke:#28a745
+    style P3_AG fill:#cce5ff,stroke:#007bff,stroke-width:2px
+    style P3_CACHE fill:#fff3cd,stroke:#ffc107,stroke-width:2px
+```
+
+**代码实现**：
+
+```python
+# multimodal/mm_utils.py L465-651
+def run_dp_sharded_mrope_vision_model(vision_model, pixel_values, grid_thw_list, rope_type):
+    tp_size = get_tensor_model_parallel_world_size()
+    tp_rank = get_tensor_model_parallel_rank()
+
+    # 1. 计算每张图像的 patch 数
+    patches_per_image = [t * h * w for t, h, w in grid_thw_list]
+
+    # 2. 负载均衡分配
+    (image_to_tp_rank, gpu_sample_counts, grouped_pixel_values_len) = \
+        get_dp_encoder_lb_assignment(patches_per_image, tp_size)
+
+    # 3. 提取本 Rank 负责的 pixel_values
+    pixel_values_local = torch.cat([
+        pixel_values[cum_patches[i]:cum_patches[i + 1]]
+        for i in image_idxs_local
+    ])
+
+    # 4. 本地 VIT 编码
+    image_embeds_local = vision_model(pixel_values_local, local_grid_thw)
+
+    # 5. Padding + All-Gather (NCCL)
+    padded = pad_to_length(image_embeds_local, max_len)
+    gathered_embeds = tensor_model_parallel_all_gather(padded, dim=0)
+
+    # 6. 去 Padding，按原始顺序重组
+    return reorder_embeddings(gathered_embeds, original_indices)
+```
+
+#### 4.3.4 传输方式
+
+| 传输类型 | 方式 | 说明 |
+|---------|------|------|
+| **GPU ↔ GPU** | NCCL All-Gather | VIT embeddings 聚合，高带宽 GPU 直连 |
+| **进程间请求分发** | ZMQ (Zero Message Queue) | DataParallelController → Scheduler 进程 |
+| **CPU ↔ GPU** | PyTorch `.to(device)` | Cache 读取时 CPU→GPU |
+
+```mermaid
+flowchart LR
+    subgraph Transport["传输方式"]
+        direction TB
+
+        subgraph NCCL["GPU 间通信 (NCCL)"]
+            G0["GPU 0"] <-->|"All-Gather"| G1["GPU 1"]
+            G1 <-->|"All-Gather"| G2["GPU 2"]
+            G2 <-->|"All-Gather"| G3["GPU 3"]
+        end
+
+        subgraph ZMQ["进程间通信 (ZMQ)"]
+            DPC["DataParallelController<br/>(主进程)"]
+            S0["Scheduler 0"]
+            S1["Scheduler 1"]
+            DPC -->|"PUSH/PULL"| S0
+            DPC -->|"PUSH/PULL"| S1
+        end
+
+        subgraph CPU_GPU["CPU ↔ GPU"]
+            CACHE["CPU Cache"]
+            GPU["GPU"]
+            CACHE <-->|".to(device)"| GPU
+        end
+    end
+
+    style NCCL fill:#cce5ff,stroke:#007bff
+    style ZMQ fill:#f8d7da,stroke:#dc3545
+    style CPU_GPU fill:#fff3cd,stroke:#ffc107
+```
+
+#### 4.3.5 Cache 分布: 全局 vs 每个 Rank
+
+**结论**：**每个 Rank 进程有独立的 Cache 副本**（非共享内存）。
+
+```mermaid
+flowchart TB
+    subgraph CacheArch["Cache 架构 (DP 模式)"]
+        direction TB
+
+        DPC["DataParallelController<br/>(主进程)"]
+
+        subgraph Rank0["Rank 0 进程"]
+            S0["Scheduler 0"]
+            C0["embedding_cache<br/>(全局单例)<br/>**独立 CPU 内存**"]
+            G0["GPU 0"]
+        end
+
+        subgraph Rank1["Rank 1 进程"]
+            S1["Scheduler 1"]
+            C1["embedding_cache<br/>(全局单例)<br/>**独立 CPU 内存**"]
+            G1["GPU 1"]
+        end
+
+        DPC -->|"请求分发"| S0
+        DPC -->|"请求分发"| S1
+        S0 --> C0
+        S1 --> C1
+        C0 <--> G0
+        C1 <--> G1
+
+        G0 <-->|"NCCL"| G1
+    end
+
+    style C0 fill:#fff3cd,stroke:#ffc107
+    style C1 fill:#fff3cd,stroke:#ffc107
+```
+
+**关键代码**：
+
+```python
+# managers/mm_utils.py L371-376
+# 全局变量: 每个进程独立
+embedding_cache: Optional[MultiModalStaticCache] = None
+
+def init_mm_embedding_cache(max_size: int = 0):
+    global embedding_cache
+    embedding_cache = MultiModalStaticCache(max_size)  # 进程内单例
+
+# managers/scheduler.py 初始化
+from sglang.srt.managers.mm_utils import init_mm_embedding_cache
+init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
+```
+
+#### 4.3.6 DP 模式 VIT Cache 总结
+
+| 问题 | 答案 |
+|------|------|
+| Cache 存放位置 | **CPU 内存** (使用 `.detach().cpu()`) |
+| 每个 Rank 数据 | **部分数据** (负载均衡分片) |
+| 数据流转 | pixel → 本地 VIT → All-Gather → 全量 embedding |
+| 传输方式 | **NCCL** (GPU间) + **ZMQ** (进程间) + **PyTorch .to()** (CPU↔GPU) |
+| Cache 分布 | **每个 Rank 独立 Cache** (Python 全局变量，进程隔离) |
+
+```mermaid
+flowchart TB
+    subgraph Summary["VIT Cache DP 模式总结"]
+        Q1["Cache 存放?"] --> A1["CPU 内存"]
+        Q2["Rank 数据?"] --> A2["部分数据 (负载均衡)"]
+        Q3["传输方式?"] --> A3["NCCL + ZMQ + .to()"]
+        Q4["Cache 分布?"] --> A4["每 Rank 独立副本"]
+    end
+
+    style A1 fill:#fff3cd
+    style A2 fill:#d4edda
+    style A3 fill:#cce5ff
+    style A4 fill:#f8d7da
+```
+
 ## 5. VIT CUDA Graph
 
 ### 5.1 ViTCudaGraphRunner

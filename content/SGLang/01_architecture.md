@@ -8,49 +8,89 @@
 
 SGLang 采用多进程架构，核心进程包括：
 
+**单卡 (TP=1) 进程模型**:
+
 ```mermaid
-flowchart TD
+flowchart LR
     subgraph MainProcess["Main Process"]
         HTTP["HTTP Server (FastAPI)"]
-        TM["TokenizerManager (tokenize)"]
-        Template["TemplateManager (chat template)"]
+        TM["TokenizerManager"]
+        Template["TemplateManager"]
         HTTP --- TM --- Template
     end
 
-    TM -->|ZMQ| Sched
-    TM -->|ZMQ| Detok
-
-    subgraph SchedProcess["Scheduler Process"]
-        Sched["Scheduler (调度批次)"]
-        TPW["TPWorker (模型执行)"]
+    subgraph SchedProcess["Scheduler Process (rank 0)"]
+        Sched["Scheduler"]
+        TPW["TPWorker (GPU)"]
         Sched --> TPW
     end
 
     subgraph DetokProcess["Detokenizer Process"]
-        Detok["Detokenizer (解码token)"]
+        Detok["Detokenizer"]
     end
 
-    Detok -->|ZMQ| Sched
+    TM -->|"① ZMQ: TokenizedReq"| Sched
+    Sched -->|"② ZMQ: BatchTokenIDOut"| Detok
+    Detok -->|"③ ZMQ: BatchStrOut"| TM
 ```
+
+通信是**单向环形**: TokenizerManager → Scheduler → Detokenizer → TokenizerManager。
+
+**多卡 (TP>1) 进程模型**:
+
+```mermaid
+flowchart LR
+    subgraph MainProcess["Main Process"]
+        TM["TokenizerManager"]
+    end
+
+    subgraph Sched0["Scheduler Process (rank 0)"]
+        S0["Scheduler"]
+        W0["TPWorker (GPU 0)"]
+        S0 --> W0
+    end
+
+    subgraph Sched1["Scheduler Process (rank 1)"]
+        S1["Scheduler"]
+        W1["TPWorker (GPU 1)"]
+        S1 --> W1
+    end
+
+    subgraph DetokProcess["Detokenizer Process"]
+        Detok["Detokenizer"]
+    end
+
+    TM -->|"ZMQ"| S0
+    S0 -->|"ZMQ"| Detok
+    Detok -->|"ZMQ"| TM
+
+    W0 <-->|"NCCL"| W1
+```
+
+TP>1 时每个 rank 一个 Scheduler 进程，但**只有 rank 0** 持有 ZMQ 连接负责外部通信，TP 间通过 **NCCL** 同步。
 
 ### 1.1 各进程职责
 
 | 进程 | 组件 | 职责 |
 |------|------|------|
 | Main | HTTP Server | 接收 HTTP/gRPC 请求 |
-| Main | TokenizerManager | 文本分词、多模态预处理 (Qwen3-VL 图像/视频处理) |
-| Subprocess | Scheduler | 批次调度、GPU 执行 |
-| Subprocess | Detokenizer | token 解码为文本 |
+| Main | TokenizerManager | 文本分词(text->token_id)、多模态预处理 (Qwen3-VL 图像/视频处理) |
+| Subprocess | Scheduler (×TP) | 批次调度、GPU 执行；仅 rank 0 负责 ZMQ 通信 |
+| Subprocess | Detokenizer | token 解码为文本(token_id -> text) |
 
 ### 1.2 进程间通信
 
-使用 **ZMQ (ZeroMQ)** 进行进程间通信：
-- Main → Scheduler: 发送 tokenized 请求
-- Scheduler → Detokenizer: 发送生成的 token IDs
-- Detokenizer → Main: 发送解码后的文本
+使用 **ZMQ (ZeroMQ)** 进行进程间通信，形成单向环形:
+1. **TokenizerManager → Scheduler (rank 0)**: 发送 tokenized 请求 (`TokenizedGenerateReqInput`)
+2. **Scheduler (rank 0) → Detokenizer**: 发送生成的 token IDs (`BatchTokenIDOutput`)
+3. **Detokenizer → TokenizerManager**: 发送解码后的文本 (`BatchStrOutput`)
+
+> **注意**: TokenizerManager 不直接与 Detokenizer 通信，所有请求必须经过 Scheduler 中转。(前向时)
 
 **关键代码位置**:
-- 进程启动: `srt/entrypoints/engine.py:_launch_subprocesses()` (L900)
+- 进程启动: `srt/entrypoints/engine.py:_launch_subprocesses()` (L900，函数定义位置)
+- HTTP 方式调用: `srt/entrypoints/http_server.py` (L1692，import 并调用 `_launch_subprocesses`)
+- Python API 方式: `srt/entrypoints/engine.py:Engine.__init__()` (L160，同样调用 `_launch_subprocesses`)
 - ZMQ 通信: `srt/managers/tokenizer_communicator_mixin.py`
 
 ## 2. 核心组件
@@ -102,10 +142,10 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 # 核心类
 class Scheduler:
     def __init__(self, ...):
-        self.waiting_queue = []      # 等待队列
-        self.running_batch = None    # 正在运行的批次
-        self.tree_cache = RadixCache(...)  # 前缀缓存
-        self.tp_worker = TPWorker(...)     # 模型执行器
+        self.waiting_queue = []      # 等待队列 init_running_status
+        self.running_batch = None    # 正在运行的批次 init_running_status
+        self.tree_cache = RadixCache(...)  # 前缀缓存 init_cache_with_memory_pool
+        self.tp_worker = TPWorker(...)     # 模型执行器 init_model_worker
 ```
 
 ### 2.3 TPWorker (Scheduler 内)
@@ -136,152 +176,57 @@ SGLang 默认使用 **overlap 模式** 的事件循环，通过 CPU/GPU 重叠�
 
 ```mermaid
 gantt
-    title CPU/GPU Overlap Pipeline
+    title CPU/GPU Overlap Pipeline (event_loop_overlap)
     dateFormat X
     axisFormat %s
 
-    section Batch N-1
-    GPU forward              :a1, 0, 6
+    section CPU
+    Phase1+2 recv+schedule (N)       :a1, 0, 3
+    Phase5 process_result(N-1)       :a3, 4, 7
+    Phase6 launch_sample(N)          :a4, 7, 8
+    Phase1+2 recv+schedule (N+1)     :a5, 8, 11
+    Phase5 process_result(N)         :a7, 12, 15
+    Phase6 launch_sample(N+1)        :a8, 15, 16
 
-    section Batch N
-    CPU recv_requests        :a2, 3, 5
-    CPU get_next_batch       :a3, 5, 7
-    CPU process_result N-1   :a4, 7, 9
-    GPU forward              :a5, 9, 15
-
-    section Batch N+1
-    CPU recv_requests        :a6, 12, 14
-    CPU get_next_batch       :a7, 14, 16
-    CPU process_result N     :a8, 16, 18
-    GPU forward              :a9, 18, 24
+    section GPU
+    forward(N)                       :b1, 3, 12
+    forward(N+1)                     :b2, 11, 20
 ```
 
-**核心思想**: 当 GPU 执行当前批次的 forward 时，CPU 同时处理上一批次的结果，实现流水线并行。
+每轮循环的阶段对应 `event_loop_overlap()` 代码:
 
-### 3.2 event_loop_overlap 详细代码分析
+| 阶段 | 操作 | 与 GPU 关系 |
+|------|------|------------|
+| Phase 1 | `recv_requests()` + `process_input_requests()` | GPU forward(N-1) 已完成 |
+| Phase 2 | `get_next_batch_to_run()` | 调度下一个批次 |
+| Phase 3 | `run_batch(batch)` | **启动** GPU forward(N)，异步执行 |
+| Phase 4 | (disable_overlap 时) 立即处理结果 | — |
+| Phase 5 | `pop_and_process()` 处理 N-1 结果 | **与 GPU forward(N) 重叠** |
+| Phase 6 | `launch_batch_sample_if_needed()` | 与 GPU forward(N) 重叠 |
 
-```python
-# srt/managers/scheduler.py:1099
-@DynamicGradMode()
-def event_loop_overlap(self):
-    """A scheduler loop that overlaps the CPU processing and GPU computation."""
+**核心思想**: GPU forward(N) 异步执行期间，CPU **只重叠做** `process_batch_result(N-1)` + `launch_batch_sample`。而 `recv_requests` 和 `get_next_batch` 在 `run_batch` **之前**执行（Phase 1-2），不与当前 forward 重叠。
 
-    # result_queue 用于存储待处理的 (batch, result) 对
-    # 关键: 结果不会立即处理，而是延迟到下一轮循环
-    self.result_queue: Deque[
-        Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
-    ] = deque()
+GPU 两次 forward 之间有短暂间隙，这是 Phase 1+2（接收请求 + 调度）的 CPU 开销，无法避免。
 
-    def pop_and_process():
-        # 从队列取出并处理上一批结果
-        tmp_batch, tmp_result = self.result_queue.popleft()
-        self.process_batch_result(tmp_batch, tmp_result)
+### 3.2 event_loop_overlap 代码结构
 
-    while True:
-        # ========== 阶段1: 接收新请求 ==========
-        recv_reqs = self.recv_requests()
-        self.process_input_requests(recv_reqs)
-        if self._engine_paused:
-            continue
+`event_loop_overlap()` 的核心是一个 **result_queue 延迟处理**机制：当前批次的结果放入队列，等到下一轮循环、GPU 已经在处理新批次时再由 CPU 处理。连续 prefill 或特殊模式下会禁用 overlap，立即处理结果。
 
-        # ========== 阶段2: 获取下一个批次 ==========
-        # 统一入口: get_next_batch_to_run()
-        # 内部会调用 get_new_batch_prefill() 或 update_running_batch()
-        batch = self.get_next_batch_to_run()
-        self.cur_batch = batch
-
-        # 检查是否需要禁用 overlap (如连续 prefill)
-        disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
-
-        # 如果需要禁用 overlap，立即处理上一批结果
-        if disable_overlap_for_batch:
-            pop_and_process()
-
-        # ========== 阶段3: 启动当前批次的 GPU 计算 ==========
-        if batch:
-            batch_result = self.run_batch(batch)
-            # 将结果加入队列，延迟处理
-            self.result_queue.append((batch.copy(), batch_result))
-        else:
-            batch_result = None
-
-        # ========== 阶段4: 处理上一批结果 (CPU/GPU 重叠) ==========
-        if self.last_batch:
-            if not disable_overlap_for_batch:
-                # 关键: 在 GPU 执行当前 batch 的同时，CPU 处理上一批结果
-                pop_and_process()
-        elif batch is None:
-            # 空闲时执行自检
-            self.self_check_during_idle()
-
-        # ========== 阶段5: 启动采样 (如需要) ==========
-        if self.is_generation:
-            self.launch_batch_sample_if_needed(batch_result)
-
-        # 更新 last_batch
-        self.last_batch = batch
-```
+> **详细代码分析、流程图、`is_disable_overlap_for_batch` 条件、`result_queue` 机制**: 见 **03_scheduler.md §2**
 
 ### 3.3 get_next_batch_to_run() 调度逻辑
 
 **文件**: `srt/managers/scheduler.py:get_next_batch_to_run()` (L1778)
 
-这是调度的核心入口，决定下一个要运行的批次：
+调度的统一入口，按以下顺序决定下一个批次：
+1. 处理上轮 chunked prefill 残留请求（缓存 + 释放 `req_pool_idx`）
+2. 合并上轮 prefill 完成的请求到 `running_batch`
+3. 尝试 `get_new_batch_prefill()` 创建新 prefill 批次
+4. 无新 prefill 时，`update_running_batch()` 继续 decode
 
-```python
-def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
-    # 1. 处理 chunked prefill 的请求
-    if self.chunked_req:
-        # 将 chunked 请求移出当前 batch，释放其 req_pool_idx
-        chunked_req_to_exclude.add(self.chunked_req)
-        self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
-        self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
+**调度优先级**: Prefill > Decode（例外：`batch_is_full` 为 True 且无 `chunked_req` 时跳过 prefill）
 
-    # 2. 合并上一轮 prefill 完成的请求到 running_batch
-    if self.last_batch and self.last_batch.forward_mode.is_extend():
-        self.last_batch.filter_batch(chunked_req_to_exclude=...)
-        if not self.last_batch.is_empty() and not self.last_batch.is_prefill_only:
-            if self.running_batch.is_empty():
-                self.running_batch = self.last_batch
-            else:
-                self.running_batch.merge_batch(self.last_batch)
-
-    # 3. 尝试获取新的 prefill 批次
-    new_batch = self.get_new_batch_prefill()
-
-    # 4. 决定返回 prefill 还是 decode 批次
-    if new_batch is not None:
-        # 优先运行 prefill
-        ret = new_batch
-    else:
-        # 运行 decode
-        if not self.running_batch.is_empty():
-            self.running_batch = self.update_running_batch(self.running_batch)
-            ret = self.running_batch if not self.running_batch.is_empty() else None
-        else:
-            ret = None
-
-    return ret
-```
-
-**调度优先级**: Prefill > Decode
-
-### 3.4 为什么没有 get_new_batch_decode()?
-
-SGLang 的设计中，decode 批次不需要单独创建函数：
-- **Prefill 完成后**，请求自动合并到 `running_batch`
-- **update_running_batch()** 负责更新 decode 批次（检查内存、处理 retraction 等）
-- `running_batch` 会持续进行 decode 直到请求完成
-
-```mermaid
-flowchart LR
-    A["waiting_queue"] --> B["get_new_batch_prefill()"]
-    B --> C["prefill 完成"]
-    C --> D["合并到 running_batch"]
-    D --> E["update_running_batch()"]
-    E --> F["decode 循环"]
-    F --> G["完成"]
-```
+> **完整流程图、代码分析、"为什么没有 get_new_batch_decode"**: 见 **03_scheduler.md §4**
 
 ## 4. 请求生命周期 (以 Qwen3-VL 多模态请求为例)
 
@@ -328,53 +273,61 @@ sequenceDiagram
     HTTP->>User: Response (stream/complete)
 ```
 
-**详细步骤分解**:
+**详细步骤分解** (按时间顺序):
 
-```mermaid
-flowchart TD
-    A["1: 用户请求到达 (包含图像 + 文本)"] --> B["2: HTTP Server 接收 (http_server.py)"]
-    B --> C["3: TokenizerManager 处理"]
-    C --> C1["tokenize(text) -> input_ids"]
-    C --> C2["QwenVLImageProcessor.process_mm_data_async()"]
-    C2 --> C2a["加载图像/视频数据"]
-    C2 --> C2b["smart_resize() 调整图像尺寸"]
-    C2 --> C2c["计算 mrope_positions (多模态旋转位置编码)"]
-    C2 --> C2d["构造 MultimodalInputs"]
-    C1 --> C3["构造 TokenizedGenerateReqInput"]
-    C2d --> C3
-
-    C3 -->|"ZMQ send"| D["4: Scheduler 接收 (handle_generate_request)"]
-    D --> D1["创建 Req 对象 (req.multimodal_inputs = MultimodalInputs)"]
-    D1 --> D2["加入 waiting_queue"]
-
-    D2 -->|"事件循环"| E["5: Scheduler.event_loop_overlap()"]
-    E --> E1["get_next_batch_to_run()"]
-    E1 --> E1a["get_new_batch_prefill()"]
-    E1a --> E1a1["从 waiting_queue 选取请求"]
-    E1a --> E1a2["查询 RadixCache (前缀复用)"]
-    E1a --> E1a3["分配 KV Cache"]
-    E1a --> E1a4["构造 ScheduleBatch (forward_mode=EXTEND)"]
-    E1 --> E1b["或 update_running_batch() (用于 decode)"]
-    E1b --> E1b1["检查内存, 必要时 retract"]
-    E1b --> E1b2["准备 decode 批次"]
-
-    E --> E2["run_batch(batch)"]
-    E2 --> E2a["batch.get_model_worker_batch() -> ModelWorkerBatch"]
-    E2 --> E2b["model_worker.forward_batch_generation()"]
-    E2b --> E2b1["模型前向 (包含视觉编码器)"]
-    E2b --> E2b2["logits -> 采样 -> next_token"]
-    E2b --> E2b3["返回 GenerationBatchResult"]
-
-    E --> E3["process_batch_result()"]
-    E3 --> E3a["更新 req.output_ids"]
-    E3 --> E3b["检查终止条件 (EOS, max_tokens)"]
-    E3 --> E3c["发送结果到 Detokenizer"]
-
-    E3c -->|"ZMQ send"| F["6: Detokenizer 解码"]
-    F --> F1["decode(token_ids) -> text"]
-    F1 --> F2["发送回 TokenizerManager"]
-
-    F2 -->|"ZMQ send"| G["7: 返回给用户"]
+```
+步骤 1 ─ 用户请求到达
+│  POST /v1/chat/completions (text + image)
+▼
+步骤 2 ─ HTTP Server 接收 (http_server.py)
+│  FastAPI 路由 → handle_generate_request()
+▼
+步骤 3 ─ TokenizerManager 处理 (主进程)
+│  3a. tokenize(text) → input_ids
+│  3b. QwenVLImageProcessor.process_mm_data_async()
+│      ├─ 加载图像/视频数据
+│      ├─ smart_resize() 调整图像尺寸
+│      ├─ 计算 mrope_positions (多模态旋转位置编码)
+│      └─ 构造 MultimodalInputs
+│  3c. 组装 TokenizedGenerateReqInput
+│
+│  ── ZMQ send ──→
+▼
+步骤 4 ─ Scheduler 接收 (handle_generate_request)
+│  4a. 创建 Req 对象 (req.multimodal_inputs = MultimodalInputs)
+│  4b. 加入 waiting_queue
+▼
+步骤 5 ─ Scheduler.event_loop_overlap() 调度
+│  5a. get_next_batch_to_run()
+│      ├─ [Prefill] get_new_batch_prefill()
+│      │   ├─ 从 waiting_queue 选取请求
+│      │   ├─ 查询 RadixCache (前缀复用)
+│      │   ├─ 分配 KV Cache
+│      │   └─ 构造 ScheduleBatch (forward_mode=EXTEND)
+│      └─ [Decode] update_running_batch()
+│          ├─ 检查内存，必要时 retract
+│          └─ 准备 decode 批次
+│  5b. run_batch(batch)
+│      ├─ batch.get_model_worker_batch() → ModelWorkerBatch
+│      └─ model_worker.forward_batch_generation()
+│          ├─ 模型前向 (含视觉编码器 ViT)
+│          ├─ logits → 采样 → next_token
+│          └─ 返回 GenerationBatchResult
+│  5c. process_batch_result()  (与下一轮 GPU forward 重叠)
+│      ├─ 更新 req.output_ids
+│      ├─ 检查终止条件 (EOS, max_tokens)
+│      └─ 发送结果到 Detokenizer
+│
+│  ── ZMQ send ──→
+▼
+步骤 6 ─ Detokenizer 解码
+│  6a. decode(token_ids) → text
+│  6b. 发送回 TokenizerManager
+│
+│  ── ZMQ send ──→
+▼
+步骤 7 ─ TokenizerManager 返回给用户
+   HTTP Response (stream/complete)
 ```
 
 ## 5. 核心数据结构与转换链
@@ -410,9 +363,22 @@ BatchStrOutput:
 
 ### 6.1 入门顺序
 
-1. **先看 Engine**: `srt/entrypoints/engine.py`
-   - 理解进程启动流程
-   - `_launch_subprocesses()` 函数
+SGLang 有两种启动方式，入口不同:
+
+**方式 A: HTTP Server (默认，`python -m sglang.launch_server`)**
+
+1. **先看 HTTP Server 入口**: `srt/entrypoints/launch_server.py` → `srt/entrypoints/http_server.py`
+   - `launch_server.py` 解析命令行参数，调用 `http_server.py:launch_server()`
+   - `launch_server()` 内调用 `_launch_subprocesses()` 启动 Scheduler、Detokenizer 等子进程
+   - 然后启动 FastAPI HTTP 服务
+
+**方式 B: Engine Python API (`sgl.Engine()`)**
+
+1. **看 Engine**: `srt/entrypoints/engine.py`
+   - `Engine.__init__()` 同样调用 `_launch_subprocesses()` 启动子进程
+   - 适用于 Python 程序直接集成，不启动 HTTP 服务
+
+两种方式殊途同归: 都通过 `_launch_subprocesses()` 启动相同的子进程架构。
 
 2. **再看 Scheduler 初始化**: `srt/managers/scheduler.py`
    - `__init__()` 方法

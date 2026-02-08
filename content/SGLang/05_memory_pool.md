@@ -476,7 +476,283 @@ with torch.cuda.use_mem_pool(self.custom_mem_pool):
     # 分配可以跨 GPU 高效传输的内存
 ```
 
-## 10. 下一步
+## 10. 显存占用分析与 OOM 机制
+
+### 10.1 显存占用分类
+
+| 类别 | 分配时机 | 是否预分配 | 生命周期 |
+|------|---------|-----------|---------|
+| 模型权重 | 启动时 | ✅ 静态 | 全程常驻 |
+| KV Cache | 启动时 | ✅ 静态 | 全程常驻 |
+| 模型激活 | 前向时 | ❌ 动态 | 单次 forward |
+| ViT 激活 | 图片处理时 | ❌ 动态 | 图片处理期间 |
+| 图片像素 | 请求到达时 | ❌ 动态 | 请求处理期间 |
+| 多模态 embedding | ViT 后 | ⚠️ 缓存 | LRU 管理 |
+
+### 10.2 静态显存 (启动时分配)
+
+#### 模型权重
+
+```python
+# 加载模型时一次性分配
+model = AutoModelForCausalLM.from_pretrained(...)
+# 权重大小 ≈ 参数量 × bytes_per_param
+```
+
+#### KV Cache
+
+```python
+# memory_pool.py - 启动时预分配
+self.k_buffer = [torch.zeros((size + page_size, head_num, head_dim), ...) for _ in range(layer_num)]
+self.v_buffer = [torch.zeros((size + page_size, head_num, head_dim), ...) for _ in range(layer_num)]
+```
+
+**计算公式**:
+```
+KV Cache 大小 = 2 × layers × max_tokens × num_kv_heads × head_dim × bytes_per_elem
+```
+
+**关键理解**: KV cache 物理内存**启动时一次性分配完毕**，运行时 allocator 只管理索引，不触发 CUDA allocator。
+
+### 10.3 动态显存 (运行时分配)
+
+#### 模型激活
+
+- **Attention**: Q/K/V 投影、attention scores、softmax 中间结果
+- **FFN/MoE**: 上投影、激活函数、下投影中间结果
+- **大小**: 与 `batch_size × seq_len` 成正比
+
+#### ViT 激活 (多模态)
+
+```python
+# 处理图片时的中间激活
+pixel_values = image.to(cuda)  # 动态分配
+vit_embeddings = vit_model(pixel_values)  # 中间激活
+```
+
+**风险场景**:
+- 超大图片 (4K+) → patch 数量多 → ViT 激活大
+- 多图请求 → 累积激活
+
+#### 图片像素到 CUDA
+
+```python
+# mm_utils.py - 请求处理时
+pixel_values = pixel_values.to(device)  # 动态拷贝到 GPU
+```
+
+### 10.4 OOM 类型对比
+
+#### SGLang 逻辑 OOM (KV Cache)
+
+**特点**: 可检测、可恢复
+
+```python
+# allocator.py - 返回 None 而非触发 CUDA 错误
+def alloc(self, need_size: int):
+    if need_size > len(self.free_pages):
+        return None  # ← 逻辑层面的 "OOM"
+    ...
+```
+
+**检测点**:
+
+| 阶段 | 检测函数 | 处理方式 |
+|------|---------|---------|
+| Prefill 调度 | `PrefillAdder.rem_total_tokens` | 拒绝新请求 |
+| Decode 阶段 | `batch.check_decode_mem()` | 触发 Retraction |
+
+#### 真正的 CUDA OOM
+
+**特点**: 无法提前检测、进程崩溃
+
+| 场景 | 原因 | SGLang 防护 |
+|------|------|------------|
+| 模型激活过大 | batch_size × seq_len 过大 | `max_running_requests`, `max_prefill_tokens` 间接限制 |
+| ViT 激活过大 | 超大图片 | 无精确限制 |
+| 碎片累积 | PyTorch allocator 碎片 | 依赖 PyTorch 自身整理 |
+
+```mermaid
+flowchart TB
+    subgraph Static[静态显存 - 启动时确定]
+        W[模型权重]
+        KV[KV Cache]
+    end
+    
+    subgraph Dynamic[动态显存 - 运行时变化]
+        ACT[模型激活]
+        VIT[ViT 激活]
+        PIX[图片像素]
+        MM[多模态 embedding]
+    end
+    
+    subgraph OOM[OOM 场景]
+        O1[KV Cache 逻辑 OOM<br/>可检测可恢复]
+        O2[激活 CUDA OOM<br/>进程崩溃]
+    end
+    
+    KV --> |check_decode_mem| O1
+    ACT --> |无精确检测| O2
+    VIT --> |无精确检测| O2
+```
+
+### 10.5 OOM 预防机制
+
+#### 核心问题
+
+真正的 CUDA OOM **原则上不可完全避免**，因为动态显存（activation、ViT 激活等）的实际大小取决于:
+- 输入图片的实际分辨率/数量
+- 模型的实际计算路径
+- PyTorch allocator 的行为
+
+**没有精确的运行时检测机制**，只能靠启动时的估算。
+
+#### 自动估算机制
+
+SGLang 会根据 GPU 型号**自动计算**关键参数，用户通常不需要手动指定：
+
+```python
+# server_args.py:909-951 - 自动计算 mem_fraction_static
+
+reserved_mem = 512  # 元数据常量 (MB)
+
+# 1. Activation 预留: chunked_prefill_size × 1.5 GB
+#    系数 1.5 是经验值，未来可通过 dummy run 更精确估算
+reserved_mem += max(chunked_prefill_size, 2048) * 1.5
+
+# 2. CUDA Graph 预留: cuda_graph_max_bs × 2 GB
+reserved_mem += cuda_graph_max_bs * 2
+
+# 3. 并行度调整
+reserved_mem += tp_size * pp_size / 8 * 1024
+
+# 4. DP Attention 额外开销
+if enable_dp_attention:
+    reserved_mem += cuda_graph_max_bs * dp_size * 3
+
+# 5. 投机解码额外开销
+if speculative_algorithm == "STANDALONE":
+    reserved_mem += 6 * 1024
+
+# 最终计算
+mem_fraction_static = (gpu_mem - reserved_mem) / gpu_mem
+```
+
+#### GPU 型号 → 默认配置
+
+| GPU 显存 | 代表型号 | chunked_prefill_size | cuda_graph_max_bs |
+|----------|----------|---------------------|------------------|
+| < 20GB | T4, 4080 | 2048 | 8 |
+| 20-35GB | A10, 4090, 5090 | 2048 | 24 (TP<4) / 80 |
+| 35-60GB | A100-40G, L40 | 4096 | 32 (TP<4) / 160 |
+| 60-90GB | H100, A100-80G | 8192 | 256 (TP<4) / 512 |
+| 90-160GB | H20, H200 | 8192 | 256 (TP<4) / 512 |
+| > 160GB | B200, MI300 | 16384 | 512 |
+
+#### VLM 额外调整
+
+多模态模型需要额外降低 `mem_fraction_static`：
+
+```python
+# server_args.py:4877-4913 - adjust_mem_fraction_for_vlm
+
+# 基础降低系数
+base_mem_fraction_reduction_ratio = 0.95
+
+# 根据 ViT 复杂度动态调整 (0.8 ~ 1.05)
+current_complexity = vit_num_layers * (vit_hidden_size ** 2)
+baseline_complexity = 24 * (1024 ** 2)  # ViT-L/14
+complexity_ratio = current_complexity / baseline_complexity
+
+# 每增长 100% 复杂度，降低 10%
+dynamic_adjustment_factor = 1.0 - 0.1 * (complexity_ratio - 1.0)
+dynamic_adjustment_factor = clamp(dynamic_adjustment_factor, 0.8, 1.05)
+
+# 最终调整
+mem_fraction_static *= 0.95 * dynamic_adjustment_factor
+```
+
+#### 用户可调参数
+
+| 参数 | 作用 | 使用场景 |
+|------|------|----------|
+| `--mem-fraction-static 0.75` | 降低 KV Cache 占比，预留更多动态空间 | 自动估算不准时手动调低 |
+| `--chunked-prefill-size 2048` | 限制单次 prefill token 数 | 减少 activation 峰值 |
+
+#### 预防策略决策树
+
+```mermaid
+flowchart TB
+    Start[启动服务] --> Auto[自动估算\n根据 GPU 型号设置\nchunked_prefill_size\ncuda_graph_max_bs\nmem_fraction_static]
+    Auto --> VLM{是否 VLM?}
+    VLM -->|是| Adjust[额外降低\nmem_fraction_static\n× 0.95 × ViT因子]
+    VLM -->|否| Run[运行服务]
+    Adjust --> Run
+    
+    Run --> OOM{遇到 OOM?}
+    OOM -->|KV Cache 逻辑 OOM| Retract[自动 Retraction\n增加 new_token_ratio]
+    OOM -->|CUDA OOM| Manual[手动调整]
+    
+    Manual --> M1[方案 A: --chunked-prefill-size 2048\n减少 LLM activation]
+    Manual --> M2[方案 B: --mem-fraction-static 0.75\n增加预留空间]
+    Manual --> M3[方案 C: 业务层限制\n图片大小/数量]
+    
+    M1 --> Retry[重启服务]
+    M2 --> Retry
+    M3 --> Retry
+    Retry --> Run
+```
+
+#### 核心结论
+
+1. **逻辑 OOM (KV Cache)**: 有检测、有恢复 → Retraction 机制自动处理
+2. **真正 CUDA OOM (Activation)**: 无精确检测 → 只能靠经验估算 + 手动调参
+3. **没有银弹**: VLM 的图片大小/数量不可预测，只能通过经验调参或业务层限制
+
+### 10.6 碎片问题
+
+#### KV Cache: 无碎片
+
+基于页的分配，页大小固定:
+
+```
+free_pages: [5, 8, 12, 3, 7, ...]  # 不连续的索引
+alloc(3) → [5, 8, 12]              # 从头取
+free([5, 8, 12]) → 归还到尾部     # 追加到末尾
+```
+
+页内容可能分散在物理 buffer 的不同位置，但**不影响分配效率**——只要有空闲页就能分配。
+
+#### 多模态 embedding: 可能有碎片
+
+```python
+# multimodal_cache.py - 动态分配
+class MultiModalStaticCache:
+    def set(self, mm_hash, embedding, ...):
+        while self.current_size + data_size > self.max_size:
+            self.mm_cache.popitem(last=False)  # 驱逐 LRU
+        self.mm_cache[mm_hash] = embedding  # 每个 tensor 独立分配
+```
+
+不同大小图片的 embedding 动态分配/释放，可能产生 CUDA allocator 碎片，但通常不严重:
+- PyTorch CUDA allocator 有碎片整理机制
+- embedding 相比 KV cache 较小
+- `max_size` 限制了缓存总量
+
+### 10.7 显存监控
+
+```python
+# 运行时监控
+torch.cuda.memory_allocated()      # 当前分配
+torch.cuda.memory_reserved()       # 当前保留 (含 allocator 缓存)
+torch.cuda.max_memory_allocated()  # 峰值
+
+# SGLang metrics
+stats.kv_cache_usage      # KV Cache 使用率
+stats.running_req_count   # 运行请求数
+```
+
+## 11. 下一步
 
 - **06**: RadixCache 前缀缓存 (radix_cache.py)
 - **07**: ModelRunner 与 CUDA Graph

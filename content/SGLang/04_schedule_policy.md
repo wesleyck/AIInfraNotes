@@ -14,22 +14,29 @@
 
 ```mermaid
 flowchart TB
+    %% 决策点文字换行，避免菱形太宽
+    Decision{"tree_cache<br/>是否启用?"}
+
     subgraph Main["调度策略分类"]
-        direction TB
-        subgraph CAP["CacheAwarePolicy - 缓存感知策略"]
-            LPM["LPM - longest prefix match"]
-            DFS["DFS_WEIGHT - 深度优先权重"]
-        end
-        subgraph CGP["CacheAgnosticPolicy - 缓存无关策略"]
+        direction LR  %% 让两个子图左右排列，或者改为 TB 上下排列以防重叠
+        
+        subgraph CGP["CacheAgnosticPolicy<br/>(缓存无关策略)"]
+            direction TB
             FCFS["FCFS - first come first serve<br/>先进先出 ★ 默认"]
             LOF["LOF - longest output first<br/>最长输出优先"]
             RANDOM["RANDOM - 随机"]
         end
+
+        subgraph CAP["CacheAwarePolicy<br/>(缓存感知策略)"]
+            direction TB
+            LPM["LPM - longest prefix match<br/>最长前缀匹配"]
+            DFS["DFS_WEIGHT - 深度优先权重"]
+        end
     end
 
-    Decision{"tree_cache 是否启用?"}
-    Decision -->|"tree_cache.disable = True"| CGP
-    Decision -->|"tree_cache.disable = False"| CAP
+    %% 连线上的文字如果太长，也建议换行
+    Decision -->|"tree_cache.disable = True<br/>(禁用缓存)"| CGP
+    Decision -->|"tree_cache.disable = False<br/>(启用缓存)"| CAP
 ```
 
 ## 2. SchedulePolicy 类
@@ -58,39 +65,6 @@ class SchedulePolicy:
 ```
 
 ### 2.2 calc_priority 流程
-
-```mermaid
-flowchart TB
-    Start["calc_priority(waiting_queue)"] --> FCFS_Check{"policy == FCFS?"}
-
-    FCFS_Check -->|Yes| PrioritySort{"enable_priority<br/>_scheduling?"}
-    PrioritySort -->|Yes| SortFCFS["_sort_by_priority_and_fcfs()"]
-    PrioritySort -->|No| Return1["return (保持 FCFS 顺序)"]
-    SortFCFS --> Return1
-
-    FCFS_Check -->|No| Degrade{"LPM && queue > 128?"}
-    Degrade -->|Yes| ToFCFS["降级为 FCFS"]
-    Degrade -->|No| PolicyType{"策略类型?"}
-
-    ToFCFS --> Return1
-
-    PolicyType -->|CacheAwarePolicy| ComputePrefix["_compute_prefix_matches()"]
-    PolicyType -->|CacheAgnosticPolicy| Agnostic{"具体策略?"}
-
-    ComputePrefix --> CacheAware{"具体策略?"}
-    CacheAware -->|LPM| SortLPM["_sort_by_longest_prefix()"]
-    CacheAware -->|DFS_WEIGHT| SortDFS["_sort_by_dfs_weight()"]
-
-    Agnostic -->|LOF| SortLOF["_sort_by_longest_output()"]
-    Agnostic -->|RANDOM| SortRandom["_sort_randomly()"]
-
-    SortLPM --> Return2["return"]
-    SortDFS --> Return2
-    SortLOF --> Return2
-    SortRandom --> Return2
-```
-
-**详细流程图**:
 
 ```mermaid
 flowchart TB
@@ -306,7 +280,7 @@ flowchart TB
     subgraph Components["组成"]
         AT["available_tokens<br/>= token_to_kv_pool_allocator.available_size()<br/>空闲的 KV cache slots"]
         ET["evictable_tokens<br/>= tree_cache.evictable_size()<br/>可驱逐的 RadixCache 节点"]
-        RT["reserved_tokens<br/>= Sum of running_req.max_new_tokens * new_token_ratio<br/>running_batch 中请求的预留空间"]
+        RT["reserved_tokens (rem_total_token_offset)<br/>= Sum of min(max_new_tokens - len(output_ids), CLIP_MAX_NEW_TOKENS) * new_token_ratio<br/>running_batch 中每个请求的预留空间"]
     end
 
     Formula --> Components
@@ -316,6 +290,19 @@ flowchart TB
         B2["2: rem_input_tokens > 0<br/>输入 token 不能超 - max_prefill_tokens"]
         B3["3: rem_chunk_tokens > 0<br/>分块 token 不能超 - chunked_prefill_size"]
     end
+```
+
+**rem_total_token_offset 精确公式**:
+
+```python
+# schedule_policy.py PrefillAdder.__init__
+rem_total_token_offset = 0
+for req in running_batch.reqs:
+    rem_total_token_offset += min(
+        max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+        CLIP_MAX_NEW_TOKENS,  # 默认 4096
+    )
+rem_total_token_offset = int(rem_total_token_offset * new_token_ratio)
 ```
 
 ### 6.3 add_one_req 流程
@@ -330,7 +317,9 @@ flowchart TB
     BudgetCheck2 -->|"Yes (如果已有请求)"| Other["OTHER"]
     BudgetCheck2 -->|No| LockNode["with _lock_node(req.last_node)<br/>锁定节点防止驱逐"]
 
-    LockNode --> HierCache["Hierarchical Cache: 加载 host 缓存"]
+    LockNode --> HostCheck{"req.host_hit_length > 0?"}
+    HostCheck -->|Yes| HierCache["init_load_back(): host→device 加载<br/>扩展 prefix_indices<br/>更新 extend_input_len"]
+    HostCheck -->|No| ChunkCheck
     HierCache --> ChunkCheck{"input_tokens <= rem_chunk_tokens?"}
 
     ChunkCheck -->|"Yes: Non-chunked prefill"| AddRun["can_run_list.append(req)<br/>tree_cache.inc_lock_ref(req.last_node)<br/>_update_prefill_budget(...)"]
@@ -340,7 +329,44 @@ flowchart TB
     TruncCalc --> RetState
 ```
 
-### 6.4 AddReqResult 状态
+### 6.4 _lock_node 与 Hierarchical Cache
+
+#### `_lock_node` (schedule_policy.py:473)
+
+`_lock_node` 是一个 **context manager**，用于在 `add_one_req` 期间锁定 RadixCache 节点，防止被缓存驱逐策略淘汰：
+
+```python
+@contextmanager
+def _lock_node(self, last_node: TreeNode):
+    try:
+        self.tree_cache.inc_lock_ref(last_node)  # lock_ref += 1
+        yield None
+    finally:
+        self.tree_cache.dec_lock_ref(last_node)   # lock_ref -= 1
+```
+
+**为什么需要锁**: `add_one_req` 分两步检查预算（锁前粗检查 + 锁内精确检查），获取锁后 `rem_total_tokens` 可能已改变（因为 `inc_lock_ref` 会将节点标记为不可驱逐），需要重新检查。
+
+#### Hierarchical Cache: `init_load_back` (schedule_policy.py:606)
+
+当启用 `enable_hicache_storage` 且请求的 `host_hit_length > 0` 时，说明在 host (CPU/SSD) 上有额外的缓存命中，需要加载回 GPU：
+
+```python
+if req.host_hit_length > 0:
+    new_indices, req.last_node = self.tree_cache.init_load_back(
+        req.last_host_node, req.host_hit_length
+    )
+    req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
+    req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+```
+
+**`real_input_tokens` 计算**: 初始 token 预算检查时考虑 host 命中长度：
+```python
+real_input_tokens = req.extend_input_len - req.host_hit_length  # 扣除 host 缓存
+real_input_tokens = ceil_paged_tokens(real_input_tokens)         # 按 page_size 向上对齐
+```
+
+### 6.5 AddReqResult 状态
 
 ```python
 class AddReqResult(Enum):

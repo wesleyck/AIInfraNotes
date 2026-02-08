@@ -17,8 +17,8 @@
 flowchart LR
     A["HTTP Request"] --> B["HTTP Server<br/>(FastAPI)"]
     B --> C["TokenizerManager<br/>(tokenize +<br/>多模态预处理)"]
-    C -->|"ZMQ"| D["Scheduler<br/>(调度批次)"]
-    D --> E["ModelRunner<br/>(模型前向)"]
+    C -->|"ZMQ"| D["Scheduler<br/>(调度batch)"]
+    D --> E["ModelRunner<br/>(model forward)"]
     E --> F["Sampling<br/>(logits→token)"]
     F --> G["Constrained<br/>Generation<br/>(Grammar/StructTag)"]
     G --> H["Detokenizer<br/>(token→text)"]
@@ -44,45 +44,45 @@ flowchart TD
 ## 笔记目录
 
 ### Phase 0: 全局架构
-- [x] `01_architecture.md` - 系统架构、进程模型、event_loop_overlap、请求生命周期
+- [ ] `01_architecture.md` - 系统架构、进程模型、event_loop_overlap、请求生命周期
 
 ### Phase 1: 数据结构
-- [x] `02_core_data_structures.md` - Req、ScheduleBatch、ModelWorkerBatch、ForwardBatch、MultimodalInputs
+- [ ] `02_core_data_structures.md` - Req、ScheduleBatch、ModelWorkerBatch、ForwardBatch、MultimodalInputs
 
 ### Phase 2: 调度系统
-- [x] `03_scheduler.md` - Scheduler 事件循环、批次调度、retraction、结果处理
-- [x] `04_schedule_policy.md` - PrefillAdder、In-batch prefix caching、优先级抢占
+- [ ] `03_scheduler.md` - Scheduler 事件循环、批次调度、retraction、结果处理
+- [ ] `04_schedule_policy.md` - PrefillAdder、In-batch prefix caching、优先级抢占
 
 ### Phase 3: 内存管理
-- [x] `05_memory_pool.md` - GPU/Host 内存池设计、KVCache 变体、分配器
-- [x] `06_radix_cache.md` - RadixAttention 前缀缓存、逐出策略、锁机制
+- [ ] `05_memory_pool.md` - GPU/Host 内存池设计、KVCache 变体、分配器
+- [ ] `06_radix_cache.md` - RadixAttention 前缀缓存、逐出策略、锁机制
 
 ### Phase 4: 模型执行
-- [x] `07_model_runner.md` - ModelRunner、CUDA Graph、ForwardBatch
-- [x] `08_attention_backends.md` - FlashInfer、FlashAttention、Triton 等后端
-- [x] `09_model_loading.md` - 模型加载、权重处理、量化支持
-- [x] `10_multimodal.md` - 多模态完整生命周期、VIT 处理、图像缓存
+- [ ] `07_model_runner.md` - ModelRunner、CUDA Graph、ForwardBatch
+- [ ] `08_attention_backends.md` - FlashInfer、FlashAttention、Triton 等后端
+- [ ] `09_model_loading.md` - 模型加载、权重处理、量化支持
+- [ ] `10_multimodal.md` - 多模态完整生命周期、VIT 处理、图像缓存
 
 ### Phase 5: 高级特性
-- [x] `11_chunked_prefill.md` - 分块预填充
-- [x] `12_speculative_decoding.md` - EAGLE、NGram 投机解码
-- [x] `13_parallel_strategies.md` - TP/PP/EP/DP 并行策略
-- [x] `14_pd_disaggregation.md` - Prefill-Decode 分离
+- [ ] `11_chunked_prefill.md` - 分块预填充
+- [ ] `12_speculative_decoding.md` - EAGLE、NGram 投机解码
+- [ ] `13_parallel_strategies.md` - TP/PP/EP/DP 并行策略
+- [ ] `14_pd_disaggregation.md` - Prefill-Decode 分离
 
 ### Phase 6: Kernel 实现
-- [x] `15_sgl_kernel_overview.md` - sgl-kernel 架构
-- [x] `16_attention_kernels.md` - Attention kernel 实现
-- [x] `17_moe_kernels.md` - MoE kernel 实现
-- [x] `18_quantization.md` - 量化实现详解
+- [ ] `15_sgl_kernel_overview.md` - sgl-kernel 架构
+- [ ] `16_attention_kernels.md` - Attention kernel 实现
+- [ ] `17_moe_kernels.md` - MoE kernel 实现
+- [ ] `18_quantization.md` - 量化实现详解
 
 ### Phase 7: 生成与约束
-- [x] `19_sampling_and_generation.md` - 采样参数、惩罚机制、LogitsProcessor、Sampler
-- [x] `20_constrained_generation.md` - Grammar Backend、JSON Schema、词表掩码、跳跃解码
-- [x] `21_reasoning_and_function_call.md` - 推理解析 (ReasoningParser)、函数调用 (FunctionCallParser)
+- [ ] `19_sampling_and_generation.md` - 采样参数、惩罚机制、LogitsProcessor、Sampler
+- [ ] `20_constrained_generation.md` - Grammar Backend、JSON Schema、词表掩码、跳跃解码
+- [ ] `21_reasoning_and_function_call.md` - 推理解析 (ReasoningParser)、函数调用 (FunctionCallParser)
 
 ### Phase 8: 特殊模型与适配
-- [x] `22_embedding_and_rerank.md` - Embedding/Rerank 模型 (Pooler, CrossEncodingPooler, SparsePooler)
-- [x] `23_lora.md` - LoRA 适配器 (S-LoRA, Punica, 内存池, 多后端)
+- [ ] `22_embedding_and_rerank.md` - Embedding/Rerank 模型 (Pooler, CrossEncodingPooler, SparsePooler)
+- [ ] `23_lora.md` - LoRA 适配器 (S-LoRA, Punica, 内存池, 多后端)
 
 ## 核心文件速查
 
