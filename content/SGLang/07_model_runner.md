@@ -37,6 +37,46 @@ flowchart LR
     Scheduler -->|ModelWorkerBatch| ModelRunner -->|ForwardBatch| CudaGraphRunner
 ```
 
+## 1.5 核心概念深入理解
+
+### 1.5.1 三层数据结构的转换
+
+| 数据结构 | 所在组件 | 进程 | 主要内容 |
+|----------|---------|------|---------|
+| ScheduleBatch | Scheduler | Scheduler 进程 | Req 对象列表、调度策略信息、CPU 侧元数据 |
+| ModelWorkerBatch | TpModelWorker | GPU Worker 进程 | 序列化友好的子集、部分 CPU→GPU 转换 |
+| ForwardBatch | ModelRunner | GPU Worker 进程 | 纯 GPU tensor、forward pass 所需的全部输入 |
+
+**转换流程**:
+
+```mermaid
+flowchart LR
+    SB[ScheduleBatch] -->|"Scheduler.run_batch()<br/>提取 worker 需要的信息"| MWB[ModelWorkerBatch]
+    MWB -->|"ForwardBatch.init_new()<br/>CPU tensor → GPU tensor"| FB[ForwardBatch]
+```
+
+**为什么需要三层？**
+
+1. **跨进程边界**: ScheduleBatch 包含 Req 对象（不可序列化），ModelWorkerBatch 是序列化友好的中间格式
+2. **屏蔽不同层对数据的感知**: 每层组件只需关心自己的数据结构，降低耦合
+3. **减少不必要的数据拷贝**: 只传递下游需要的字段，避免大量冗余数据跨进程传输
+4. **抽象分层**: Scheduler 不需要知道 GPU tensor 细节，ModelRunner 不需要知道调度策略
+
+### 1.5.2 ForwardMode 深入理解
+
+| 模式 | 场景 | 分块维度 | 每次处理 | 特点 |
+|------|------|---------|---------|------|
+| EXTEND | 正常 Prefill / Chunked Prefill | Token 维度 | 部分 token，**全部层** | KV Cache 逐 chunk 写入 |
+| DECODE | 纯 Decode | - | 1 token/request，全部层 | 可用 CUDA Graph |
+| MIXED | Chunked Prefill + Decode | Token 维度 | 混合 batch | 避免 Decode 饥饿 |
+| SPLIT_PREFILL | PDMux (PD 复用) | **Layer 维度** | 全部 token，**部分层** | 与 Decode 并行执行 |
+
+**MIXED 模式的意义**:
+- Chunked Prefill 将长 prompt 分成多个 chunk
+- 在等待下一个 chunk 的间隙，Decode 请求可以"插队"
+- 一个 batch 内同时包含 prefill 和 decode 的请求
+- 避免 Decode 请求长时间等待
+
 ## 2. ForwardMode 枚举
 
 ```python
@@ -143,23 +183,7 @@ flowchart TB
     style Output fill:#87CEEB
 ```
 
-**详细流程图**:
 
-```mermaid
-flowchart TD
-    A["1: 检查是否可以使用 CUDA Graph"] --> B{"can_run_graph?<br/>forward_mode.is_cuda_graph()<br/>AND self.graph_runner<br/>AND graph_runner.can_run()"}
-    B -->|Yes| C["2: return graph_runner.replay(forward_batch)"]
-    B -->|No| D{"3: 根据 forward_mode 分发"}
-    D -->|is_decode| E["forward_decode()"]
-    D -->|is_split_prefill| F["forward_split_prefill()"]
-    D -->|is_extend| G["forward_extend()"]
-    D -->|is_idle| H["forward_idle()"]
-    E --> I["4: 返回 ModelRunnerOutput<br/>logits_output, can_run_graph"]
-    F --> I
-    G --> I
-    H --> I
-    C --> I
-```
 
 ### 4.2 forward_decode
 
@@ -321,19 +345,70 @@ def replay(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
     return self.output_buffers[bs]
 ```
 
-### 5.5 can_run 判断
+### 5.5 can_run 判断详解
 
 ```python
 def can_run(self, forward_batch: ForwardBatch) -> bool:
-    bs = forward_batch.batch_size
+    # 1. batch_size 检查
+    is_bs_supported = cuda_graph_bs <= self.max_bs
+    
+    # 2. Encoder-Decoder 混合批次检查
+    is_encoder_lens_supported = torch.all(forward_batch.encoder_lens > 0)
+    
+    # 3. Hidden state 捕获模式检查
+    capture_hidden_mode_matches = (
+        requested_mode == CaptureHiddenMode.NULL or 
+        requested_mode == self.capture_hidden_mode
+    )
+    
+    # 4. Two-Batch Overlap 检查
+    is_tbo_supported = forward_batch.can_run_tbo
+    
+    # 5. N-gram 投机解码检查
+    is_ngram_supported = (bs * num_tokens_per_bs == input_ids.numel())
+    
+    return all([is_bs_supported, is_encoder_lens_supported, ...])
+```
 
-    # 检查条件
-    is_bs_supported = bs <= self.max_bs                    # batch size 在捕获范围内
-    is_encoder_lens_supported = all(encoder_lens > 0)     # Encoder-Decoder 模型约束
-    capture_hidden_mode_matches = ...                      # Hidden state 捕获模式匹配
-    is_tbo_supported = forward_batch.can_run_tbo          # Two-Batch Overlap 兼容
+#### 各条件详解
 
-    return is_bs_supported and is_encoder_lens_supported and ...
+| 条件 | 含义 | 失败场景 |
+|------|------|---------|
+| `is_bs_supported` | batch_size 在预捕获范围内 | 高并发时请求数超过 max_bs |
+| `is_encoder_lens_supported` | 所有请求都有 encoder 输出 | 多模态模型混合纯文本和图文请求 |
+| `capture_hidden_mode_matches` | hidden states 捕获模式匹配 | 需要返回 hidden states 但图没捕获该模式 |
+| `is_tbo_supported` | Two-Batch Overlap 兼容 | TBO 模式下某些条件不满足 |
+| `is_ngram_supported` | N-gram 投机解码 token 数匹配 | 投机解码时实际 token 数与预期不符 |
+
+#### is_encoder_lens_supported 详解
+
+**背景**: 针对 Encoder-Decoder 模型（如 Whisper、T5、多模态模型）
+
+```
+场景：Mixed Batch（混合批次）
+┌────────────────────────────────────────────┐
+│ Batch 内同时有：                            │
+│   - Request A: 图片+文本 (encoder_lens=196) │
+│   - Request B: 纯文本    (encoder_lens=0)   │
+└────────────────────────────────────────────┘
+
+问题：CUDA Graph 捕获时假设所有请求结构相同
+     - 捕获时：所有请求都有 encoder 输出
+     - 重放时：部分请求没有 encoder 输出
+     → Attention mask、cross-attention 的计算路径不同
+     → 固定的图无法处理这种动态分支
+```
+
+#### Fallback 机制
+
+当 `can_run()` 返回 False 时：
+
+```python
+# model_runner.py forward() 逻辑
+if forward_mode.is_cuda_graph() and self.cuda_graph_runner.can_run(batch):
+    return self.cuda_graph_runner.replay(batch)  # 用 CUDA Graph
+else:
+    return self.forward_decode(batch)  # 降级到普通执行，有 launch 开销
 ```
 
 ## 6. Batch Size 填充策略
@@ -398,6 +473,39 @@ def patch_model(model, enable_compile, num_tokens, tp_group):
         yield model.forward
 ```
 
+### 7.3 为什么先 compile 再 capture？
+
+`patch_model` 在捕获 CUDA Graph 之前调用 `torch.compile`，**顺序非常重要**：
+
+```mermaid
+flowchart TB
+    subgraph Step1["Step 1: torch.compile"]
+        O1["原始 forward:<br/>kernel_A (matmul)<br/>kernel_B (bias_add)<br/>kernel_C (activation)"]
+        O2["编译后 forward:<br/>fused_kernel_ABC ← 3个变1个!"]
+        O1 -->|"融合优化"| O2
+    end
+    
+    subgraph Step2["Step 2: CUDA Graph capture"]
+        C1["录制 fused_kernel_ABC 的调用<br/>(而不是原始的 A, B, C 三个)"]
+    end
+    
+    Step1 --> Step2
+    
+    Result["结果: Graph 里是优化后的少量大 kernel<br/>replay 时既有算子优化，又无 launch 开销"]
+```
+
+**顺序为什么重要？**
+
+| 顺序 | 结果 |
+|------|------|
+| ✅ 先 compile 再 capture | compile 产出优化后的 kernel → capture 录制优化后的 kernel → replay 执行融合后的高效 kernel |
+| ❌ 先 capture 再 compile | capture 录制原始 kernel → 图已固定无法再优化 → compile 的优化结果无法应用 |
+
+**类比**:
+- `torch.compile` = 把食谱优化（合并步骤、选更好的食材）
+- `CUDA Graph` = 把优化后的食谱录成视频，以后照着做不用再看文字
+- 必须先优化食谱，再录视频
+
 ## 8. forward_split_prefill 详解
 
 ### 8.1 用途
@@ -447,6 +555,103 @@ flowchart TD
     Stream0 --- Advantages
     Stream1 --- Advantages
 ```
+
+### 8.3 实现细节
+
+#### 每次执行多少层？
+
+由 `forward_count` 参数控制，PDMux 调度器根据 SM 资源和延迟要求动态决定：
+
+```python
+def forward_split_prefill(
+    self,
+    forward_batch: ForwardBatch,
+    forward_count: int = 1,  # 控制每次执行几层
+) -> LogitsProcessorOutput:
+    next_split_index = min(
+        forward_batch.split_index + forward_count,
+        self.model_config.num_hidden_layers,
+    )
+    # 执行 [split_index, next_split_index) 这些层
+    ret = self.model.forward_split_prefill(..., (split_index, next_split_index))
+    forward_batch.split_index = next_split_index
+    return ret
+```
+
+#### 多 Stream 交错执行
+
+```mermaid
+flowchart TB
+    subgraph GPU["GPU 多 Stream 并行"]
+        subgraph S0["Stream 0 (Decode)"]
+            D1["Decode<br/>CUDA Graph"] --> D2["Decode"] --> D3["Decode"] --> D4["Decode"]
+        end
+        subgraph S1["Stream 1 (Prefill)"]
+            P1["Layer 0-3"] --> P2["Layer 4-7"] --> P3["Layer 8-11"] --> P4["...lm_head"]
+        end
+    end
+    
+    Note["两个 Stream 并行执行<br/>Prefill 不阻塞 Decode"]
+```
+
+**交错逻辑** (伪代码):
+```python
+while prefill_not_done:
+    # Stream 1: 执行 Prefill 的几层
+    stream1.run(forward_split_prefill, forward_count=4)
+    
+    # Stream 0: 同时执行一轮 Decode (CUDA Graph replay)
+    stream0.run(forward_decode)
+    
+    # 两个 Stream 并行执行，互不阻塞
+```
+
+#### 中间状态存储
+
+ForwardBatch 保存跨调用的中间状态：
+
+```python
+@dataclass
+class ForwardBatch:
+    # Split Prefill 的中间状态
+    hidden_states: torch.Tensor = None      # 当前层的输出
+    residual: torch.Tensor = None           # 残差连接
+    model_specific_states: Dict[str, any] = None  # 模型特定状态
+    split_index: int = 0                    # 当前执行到第几层
+```
+
+**执行流程**:
+```
+第一次调用 (forward_count=4):
+├── split_index = 0
+├── 执行 layer 0~3
+├── 保存 hidden_states, residual 到 forward_batch
+└── split_index = 4
+
+第二次调用 (forward_count=4):
+├── split_index = 4
+├── 从 forward_batch 读取上次的 hidden_states
+├── 执行 layer 4~7
+├── 更新 hidden_states
+└── split_index = 8
+
+... 继续直到所有层完成 + lm_head
+```
+
+**关键点**:
+- `hidden_states` 和 `residual` 在 GPU 上保持，不需要 CPU↔GPU 传输
+- forward_batch 对象在调用之间被保留
+- `split_index` 记录进度，确保下次从正确位置继续
+
+### 8.4 SPLIT_PREFILL vs EXTEND 对比
+
+| 特性 | EXTEND (普通 Prefill) | SPLIT_PREFILL (PDMux) |
+|------|----------------------|----------------------|
+| **分块维度** | Token 维度 (Chunked Prefill) | Layer 维度 |
+| **每次处理** | 部分 token，全部层 | 全部 token，部分层 |
+| **中间状态** | KV Cache 已写入，下个 chunk 继续 | hidden_states 暂存，下几层继续 |
+| **与 Decode 关系** | 顺序执行（或 MIXED batch） | 并行执行（多 Stream） |
+| **目标** | 控制单次 prefill 内存峰值 | 降低 Decode 延迟抖动 |
 
 ## 9. 三种 CUDA Graph 对比
 
@@ -792,6 +997,57 @@ class GraphInputBuffers:
         ...
 ```
 
+### 12.3 CUDA Graph 的固定地址约束
+
+**核心限制**: CUDA Graph 捕获时录制的是**指针地址**，不是数据值。
+
+```
+捕获时: kernel_A(ptr=0x7f8a0000, ...)  ← 录下这个地址
+重放时: 还是调用 kernel_A(ptr=0x7f8a0000, ...)  ← 地址不变！
+```
+
+**这就是为什么需要 GraphInputBuffers**:
+
+```mermaid
+flowchart TB
+    subgraph Capture["捕获阶段 (启动时)"]
+        C1["GraphInputBuffers 分配<br/>input_ids @ 0xA<br/>seq_lens @ 0xB<br/>positions @ 0xC"]
+        C2["CUDA Graph 录下这些地址"]
+        C3["graph.capture() → 保存图"]
+        C1 --> C2 --> C3
+    end
+    
+    subgraph Replay["重放阶段 (每次 forward)"]
+        R1["forward_batch (新请求)<br/>input_ids @ 0xX ← 地址每次可能不同"]
+        R2["buffers.populate_from_forward_batch()<br/>复制数据到固定地址 0xA"]
+        R3["graph.replay()<br/>GPU 从 0xA 读取执行"]
+        R1 --> R2 --> R3
+    end
+    
+    Capture --> Replay
+```
+
+**如果没有 GraphInputBuffers 会怎样？**
+
+```python
+# ❌ 错误做法：直接用 forward_batch 的 tensor
+graph.replay()  # 图内部还在读旧地址 0x7f8a0000
+                # 但 forward_batch.input_ids 可能在 0x7f8b0000
+                # → 读到错误数据或 CUDA crash！
+```
+
+**关键代码路径**:
+```python
+# cuda_graph_runner.py:787
+seq_lens_cpu = buffers.populate_from_forward_batch(
+    forward_batch=forward_batch,  # 新数据源（地址不固定）
+    raw_bs=raw_bs,
+    bs=bs,
+    ...
+)
+# 内部实现: self.input_ids[:n].copy_(forward_batch.input_ids)
+```
+
 ## 13. 配置参数
 
 | 参数 | 默认值 | 说明 |
@@ -803,22 +1059,122 @@ class GraphInputBuffers:
 | `enable_piecewise_cuda_graph` | False | 启用分段 CUDA Graph |
 | `disable_cuda_graph_padding` | False | 禁用 bs padding |
 
-## 14. 调试技巧
+## 14. 多模态请求执行流程
 
-### 14.1 查看捕获的 batch size
+以 Qwen3-VL 处理带图片请求为例：
+
+```mermaid
+flowchart TB
+    subgraph Input["用户请求"]
+        I1["图片 URL + 文本 prompt"]
+    end
+    
+    subgraph TM["Tokenizer Manager (CPU)"]
+        T1["解析请求，提取图片 URL"]
+        T2["下载/预处理图片 → pixel_values"]
+        T3["文本 tokenize → input_ids"]
+        T4["构造 mm_inputs"]
+    end
+    
+    subgraph Sched["Scheduler"]
+        S1["创建 Req，加入 waiting queue"]
+        S2["调度决策：选择进入 running batch"]
+        S3["构造 ScheduleBatch → ModelWorkerBatch"]
+    end
+    
+    subgraph Worker["TpModelWorker"]
+        W1["ModelWorkerBatch → ForwardBatch"]
+        W2["调用 ModelRunner.forward()"]
+    end
+    
+    Input --> TM --> Sched --> Worker
+```
+
+### 14.1 Prefill 阶段详解
+
+```mermaid
+flowchart TB
+    subgraph Prefill["ModelRunner.forward() - EXTEND 模式"]
+        P1["forward_mode = EXTEND"]
+        
+        subgraph VIT["VIT 处理"]
+            V1["pixel_values → patch_embed"]
+            V2["pos_embed 计算"]
+            V3["VIT blocks (可能用 VIT CUDA Graph)"]
+            V4["all_gather 收集多卡结果 (如果 DP)"]
+        end
+        
+        subgraph Merge["Embedding 融合"]
+            M1["text_embeds = embed_tokens(input_ids)"]
+            M2["hidden_states = merge(text_embeds, image_embeds)"]
+        end
+        
+        subgraph LLM["LLM Layers"]
+            L1["32~80 层 transformer blocks"]
+            L2["写入 KV Cache"]
+            L3["不用 Decode CUDA Graph"]
+            L4["可选: Piecewise CUDA Graph"]
+        end
+        
+        subgraph Output["输出"]
+            O1["lm_head → logits"]
+            O2["sample → next_token"]
+        end
+        
+        P1 --> VIT --> Merge --> LLM --> Output
+    end
+```
+
+### 14.2 Decode 阶段详解
+
+```mermaid
+flowchart TB
+    subgraph Decode["ModelRunner.forward() - DECODE 模式 (循环)"]
+        D1["forward_mode = DECODE"]
+        
+        D2{"can_run() 检查"}
+        D2 -->|"bs <= max_bs ✅<br/>encoder_lens > 0 ✅"| D3["使用 CUDA Graph"]
+        D2 -->|"条件不满足"| D4["普通执行"]
+        
+        D3 --> D5["cuda_graph_runner.replay()"]
+        D5 --> D6["populate buffers"]
+        D6 --> D7["graph.replay()"]
+        D7 --> D8["返回 logits"]
+        
+        D4 --> D8
+        
+        D8 --> D9["sample → next_token"]
+        D9 --> D10{"EOS 或 max_tokens?"}
+        D10 -->|No| D1
+        D10 -->|Yes| D11["结束"]
+    end
+```
+
+### 14.3 各阶段 CUDA Graph 使用总结
+
+| 阶段 | CUDA Graph 类型 | 是否使用 | 条件 |
+|------|----------------|---------|------|
+| VIT 处理 | VIT CUDA Graph | 可选 | `SGLANG_VIT_ENABLE_CUDA_GRAPH=1` |
+| LLM Prefill | Piecewise CUDA Graph | 可选 | `--enable-piecewise-cuda-graph` |
+| LLM Decode (纯) | Decode CUDA Graph | ✅ 默认开启 | `can_run() = True` |
+| LLM Decode (MIXED) | Decode CUDA Graph | ❌ 通常不用 | forward_mode 不是 DECODE |
+
+## 15. 调试技巧
+
+### 15.1 查看捕获的 batch size
 
 ```python
 # 启动日志中会显示
 logger.info(f"Capture cuda graph bs {self.capture_bs}")
 ```
 
-### 14.2 禁用 CUDA Graph 调试
+### 15.2 禁用 CUDA Graph 调试
 
 ```bash
 python -m sglang.launch_server ... --disable-cuda-graph
 ```
 
-### 14.3 Profile CUDA Graph
+### 15.3 Profile CUDA Graph
 
 ```python
 # 启用 profiler
@@ -826,7 +1182,56 @@ python -m sglang.launch_server ... --disable-cuda-graph
 # 输出: cuda_graph_runner_memory_usage.pickle
 ```
 
-## 15. 下一步
+## 16. ModelRunner 核心要点总结
+
+### 必须掌握的概念
+
+| 概念 | 要点 | 关键代码位置 |
+|------|------|-------------|
+| **三层数据结构** | ScheduleBatch → ModelWorkerBatch → ForwardBatch 的转换与设计原因 | `forward_batch_info.py:init_new()` |
+| **ForwardMode** | EXTEND/DECODE/MIXED/SPLIT_PREFILL 的区别与使用场景 | `forward_batch_info.py:70-180` |
+| **CUDA Graph 原理** | 解决 kernel launch 开销，固定地址约束 | `cuda_graph_runner.py` |
+| **GraphInputBuffers** | 预分配固定地址 buffer，replay 时 copy 数据 | `input_buffers.py` |
+| **can_run() 判断** | 5 个条件决定是否使用 CUDA Graph | `cuda_graph_runner.py:373-437` |
+| **torch.compile + CUDA Graph** | 先 compile 优化 kernel，再 capture 录制 | `cuda_graph_runner.py:140-170` |
+
+### 关键执行路径
+
+```
+ModelRunner.forward()
+├── forward_mode.is_cuda_graph() && can_run()?
+│   ├── Yes → cuda_graph_runner.replay()
+│   │         ├── bisect_left 选择合适的 bs
+│   │         ├── buffers.populate_from_forward_batch()
+│   │         └── graph.replay()
+│   └── No → 根据 forward_mode 分发
+│            ├── DECODE → forward_decode()
+│            ├── EXTEND → forward_extend()
+│            ├── SPLIT_PREFILL → forward_split_prefill()
+│            └── IDLE → forward_idle()
+└── sample() → next_token_ids
+```
+
+### 常见问题排查
+
+| 问题 | 可能原因 | 排查方法 |
+|------|---------|---------|
+| Decode 延迟突然升高 | CUDA Graph fallback 到普通执行 | 检查 `can_run()` 条件，看日志是否有 fallback |
+| 启动时间很长 | CUDA Graph 捕获多个 bs | 减少 `cuda_graph_bs` 列表大小 |
+| 显存 OOM | CUDA Graph 占用过多 | 减少捕获的 bs 数量，或用 `--disable-cuda-graph` |
+| 多模态请求慢 | VIT CUDA Graph 未开启 | 设置 `SGLANG_VIT_ENABLE_CUDA_GRAPH=1` |
+
+### 性能调优建议
+
+| 场景 | 建议配置 |
+|------|---------|
+| 标准 LLM 推理 | 默认配置 (Decode CUDA Graph 开启) |
+| MoE 模型 | `--enable-piecewise-cuda-graph` |
+| 多模态模型 | `SGLANG_VIT_ENABLE_CUDA_GRAPH=1` |
+| 调试/开发 | `--disable-cuda-graph` |
+| 低延迟优先 | 开启 PDMux (`--enable-pdmux`) |
+
+## 17. 下一步
 
 - **08**: Attention 后端 (FlashInfer, FlashAttention, Triton)
 - **09**: 模型加载、权重处理、量化支持

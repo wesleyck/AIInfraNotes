@@ -68,7 +68,112 @@ flowchart TB
     style L2 fill:#fff3e0
 ```
 
-### 1.1 与 Tree Cache 的关系
+### 1.1 三者一句话定义与请求示例
+
+| 组件 | 一句话用途 | 存储内容 |
+|------|-----------|---------|
+| **ReqToTokenPool** | 请求级别的"目录"：记录每个请求的每个 token 位置对应哪个 KV slot | `req_to_token[req_id, pos] → kv_slot_index`，一个 2D int32 张量 |
+| **TokenToKVPoolAllocator** | 索引管理器：决定哪些 KV slot 是空闲可用的 | `free_pages: Tensor[int64]`，一个一维的空闲索引列表 |
+| **KVCache (如 MHATokenToKVPool)** | 真正的物理 KV buffer：保存每层的 K/V 张量数据 | `k_buffer[layer][slot, H, D]` 和 `v_buffer[layer][slot, H, D]` |
+
+**KVCache 是真正保存 KV 数据的物理 buffer。** Allocator 只管"哪些 slot 号可用"，ReqToTokenPool 只管"哪个请求的哪个位置对应哪个 slot 号"。三者的关系是：
+
+```
+请求来了 → ReqToTokenPool 分配一个请求行
+        → Allocator 从 free_pages 分出 N 个 slot 号
+        → slot 号写入 ReqToTokenPool 的对应行
+        → 模型前向时，用 slot 号索引 KVCache 的物理 buffer 写入/读取 K/V
+```
+
+#### 请求示例
+
+假设 req_0 的 prompt 有 5 个 token，prefix cache 命中了前 3 个（slot 号 [42, 17, 88]），需要新算后 2 个：
+
+```mermaid
+sequenceDiagram
+    participant Req as 请求 req_0
+    participant RTP as ReqToTokenPool
+    participant Alloc as Allocator
+    participant KV as KVCache
+
+    Note over Req: prompt 5 tokens<br/>prefix hit 前 3 个
+
+    Req->>RTP: 1. alloc(1) 分配请求行
+    RTP-->>Req: 行号 0
+    Note over RTP: [0]: [_, _, _, _, _]
+
+    Note over RTP: 2. prefix hit 写入
+    RTP->>RTP: 写入缓存命中的 slot [42, 17, 88]
+    Note over RTP: [0]: [42, 17, 88, _, _]
+
+    Req->>Alloc: 3. alloc(2) 请求新 slots
+    Alloc-->>RTP: 返回 [5, 9] 并写入映射
+    Note over RTP: [0]: [42, 17, 88, 5, 9]
+    Note over Alloc: free_pages 去掉 5, 9
+
+    Req->>KV: 4. forward 写 K/V 到物理 buffer
+    Note over KV: k_buf[L][5] ← K₄<br/>v_buf[L][5] ← V₄<br/>k_buf[L][9] ← K₅<br/>v_buf[L][9] ← V₅
+```
+
+
+
+#### 调用链
+
+**Prefill (extend) 路径：**
+
+```
+ScheduleBatch.prepare_for_extend()
+  → alloc_for_extend(batch)                   # common.py:331
+    → alloc_req_slots(req_to_token_pool, ...)  # common.py:298 — Step 1: 分配请求行
+    → page_size==1: alloc_token_slots(tree_cache, N)  # common.py:203
+      → allocator.alloc(N)                     # Step 2: 拿 slot 号
+    → page_size>1: allocator.alloc_extend(prefix_lens, seq_lens, last_loc, N)  # Triton kernel
+    → write_cache_indices(out_cache_loc, ...)   # common.py:80 — Step 3: 写入映射
+模型前向:
+  → kv_cache.set_kv_buffer(layer, loc, K, V)   # Step 4: 写物理 buffer
+```
+
+**Decode 路径：**
+```
+ScheduleBatch.prepare_for_decode()
+  → alloc_for_decode(batch)                    # common.py:429
+    → page_size==1: allocator.alloc(bs)        # 每个请求 1 个新 slot
+    → page_size>1: allocator.alloc_decode(seq_lens, last_loc)  # Triton kernel
+    → req_to_token_pool.write(...)             # 写映射
+```
+
+**释放路径：**
+```
+process_batch_result_decode()
+  → allocator.free_group_begin()               # allocator.py:74 — 开始批量释放
+  → 对每个结束的请求:
+    → release_kv_cache(req, tree_cache)        # common.py:472
+      → tree_cache.cache_finished_req(...)     # 前缀插入 radix tree
+      → allocator.free(over_allocated_indices) # 归还多余 slot
+  → allocator.free_group_end()                 # allocator.py:78 — 批量 torch.cat 合并
+```
+
+#### Buffer 管理和碎片
+
+**Allocator 管的是索引号（哪些 slot 空闲），不是内存分配。** KVCache 的物理 buffer 在**启动时就全部预分配好了**（`torch.zeros`），运行时不再触发 CUDA malloc。Allocator 相当于一个"号码牌发放机"。
+
+**free 有没有碎片？** 严格说**有逻辑碎片但不影响性能**：
+
+```
+初始:     free_pages = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]  ← 连续
+alloc(3): 拿走 [1,2,3]
+alloc(4): 拿走 [4,5,6,7]
+free([1,2,3]): free_pages = [8, 9, 10, 1, 2, 3]          ← 不连续了！
+alloc(5): 拿走 [8, 9, 10, 1, 2]                           ← 跨了"原始边界"
+```
+
+这些 slot 号在物理 buffer 上确实不连续，但**完全没关系**，因为 KV cache 的读写都是通过 scatter/gather 索引（`buffer[loc]`）进行的，不要求物理连续。这跟传统内存分配的碎片完全不同 — 传统碎片会导致"有总量但分配不出大块"，而这里**不需要大块连续分配**，只要有足够数量的空闲 slot 就行。
+
+`page_size=1` 时就是 slot 池：可以理解为"启动时把所有 slot 号放进一个袋子里，需要就拿出来，用完就放回去"。不管 slot 号多乱，只要袋子里还有号码就能分配。
+
+`page_size>1` 时也类似，只是粒度变成了"页号"。一个页固定包含 page_size 个连续 slot。free 时用 `torch.unique(idx // page_size)` 还原为页号放回。页内部不会有碎片（要么整页占用，要么整页空闲——除了最后一个 partial page，但那个由 alloc_extend 的 Part 1 逻辑处理）。
+
+### 1.2 与 Tree Cache 的关系
 
 ```mermaid
 flowchart TB
@@ -88,7 +193,7 @@ flowchart TB
 
 **文件**: `memory_pool.py:78`
 
-管理请求 ID 到 token 位置的映射。
+管理请求 ID 到 token 位置的映射，请求级别，每个slot里面是该请求上下午长度的token id 在kv中的位置
 
 ### 2.1 数据结构
 
@@ -157,7 +262,7 @@ class MHATokenToKVPool(KVCache):
 **内存布局**:
 ```mermaid
 flowchart LR
-    subgraph KB["k_buffer layer_id - H = head_num, D = head_dim"]
+    subgraph KB["k_buffer layer_id，H = head_num, D = head_dim"]
         T0["Token 0<br/>[H, D]"]
         T1["Token 1<br/>[H, D]"]
         T2["Token 2<br/>[H, D]"]
@@ -180,7 +285,7 @@ class MLATokenToKVPool(KVCache):
 
         # MLA 使用压缩的 KV 表示
         # Shape: [size, kv_lora_rank + qk_rope_head_dim]
-        self.kv_buffer = [
+        self.kv_buffer = [Å
             torch.zeros((size + page_size, kv_lora_rank + qk_rope_head_dim), ...)
             for _ in range(layer_num)
         ]
@@ -199,10 +304,12 @@ flowchart TB
         subgraph Pools["双池结构"]
             direction LR
             subgraph FAP["Full Attention Pool - 部分层"]
+            		direction TB
                 FA_SIZE["size = size"]
                 FA_DESC["存储完整历史"]
             end
             subgraph SWAP["Sliding Window Attention Pool - 部分层"]
+            		direction TB
                 SWA_SIZE["size = size_swa - 通常更小"]
                 SWA_DESC["只存储窗口内 token"]
             end
@@ -242,6 +349,7 @@ class HybridLinearKVPool(KVCache):
 flowchart TB
     subgraph MambaHybrid["Mamba-Hybrid 模型 KV 存储架构<br/>模型层数: 假设 32 层, 其中 8 层 Full Attention, 24 层 Mamba"]
         direction TB
+        
         subgraph HRTP["HybridReqToTokenPool - 继承自 ReqToTokenPool"]
             R2T["req_to_token - token 位置映射, 仅 Attention 层"]
             MP["mamba_pool: MambaPool - SSM 状态存储"]
@@ -330,6 +438,27 @@ flowchart TB
     end
 ```
 
+#### 4.2.1 为什么 Paged 版本需要 alloc_extend / alloc_decode？
+
+**核心原因：page 对齐。** 当 page_size=1 时，每个 token 就是一个独立 slot，`alloc(N)` 直接拿 N 个就行。但 page_size>1 时（如 16 或 64），会出现三个普通版不需要考虑的问题：
+
+1. **部分页填充**：请求可能上次 prefill 只用了某页的一半，extend 时要先填满这半页（用 `last_loc` 定位）
+2. **跨页边界**：decode 时新增 1 个 token，如果恰好跨页边界就需要分配整页，否则直接 `last_loc+1`
+3. **批量页分配**：多个请求各需要不同数量的新页，用 Triton kernel（`allocator.py:302` / `allocator.py:382`）并行计算每个请求的需求然后一次分配
+
+```
+page_size=1:  alloc(5) → 拿5个slot，完事
+page_size=4:  extend 场景示例:
+  请求已有 seq_len=6, 在一个4-slot页里用了2个（slot 4,5）还剩2个空位
+  现在要 extend 5 tokens：
+    Part 1: 先填满当前页的2个空位 → slot 6, 7 (不需要新页)
+    Part 2: 分配1整页(4 slots) → page 3 → slot 12,13,14,15
+    Part 3: 还差1个 → 新开1页但只用1个 → page 5 → slot 20
+  → 总共: [6,7,12,13,14,15,20]
+```
+
+**这就是为什么需要 Triton kernel**：普通的 `alloc(N)` 无法表达"先填旧页、再开新页"这种逻辑。Paged 的 `alloc_extend`（`allocator.py:465`）和 `alloc_decode`（`allocator.py:518`）用 Triton kernel 在 GPU 上并行处理整个 batch 的分配。
+
 ### 4.3 SWATokenToKVPoolAllocator
 
 **双池分配器，同时管理 Full 和 SWA 池**
@@ -350,9 +479,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return alloc_full_indices
 ```
 
-## 5. MambaPool
+## 5. MambaPool 与 Mamba 状态管理
 
-**用于 Mamba/SSM 模型的状态存储**
+### 5.1 MambaPool 数据结构
+
+**文件**: `memory_pool.py:128`
 
 ```python
 class MambaPool:
@@ -369,12 +500,153 @@ class MambaPool:
         )
 ```
 
-**与 KV Cache 的区别**:
+### 5.2 Mamba State vs KV Cache 的核心区别
+
 | 特性 | KVCache | MambaPool |
 |------|---------|-----------|
-| 存储内容 | K, V 张量 | conv, ssm 状态 |
-| 增长模式 | 随 token 线性增长 | 固定大小 |
+| 存储内容 | K, V 张量 | conv + SSM temporal 状态 |
+| 增长模式 | 随 token 线性增长 (append-only) | 固定大小 (滚动更新) |
 | 分配粒度 | per-token | per-request |
+| Prefix 共享 | 可在任意 token 位置断开/复用 | 只能在 checkpoint 位置接续 |
+| 更新方式 | 新 token 追加，旧 token 保留 | 每处理一个 token，原地更新 |
+
+**一个请求只有一个 Mamba 状态，并且是滚动更新的。** 每处理一个 token，conv state 和 SSM temporal state 都会原地更新（像 RNN 的 hidden state）。不像 KV cache 是"append only"的。
+
+```
+KV Cache:  token 1 → [K1,V1], token 2 → [K1,V1,K2,V2], ... → 逐个追加
+Mamba:     token 1 → state_1, token 2 → state_2 (覆盖), ... → 滚动替换
+```
+
+### 5.3 Prefix Cache + Mamba：Checkpoint 对齐问题
+
+SGLang 中 Mamba 状态的 checkpoint 间隔由两个因素决定：
+
+1. **FLA_CHUNK_SIZE = 64**：Mamba 内部用 Flash Linear Attention 的 chunk 算法，状态只在 chunk 边界（64 的倍数）是"完整"的
+2. **mamba_track_interval = 256**（默认）：decode 阶段每 256 tokens 做一次 checkpoint
+
+#### 场景 1：prefix cache 了 230 tokens
+
+```
+Radix Tree 节点：[tokens 0..229] → 有 KV cache indices
+但 Mamba checkpoint 只在 FLA_CHUNK_SIZE 对齐位置有效
+
+230 不是 64 的整数倍 (230 / 64 = 3.59)
+最近的 checkpoint 位置 = floor(230 / 64) × 64 = 192
+
+结果：
+  - KV cache 命中 230 tokens ✓
+  - Mamba 状态只在 position 192 处有 checkpoint
+  - 有效 prefix = 192 tokens（取 min）
+  - tokens 192..229 需要重新计算 Mamba 状态（但可以复用 KV cache）
+```
+
+#### 场景 2：prefix cache 了 280 tokens
+
+```
+280 / 64 = 4.375
+最近的 checkpoint = floor(280 / 64) × 64 = 256
+
+两种情况:
+(a) 如果节点在 256 位置有 mamba_value:
+    - 有效 prefix = 256 tokens（mamba checkpoint 所在位置）
+    - tokens 256..279 复用 KV，但需要重新跑 Mamba 层
+
+(b) 如果 256 位置的节点是 tombstone（mamba_value 被 evict 了）:
+    - 继续往回找最近的有 mamba_value 的节点
+    - 比如 192 位置有，那有效 prefix = 192
+    - tokens 192..279 需要重新跑 Mamba 层
+```
+
+这就是 `_match_prefix_helper`（`mamba_radix_cache.py:900`）中 `best_value_len` / `best_last_node` 的逻辑：沿着 radix tree 走到最远的 KV 匹配，但只返回到**最深的有 mamba_value 的节点**位置。
+
+#### Mamba Prefix Matching 完整示例
+
+```
+Radix Tree (MambaRadixCache):
+
+      [root] mamba=None
+        |
+   [node A: tokens 0..191]     mamba=slot_3 ← checkpoint @ 192
+        |
+   [node B: tokens 192..255]   mamba=None   ← TOMBSTONE (已evict)
+        |
+   [node C: tokens 256..319]   mamba=slot_7 ← checkpoint @ 320
+
+新请求: prompt = tokens 0..279
+
+match_prefix 结果:
+  KV match = 280 tokens (走到 node C 的一部分)
+  best_last_node = node A (最深的有 mamba_value 的节点)
+  有效 prefix = 192 tokens
+  mamba_branching_seqlen = 192
+
+处理:
+  1. COW: 复制 node A 的 mamba state (slot_3) → 请求私有 slot
+     (cow_mamba=True, mamba_radix_cache.py:424)
+  2. Prefill tokens 192..279:
+     - Attention 层: tokens 192..279 的 KV 已缓存(复用)，不需要重算
+     - Mamba 层: 从 position 192 的 checkpoint 开始，重新跑 tokens 192..279 更新 state
+  3. 在 FLA_CHUNK_SIZE 对齐位置保存新 mamba checkpoint
+```
+
+### 5.4 KV Cache 和 Mamba 的管理关系
+
+**独立管理，但 prefix 匹配时取 min。**
+
+1. **存储层面**：完全独立
+   - KV cache → `TokenToKVPoolAllocator` + `KVCache` 物理 buffer
+   - Mamba state → `MambaPool`（独立的 slot 池，`memory_pool.py:128`）
+   - 显存预算按比例分配：`mamba_full_memory_ratio = 0.9`（默认 Mamba 占剩余显存的 90%）
+
+2. **逐出层面**：独立的双 LRU 链表
+   - `full_lru_list`：管 KV cache 的逐出
+   - `mamba_lru_list`：管 Mamba state 的逐出
+   - 可以只逐出 Mamba（创建 tombstone），KV 保留
+
+3. **前缀匹配层面**：取 min
+   - `_match_prefix_helper` 返回的有效前缀长度 = min(KV 匹配长度, 最深 mamba checkpoint 位置)
+
+### 5.5 Ping-Pong Buffer 机制
+
+当 `mamba_scheduler_strategy == "extra_buffer"` 时，每个请求分配 **2 个** mamba state buffer，交替读写：
+
+```
+Chunk N:   读 buffer[0], 写 buffer[1]
+Chunk N+1: 读 buffer[1], 写 buffer[0]   ← 由 get_mamba_ping_pong_other_idx 切换
+```
+
+**目的**：支持 chunked prefill 的 overlap schedule。在计算当前 chunk 时，上一个 chunk 的 state 仍然可读（用于 Post Schedule 阶段缓存到 radix tree），不会因写操作被破坏。
+
+相关字段（`schedule_batch.py` Req 类）：
+- `mamba_pool_idx`: 在 MambaPool 中的 slot 索引
+- `mamba_ping_pong_track_buffer`: `Tensor[2]` — 两个交替 buffer 的索引
+- `mamba_next_track_idx`: 0 或 1，当前写目标
+- `mamba_last_track_seqlen`: FLA_CHUNK_SIZE 对齐的已保存位置
+- `mamba_branching_seqlen`: prefix cache 匹配后的有效 mamba 位置
+
+### 5.6 Cache Hit 率与设计权衡
+
+**Mamba 开启后有效前缀命中率会下降**，原因：
+
+1. **Checkpoint 粒度限制**：只在 64 的倍数位置有有效 checkpoint，不像 KV 可以精确到每个 token
+2. **Mamba state 更容易被 evict**：每个 checkpoint 的存储成本远大于对应数量的 KV token（固定大小的 conv+SSM state），mamba pool 容量有限
+3. **每个请求需要 3 个 mamba slot**（running + 2 ping-pong），进一步限制可缓存的 checkpoint 数量
+
+**显存分配 Trade-off**：
+
+| 策略 | 效果 | 代价 |
+|------|------|------|
+| 增加 mamba cache 容量 | 更多 checkpoint → 更高命中率 | KV cache 容量下降 → 可并发请求数减少 |
+| 减少 mamba track interval | 更频繁 checkpoint → 更细粒度匹配 | 每个请求需要更多 checkpoint slot |
+| 提高 `mamba_full_memory_ratio` | 更多 mamba 显存 | 更少 KV 显存 |
+
+**Tombstone 机制的设计本质**：
+
+这是 Mamba/SSM 模型的**本质限制**带来的妥协：
+- KV cache 天然是 append-only 的，可以在任意 token 位置断开/复用
+- Mamba state 是**递归累积**的，必须从某个 checkpoint 开始才能继续（就像 RNN 的 hidden state）
+- Tombstone 机制：KV cache 保留（注意力层还能用），mamba state 按需 evict/recompute
+- **本质上是用"重算 mamba state 的计算成本"换"减少显存占用"**
 
 ## 6. Host 内存池 (Hierarchical Cache)
 
@@ -711,17 +983,29 @@ flowchart TB
 
 ### 10.6 碎片问题
 
-#### KV Cache: 无碎片
+#### KV Cache: 逻辑碎片无害
 
 基于页的分配，页大小固定:
 
 ```
-free_pages: [5, 8, 12, 3, 7, ...]  # 不连续的索引
-alloc(3) → [5, 8, 12]              # 从头取
-free([5, 8, 12]) → 归还到尾部     # 追加到末尾
+初始:        free_pages = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]  ← 连续
+alloc(3):    拿走 [1,2,3]
+alloc(4):    拿走 [4,5,6,7]
+free([1,2,3]): free_pages = [8, 9, 10, 1, 2, 3]            ← 不连续了！
+alloc(5):    拿走 [8, 9, 10, 1, 2]                           ← 跨了"原始边界"
 ```
 
-页内容可能分散在物理 buffer 的不同位置，但**不影响分配效率**——只要有空闲页就能分配。
+这些 slot 号在物理 buffer 上确实不连续，但**完全没关系**：
+
+| 传统内存碎片 | KV Cache "碎片" |
+|-------------|----------------|
+| 有总量但分配不出大块连续空间 | 只需要有足够**数量**的空闲 slot |
+| `malloc(1MB)` 可能因碎片失败 | `alloc(100)` 只要 `len(free_pages) >= 100` |
+| 读写依赖连续地址 | 读写通过 scatter/gather 索引 `buffer[loc]` |
+
+**本质区别**：KV cache 的访问模式是 `buffer[scattered_indices]`，不要求物理连续，所以"碎片"不影响分配效率也不影响读写性能。
+
+`page_size>1` 时也类似，粒度变成"页号"。free 时 `torch.unique(idx // page_size)` 还原为页号放回。页内不会有碎片（整页分配/整页回收），partial page 由 alloc_extend 的 Part 1 逻辑处理。
 
 #### 多模态 embedding: 可能有碎片
 
