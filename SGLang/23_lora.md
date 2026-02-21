@@ -1,0 +1,644 @@
+# SGLang LoRA 适配器详解
+
+## 1. 概览
+
+### 1.1 LoRA 原理
+
+LoRA (Low-Rank Adaptation) 通过在预训练权重旁注入低秩矩阵实现高效微调：
+
+```
+W' = W + B × A × scaling
+```
+
+其中：
+- `W`: 原始预训练权重 `[output_dim, input_dim]`
+- `A`: 低秩矩阵 `[r, input_dim]` (r << input_dim)
+- `B`: 低秩矩阵 `[output_dim, r]`
+- `scaling = lora_alpha / r`
+
+### 1.2 SGLang LoRA 架构
+
+SGLang 实现了 **S-LoRA** (多租户 LoRA serving) 和 **Punica** (SGEMM 内核) 的核心思想，支持同时服务数千个 LoRA 适配器。
+
+```mermaid
+flowchart TD
+    subgraph TokenizerProcess["TokenizerManager 进程"]
+        LR["LoRARegistry<br/>适配器注册表"]
+    end
+
+    subgraph SchedulerProcess["Scheduler 进程"]
+        LM["LoRAManager<br/>权重管理"]
+        MP["LoRAMemoryPool<br/>GPU 内存池"]
+        LB["LoRA Backend<br/>SGEMM 内核"]
+        Layers["LoRA Layers<br/>模块替换"]
+    end
+
+    LR -->|"acquire/release"| LM
+    LM --> MP
+    LM --> Layers
+    MP -->|"A/B Buffer"| LB
+    Layers -->|"forward"| LB
+```
+
+### 1.3 核心文件索引
+
+| 文件 | 说明 |
+|------|------|
+| `srt/lora/lora_registry.py` | LoRARef + LoRARegistry (请求路由) |
+| `srt/lora/lora_config.py` | LoRAConfig (adapter_config.json 解析) |
+| `srt/lora/lora.py` | LoRALayer + LoRAAdapter (权重容器) |
+| `srt/lora/lora_manager.py` | LoRAManager (核心管理器) |
+| `srt/lora/mem_pool.py` | LoRAMemoryPool (GPU 内存管理) |
+| `srt/lora/layers.py` | BaseLayerWithLoRA 及各变体 (模块替换) |
+| `srt/lora/backend/` | 各后端实现 (Triton, Chunked, Torch, Ascend) |
+| `srt/lora/eviction_policy.py` | LRU/FIFO 驱逐策略 |
+
+---
+
+## 2. 数据结构
+
+### 2.1 LoRARef
+
+**文件**: `srt/lora/lora_registry.py:26`
+
+唯一标识一个 LoRA 适配器的引用记录：
+
+```python
+@dataclass(frozen=True)
+class LoRARef:
+    lora_id: str = field(default_factory=lambda: uuid4().hex)  # 唯一 UUID
+    lora_name: Optional[str] = None    # 用户可见名称
+    lora_path: Optional[str] = None    # 适配器路径
+    pinned: Optional[bool] = None      # 是否常驻 GPU
+```
+
+`lora_id` 使用 UUID 自动生成，消除了名称或路径重用带来的冲突，也可用于生成确定性的缓存 key（如 RadixCache）。
+
+### 2.2 LoRAConfig
+
+**文件**: `srt/lora/lora_config.py:21`
+
+解析 `adapter_config.json`：
+
+```python
+class LoRAConfig:
+    def __init__(self, path: str):
+        self.hf_config = self.get_lora_config()  # 读取 adapter_config.json
+        self.target_modules = self.hf_config["target_modules"]
+        self.r = self.hf_config["r"]              # LoRA rank
+        self.lora_alpha = self.hf_config["lora_alpha"]
+        self.added_tokens_config = self.get_added_tokens_config()
+        self.lora_added_tokens_size = len(self.added_tokens_config) if ... else 0
+```
+
+### 2.3 LoRAAdapter / LoRALayer
+
+**文件**: `srt/lora/lora.py`
+
+```python
+class LoRALayer(nn.Module):
+    """单层 LoRA 权重容器"""
+    def __init__(self, config, base_hf_config):
+        self.config = config
+        self.base_hf_config = base_hf_config
+        self.weights: Dict[str, torch.Tensor] = {}  # CPU 上的权重
+
+class LoRAAdapter(nn.Module):
+    """完整 LoRA 适配器 (包含所有层)"""
+    def __init__(self, uid, config, base_hf_config, load_config, lora_backend):
+        self.uid = uid
+        self.config = config
+        self.scaling = config.lora_alpha / config.r
+        self.layers: Dict[int, LoRALayer] = {}
+```
+
+```mermaid
+classDiagram
+    class LoRARef {
+        +str lora_id
+        +str lora_name
+        +str lora_path
+        +bool pinned
+    }
+    class LoRAConfig {
+        +str path
+        +dict hf_config
+        +list target_modules
+        +int r
+        +float lora_alpha
+    }
+    class LoRAAdapter {
+        +str uid
+        +LoRAConfig config
+        +float scaling
+        +Dict layers
+        +initialize_weights()
+    }
+    class LoRALayer {
+        +LoRAConfig config
+        +Dict weights
+    }
+    LoRAAdapter --> LoRAConfig
+    LoRAAdapter --> "*" LoRALayer
+    LoRARef ..> LoRAAdapter : identifies
+```
+
+---
+
+## 3. LoRARegistry — 请求路由
+
+**文件**: `srt/lora/lora_registry.py:54`
+
+`LoRARegistry` 运行在 **TokenizerManager 进程**中，是所有可用 LoRA 适配器的单一数据源。
+
+### 3.1 核心数据结构
+
+```python
+class LoRARegistry:
+    _registry_lock: RWLock                          # 读写锁
+    _registry: OrderedDict[str, LoRARef]            # LRU 有序字典 (name → ref)
+    _counters: Dict[str, ConcurrentCounter]         # 使用计数器 (id → counter)
+```
+
+### 3.2 请求生命周期
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant TM as TokenizerManager
+    participant Registry as LoRARegistry
+    participant Sched as Scheduler
+
+    Client->>TM: 请求 (lora_name="adapter-A")
+    TM->>Registry: acquire("adapter-A")
+    Registry->>Registry: _lookup → LoRARef
+    Registry->>Registry: move_to_end (LRU 更新)
+    Registry->>Registry: counter.increment()
+    Registry-->>TM: lora_id
+
+    TM->>Sched: TokenizedGenerateReqInput(lora_id=...)
+    Sched->>Sched: 调度执行...
+    Sched-->>TM: 结果
+
+    TM->>Registry: release(lora_id)
+    Registry->>Registry: counter.decrement()
+    TM-->>Client: 响应
+```
+
+### 3.3 并发控制
+
+- **RWLock**: `register`/`unregister` 使用 writer_lock（互斥），`release` 使用 reader_lock（共享）
+- **ConcurrentCounter**: acquire/release 通过原子计数器追踪使用量，卸载时需等待计数归零
+- **LRU 顺序**: `_registry` 使用 `OrderedDict`，每次 acquire 调用 `move_to_end()` 更新访问顺序
+
+### 3.4 动态加载/卸载
+
+```python
+# 注册新适配器
+await registry.register(LoRARef(lora_name="new-adapter", lora_path="/path/to/adapter"))
+
+# 卸载适配器 (需等待使用计数归零)
+lora_id = await registry.unregister("adapter-name")
+await registry.wait_for_unload(lora_id)  # 等待所有请求完成
+```
+
+---
+
+## 4. LoRAManager — 权重管理
+
+**文件**: `srt/lora/lora_manager.py:50`
+
+`LoRAManager` 运行在 **Scheduler 进程**中，负责管理 LoRA 权重的加载、缓存和批次准备。
+
+### 4.1 初始化流程
+
+```mermaid
+flowchart TD
+    A["LoRAManager.__init__()"] --> B["init_state()"]
+    B --> C["init_lora_adapters()"]
+    C --> C1["加载初始 --lora-paths"]
+    C1 --> C2["LoRAConfig 解析"]
+    C2 --> C3["LoRAAdapter 权重加载到 CPU"]
+
+    B --> D["init_lora_shapes()"]
+    D --> D1["推断 target_modules"]
+    D1 --> D2["确定 max_lora_rank"]
+
+    B --> E["init_lora_modules()"]
+    E --> E1["遍历 base_model.named_modules()"]
+    E1 --> E2{"module_name 在 target_modules 中?"}
+    E2 -->|"是"| E3["get_lora_layer → 替换子模块"]
+    E2 -->|"否"| E4["跳过"]
+
+    B --> F["init_memory_pool()"]
+    F --> F1["创建 LoRAMemoryPool"]
+    F1 --> F2["分配 A_buffer / B_buffer"]
+
+    B --> G["update_lora_info()"]
+    G --> G1["关联 LoRA 模块与内存池"]
+```
+
+### 4.2 模块替换
+
+`init_lora_modules` 是 LoRA 集成的关键步骤，通过 `replace_submodule` 将原始模块替换为带 LoRA 的版本：
+
+```python
+def set_lora_module(self, module_name, module):
+    lora_module = get_lora_layer(module, self.lora_backend)
+    replace_submodule(self.base_model, module_name, lora_module)
+    return lora_module
+```
+
+替换规则：
+- `embed_tokens` → `VocabParallelEmbeddingWithLoRA`
+- `lm_head` → `ParallelLMHeadWithLoRA`
+- `qkv_proj` → `QKVParallelLinearWithLoRA`
+- `gate_up_proj` → `MergedColumnParallelLinearWithLoRA`
+- `o_proj`, `down_proj` → `RowParallelLinearWithLoRA`
+- 其他 Linear → `ColumnParallelLinearWithLoRA`
+
+### 4.3 prepare_lora_batch
+
+每次 forward 前调用，准备批次的 LoRA 信息：
+
+```python
+def prepare_lora_batch(self, forward_batch: ForwardBatch):
+    cur_uids = set(forward_batch.lora_ids)
+
+    # 1. 将活跃 LoRA 加载到 GPU 内存池
+    self.memory_pool.prepare_lora_batch(cur_uids, self.loras, ...)
+
+    # 2. 构建 weight_indices, lora_ranks, scalings
+    for i, uid in enumerate(forward_batch.lora_ids):
+        weight_indices[i] = self.memory_pool.get_buffer_id(uid)
+        if uid is not None:
+            lora_ranks[weight_indices[i]] = self.loras[uid].config.r
+            scalings[weight_indices[i]] = self.loras[uid].scaling
+
+    # 3. 传递给后端准备 batch info
+    self.lora_backend.prepare_lora_batch(forward_batch, weight_indices, ...)
+```
+
+---
+
+## 5. LoRAMemoryPool — GPU 内存管理
+
+**文件**: `srt/lora/mem_pool.py:46`
+
+### 5.1 Buffer 结构
+
+```mermaid
+flowchart TD
+    subgraph GPU["GPU 内存"]
+        subgraph AB["A_buffer"]
+            direction TB
+            A1["qkv_proj: [max_loras, 3*r, input_dim] × num_layers"]
+            A2["gate_up_proj: [max_loras, 2*r, input_dim] × num_layers"]
+            A3["o_proj: [max_loras, r, input_dim] × num_layers"]
+            A4["down_proj: [max_loras, r, input_dim] × num_layers"]
+        end
+        subgraph BB["B_buffer"]
+            direction TB
+            B1["qkv_proj: [max_loras, output_dim, r] × num_layers"]
+            B2["gate_up_proj: [max_loras, output_dim, r] × num_layers"]
+            B3["o_proj: [max_loras, output_dim, r] × num_layers"]
+            B4["down_proj: [max_loras, output_dim, r] × num_layers"]
+        end
+        subgraph EB["Embedding Buffers"]
+            EA["embedding_A_buffer"]
+            EBuf["embedding_B_buffer"]
+            LH["lm_head_A/B_buffer"]
+        end
+    end
+```
+
+A_buffer 和 B_buffer 分别存储所有目标模块的 LoRA A/B 权重。每个模块对应一个 buffer 列表，长度为 `num_hidden_layers`，每个 buffer 的第一个维度为 `max_loras_per_batch`，即最多同时驻留的 LoRA 数。
+
+### 5.2 Slot 管理
+
+```python
+# Lora uid → buffer slot 索引
+uid_to_buffer_id: Dict[Optional[str], int] = {}
+
+# buffer slot 索引 → Lora uid (EMPTY_SLOT 表示空闲)
+buffer_id_to_uid: List[Union[str, None, EmptySlot]] = [EMPTY_SLOT] * max_loras_per_batch
+```
+
+注意：`None` 是合法的 uid，表示基础模型（无 LoRA）的零权重 slot。
+
+### 5.3 驱逐策略
+
+```mermaid
+flowchart TD
+    A["需要新 slot"] --> B{"有 EMPTY_SLOT?"}
+    B -->|"是"| C["使用空闲 slot"]
+    B -->|"否"| D["收集驱逐候选"]
+    D --> E["排除当前 batch 需要的 UID"]
+    E --> F["排除 pinned 适配器"]
+    F --> G{"有非 None 候选?"}
+    G -->|"是"| H["使用驱逐策略选择受害者"]
+    G -->|"否"| I["只能驱逐 None slot"]
+    H --> J["eviction_policy.select_victim()"]
+    I --> J
+    J --> K["释放 slot, 加载新权重"]
+```
+
+支持的驱逐策略：
+- **LRU** (Least Recently Used): 驱逐最久未使用的适配器
+- **FIFO** (First In First Out): 驱逐最早加载的适配器
+
+### 5.4 权重加载 + TP 切片
+
+权重从 CPU (`LoRAAdapter`) 复制到 GPU buffer 的指定 slot。LoRA Manager 在 `init_lora_shapes` 阶段已经考虑了 Tensor Parallelism 的切片：
+
+```python
+# A_buffer shape 考虑 TP (RowParallel 模块的 input_dim 需要切分)
+if tp_size > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
+    input_dim = divide(input_dim, tp_size)
+
+# B_buffer shape 考虑 TP (非 RowParallel 模块的 output_dim 需要切分)
+if tp_size > 1 and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES:
+    output_dim = divide(output_dim, tp_size)
+```
+
+---
+
+## 6. LoRA Layer 实现
+
+**文件**: `srt/lora/layers.py`
+
+### 6.1 BaseLayerWithLoRA
+
+所有 LoRA 层的基类，封装原始层并添加 LoRA 前向逻辑：
+
+```python
+class BaseLayerWithLoRA(nn.Module):
+    def __init__(self, base_layer, lora_backend):
+        self.base_layer = base_layer
+        self.lora_backend = lora_backend
+        self.lora_a_weights = None  # GPU buffer 引用
+        self.lora_b_weights = None
+
+    def set_lora_info(self, lora_a_weights, lora_b_weights):
+        """关联 GPU 内存池中的权重"""
+        self.lora_a_weights = lora_a_weights
+        self.lora_b_weights = lora_b_weights
+```
+
+### 6.2 层变体
+
+```mermaid
+flowchart TD
+    BL["BaseLayerWithLoRA"]
+    BL --> CPL["ColumnParallelLinearWithLoRA"]
+    CPL --> MCPL["MergedColumnParallelLinearWithLoRA<br/>(gate_up_proj)"]
+    CPL --> QKVL["QKVParallelLinearWithLoRA<br/>(qkv_proj)"]
+    BL --> RPL["RowParallelLinearWithLoRA<br/>(o_proj, down_proj)"]
+    BL --> VPE["VocabParallelEmbeddingWithLoRA<br/>(embed_tokens)"]
+    BL --> PLH["ParallelLMHeadWithLoRA<br/>(lm_head)"]
+```
+
+### 6.3 Forward 路径
+
+以 `ColumnParallelLinearWithLoRA` 为例：
+
+```python
+def forward(self, x):
+    # 1. 基础模型 forward
+    result = self.base_layer(x)
+
+    # 2. LoRA A: x → [s, input_dim] × [max_loras, r, input_dim]^T → [s, r]
+    lora_a_output = self.lora_backend.run_lora_a_sgemm(x, self.lora_a_weights, ...)
+
+    # 3. LoRA B: [s, r] × [max_loras, output_dim, r]^T → [s, output_dim]
+    lora_b_output = self.lora_backend.run_lora_b_sgemm(lora_a_output, self.lora_b_weights, ...)
+
+    # 4. 加上 scaling 后合并
+    result += lora_b_output
+    return result
+```
+
+```mermaid
+flowchart LR
+    X["x [s, input_dim]"] --> BASE["base_layer.forward()"]
+    X --> LA["LoRA A SGEMM"]
+    LA --> LB["LoRA B SGEMM"]
+    LB --> SCALE["× scaling"]
+    BASE --> ADD["+"]
+    SCALE --> ADD
+    ADD --> OUT["output"]
+```
+
+特殊变体：
+- **QKVParallelLinearWithLoRA**: 使用 `run_qkv_lora` 一次处理 Q/K/V 三个投影，A 权重形状 `[max_loras, 3*r, input_dim]`
+- **MergedColumnParallelLinearWithLoRA**: 使用 `run_gate_up_lora` 处理 gate+up 两个投影，A 权重形状 `[max_loras, 2*r, input_dim]`
+- **VocabParallelEmbeddingWithLoRA**: 处理 embedding 查找 + 额外 token 嵌入
+
+---
+
+## 7. Backend 实现
+
+**文件**: `srt/lora/backend/`
+
+所有后端继承 `BaseLoRABackend`，实现以下核心 API：
+
+| 方法 | 说明 |
+|------|------|
+| `run_lora_a_sgemm(x, weights)` | Segment GEMM: LoRA A 矩阵乘法 |
+| `run_lora_b_sgemm(x, weights)` | Segment GEMM: LoRA B 矩阵乘法 |
+| `run_qkv_lora(x, a, b)` | QKV 合并 LoRA |
+| `run_gate_up_lora(x, a, b)` | Gate+Up 合并 LoRA |
+| `run_lora_a_embedding(ids, weights)` | LoRA embedding 查找 |
+| `prepare_lora_batch(...)` | 批次准备 |
+| `init_cuda_graph_batch_info(...)` | CUDA Graph 初始化 |
+
+### 7.1 可用后端
+
+| 后端 | 文件 | 说明 |
+|------|------|------|
+| **Triton** | `triton_backend.py` | 默认后端，Triton SGEMM 内核 |
+| **Chunked SGMV** | `chunked_backend.py` | 分块 SGMV，优化大批量 |
+| **Torch Native** | `torch_backend.py` | 纯 PyTorch 实现，作为 fallback |
+| **Ascend** | `ascend_backend.py` | 华为 NPU 后端 |
+
+### 7.2 Segment GEMM
+
+LoRA 的核心计算是 **Segment GEMM** (分段矩阵乘法)：批内不同请求使用不同的 LoRA 权重矩阵，需要根据 `weight_indices` 选择每个请求对应的权重切片。
+
+```
+对于 batch 中的每个请求 i:
+    output[i] = x[i] @ weights[weight_indices[i]].T
+```
+
+这与标准 GEMM 的区别在于每个序列可能使用不同的权重矩阵。Triton 和 Chunked 后端通过自定义内核高效实现了这一操作。
+
+---
+
+## 8. Scheduler 集成
+
+**文件**: `srt/managers/scheduler.py`
+
+### 8.1 调度约束
+
+Scheduler 在构建 prefill 批次时检查 LoRA 约束：
+
+```python
+if self.enable_lora:
+    lora_set = set([req.lora_id for req in self.running_batch.reqs])
+
+for req in self.waiting_queue:
+    if self.enable_lora:
+        new_lora_set = (
+            lora_set
+            | set([req.lora_id for req in adder.can_run_list])
+            | set([req.lora_id])
+        )
+        if not self.tp_worker.can_run_lora_batch(new_lora_set):
+            if req.lora_id is not None:
+                continue  # 跳过会超出 slot 限制的 LoRA 请求
+```
+
+`can_run_lora_batch` 检查新 LoRA ID 集合是否超过 `max_loras_per_batch` 限制，同时考虑 pinned 适配器的占用。
+
+### 8.2 RadixCache LoRA 隔离
+
+不同 LoRA 适配器的 KV Cache 不能共享。通过在 RadixCache 的 key 中包含 `lora_id`，确保不同适配器的缓存自动隔离：
+
+```python
+req = Req(
+    ...,
+    lora_id=recv_req.lora_id,  # LoRA ID 作为请求属性
+)
+```
+
+### 8.3 动态加载/卸载 API
+
+```python
+# Scheduler 请求分发表中的 LoRA 操作
+(LoadLoRAAdapterReqInput, self.load_lora_adapter),
+(UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
+```
+
+---
+
+## 9. CUDA Graph 兼容性
+
+### 9.1 预分配 LoRABatchInfo
+
+CUDA Graph 要求所有张量地址在录制后不变。LoRA 后端通过预分配 batch info 张量并进行 **in-place 更新** 来支持 CUDA Graph：
+
+```python
+def init_cuda_graph_batch_info(self, max_bs_in_cuda_graph, num_tokens_per_bs):
+    """在 CUDA Graph 录制前预分配所有 batch info 张量"""
+    self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
+    self.lora_backend.init_cuda_graph_batch_info(
+        max_bs_in_cuda_graph=max_bs_in_cuda_graph,
+        num_tokens_per_bs=num_tokens_per_bs,
+    )
+```
+
+### 9.2 In-place 更新策略
+
+```python
+def prepare_lora_batch(self, forward_batch, weight_indices, lora_ranks, scalings, use_cuda_graph):
+    if use_cuda_graph:
+        # 使用 in-place 操作更新预分配的张量
+        # 张量地址不变，内容更新
+        ...
+    else:
+        # 正常创建新的 batch info
+        ...
+```
+
+---
+
+## 10. 配置参数表
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--enable-lora` | 启用 LoRA 支持 | False |
+| `--lora-paths` | 初始加载的 LoRA 适配器路径列表 | None |
+| `--max-loras-per-batch` | 单批次最大 LoRA 数 | 8 |
+| `--max-lora-rank` | 最大 LoRA rank | 自动推断 |
+| `--lora-target-modules` | 目标模块列表 | 自动推断 |
+| `--lora-backend` | SGEMM 后端 (triton/csgmv/torch/ascend) | triton |
+| `--lora-eviction-policy` | 驱逐策略 (lru/fifo) | lru |
+
+### 10.1 启动示例
+
+```bash
+# 基本 LoRA 启动
+python -m sglang.launch_server \
+    --model-path meta-llama/Llama-3-8B \
+    --enable-lora \
+    --lora-paths adapter1=/path/to/adapter1 adapter2=/path/to/adapter2 \
+    --port 30000
+
+# 指定最大 rank 和目标模块
+python -m sglang.launch_server \
+    --model-path meta-llama/Llama-3-8B \
+    --enable-lora \
+    --max-lora-rank 16 \
+    --lora-target-modules qkv_proj o_proj gate_up_proj down_proj \
+    --max-loras-per-batch 16 \
+    --port 30000
+```
+
+### 10.2 API 使用
+
+```bash
+# 指定 LoRA 适配器名称
+curl http://localhost:30000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "adapter1",
+    "prompt": "Hello, world!",
+    "max_tokens": 50
+  }'
+
+# 动态加载新适配器
+curl http://localhost:30000/lora/load \
+  -H "Content-Type: application/json" \
+  -d '{
+    "lora_name": "new-adapter",
+    "lora_path": "/path/to/new-adapter"
+  }'
+```
+
+---
+
+## 11. 关键流程总结
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant TM as TokenizerManager
+    participant Registry as LoRARegistry
+    participant Sched as Scheduler
+    participant LM as LoRAManager
+    participant MP as LoRAMemoryPool
+    participant Backend as LoRA Backend
+    participant Model as Model + LoRA Layers
+
+    Client->>TM: 请求 model="adapter1"
+    TM->>Registry: acquire("adapter1")
+    Registry-->>TM: lora_id
+
+    TM->>Sched: TokenizedGenerateReqInput(lora_id)
+    Sched->>Sched: get_next_batch_to_run()
+    Note over Sched: 检查 can_run_lora_batch
+
+    Sched->>LM: prepare_lora_batch(forward_batch)
+    LM->>MP: prepare_lora_batch(cur_uids)
+    Note over MP: 加载/驱逐 slot
+    LM->>Backend: prepare_lora_batch(weight_indices, ranks, scalings)
+
+    Sched->>Model: forward(input_ids, positions, forward_batch)
+    Note over Model: 每个 LoRA Layer 调用 Backend SGEMM
+    Model->>Backend: run_lora_a_sgemm + run_lora_b_sgemm
+    Model-->>Sched: logits
+
+    Sched-->>TM: 结果
+    TM->>Registry: release(lora_id)
+    TM-->>Client: 响应
+```
