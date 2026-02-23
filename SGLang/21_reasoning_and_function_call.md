@@ -116,6 +116,33 @@ class StreamingParseResult:
 
 **KimiDetector**: 使用 Unicode 字符作为标记 (`◁think▷` / `◁/think▷`)。
 
+**MiniMaxAppendThinkDetector**: 特殊检测器，在输出前主动追加 `<think>` 标记。与其他检测器的被动检测不同，它在首次流式输出时修改文本：
+
+```python
+# reasoning_parser.py L252-274
+class MiniMaxAppendThinkDetector(BaseReasoningFormatDetector):
+    def __init__(self, stream_reasoning=True, force_reasoning=False):
+        super().__init__("<think>", "</think>", force_reasoning=force_reasoning, ...)
+        self.is_first_chunk = False       # 追踪是否为首次调用
+
+    def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+        if not self.is_first_chunk:
+            self.is_first_chunk = True
+            new_text = self.think_start_token + new_text  # 在首块前追加 <think>
+        # 注意: 直接返回 normal_text（不做 thinking 分离）
+        # 追加的 <think> 会被下游（如 serving_chat.py）或客户端处理
+        return StreamingParseResult(normal_text=new_text)
+
+    def detect_and_parse(self, text: str) -> StreamingParseResult:
+        return StreamingParseResult(normal_text=self.think_start_token + text)
+```
+
+核心设计要点：
+- `is_first_chunk` 标志确保 `<think>` 只在流的第一块前追加一次
+- **不做 thinking 内容分离**: `parse_streaming_increment` 直接将拼接后的文本作为 `normal_text` 返回，与 `BaseReasoningFormatDetector` 的状态机逻辑完全不同
+- 非流式的 `detect_and_parse` 同样只是简单拼接，不解析 `</think>`
+- 适用场景：MiniMax 模型需要在输出流开头注入 thinking 标记，但实际的 thinking 分离由模型或客户端完成
+
 ## 3. FunctionCallParser 架构
 
 **文件**: `srt/function_call/function_call_parser.py`
@@ -276,6 +303,52 @@ elif tool_choice == "required" or isinstance(tool_choice, ToolChoice):
     → json_schema 约束 (强制生成符合 schema 的 JSON)
 ```
 
+### 4.1 supports_structural_tag() 方法
+
+**文件**: `srt/function_call/base_format_detector.py:323`
+
+并非所有 detector 都支持 structural_tag 格式。`BaseFormatDetector` 提供了 `supports_structural_tag()` 方法来控制此行为：
+
+```python
+# base_format_detector.py L323-325
+class BaseFormatDetector(ABC):
+    def supports_structural_tag(self) -> bool:
+        """Return True if this detector supports structural tag format."""
+        return True  # 基类默认返回 True
+```
+
+多个 detector 覆盖此方法返回 `False`：
+
+| Detector | supports_structural_tag | 原因 |
+|----------|------------------------|------|
+| 大多数 detector (Qwen25, DeepSeek, Llama3, Mistral 等) | `True` (继承基类) | JSON 格式兼容 structural_tag |
+| `PythonicDetector` | `False` | Pythonic 语法非 JSON，structural_tag 无法解析 |
+| `MiMoDetector` | `False` | 自定义 XML 格式 |
+| `MinimaxM2Detector` | `False` | 自定义格式 |
+| `Qwen3CoderDetector` | `False` | 自定义多块格式 |
+| `Step3Detector` | `False` | 自定义格式 |
+| `Glm4MoeDetector` / `Glm47MoeDetector` | `False` | 自定义格式 |
+
+在 `get_structure_constraint()` 中的使用：
+
+```python
+# function_call_parser.py L193-205
+def get_structure_constraint(self, tool_choice):
+    if (
+        self.detector.supports_structural_tag()      # 先检查 detector 是否支持
+        and tool_choice == "auto"
+        and (any(tool.function.strict ...) or self.tool_strict_level >= ToolStrictLevel.FUNCTION)
+    ):
+        tag = self.get_structure_tag()
+        return ("structural_tag", tag)
+    elif tool_choice == "required" or isinstance(tool_choice, ToolChoice):
+        json_schema = get_json_schema_constraint(self.tools, tool_choice)
+        return ("json_schema", json_schema)
+    # 如果 detector 不支持 structural_tag，且 tool_choice == "auto"，则不施加约束
+```
+
+这是一种 Pythonic 模式: 用 `bool` 方法控制行为分支。当 detector 不支持 structural_tag 时，`tool_choice="auto"` 的请求不会施加任何 grammar 约束，模型自由生成（可能需要后处理解析工具调用）。
+
 ## 5. Serving 层集成
 
 **文件**: `srt/entrypoints/openai/serving_chat.py`
@@ -363,23 +436,32 @@ if self.server_args.reasoning_parser and self.tokenizer:
 
 ```python
 class ReasonerGrammarObject:
-    def __init__(self, wrapped_grammar, think_end_id):
-        self.wrapped_grammar = wrapped_grammar
+    def __init__(self, grammar: BaseGrammarObject, think_end_id: int):
+        self.grammar = grammar              # 内层 grammar 对象 (非 wrapped_grammar)
         self.think_end_id = think_end_id
-        self.tokens_after_think_end = -1  # -1 表示仍在 thinking
+        self.tokens_after_think_end = -1    # -1 表示仍在 thinking; 0 表示刚结束; >0 表示结束后 token 数
 
-    def accept_token(self, token):
-        if token == self.think_end_id:
-            self.tokens_after_think_end = 0   # thinking 结束, 激活约束
+    def transfer_state(self, token: int):
+        """状态转移: 检测 think_end_id 并跟踪 thinking 结束后的 token 计数"""
+        if self.tokens_after_think_end == -1 and token == self.think_end_id:
+            self.tokens_after_think_end = 0   # thinking 结束
         elif self.tokens_after_think_end >= 0:
-            self.wrapped_grammar.accept_token(token)  # 委托给内层 grammar
+            self.tokens_after_think_end += 1  # 递增计数
 
-    def fill_vocab_mask(self, mask, idx):
-        if self.tokens_after_think_end < 0:
-            pass  # thinking 阶段: 不限制词表 (全部允许)
-        else:
-            self.wrapped_grammar.fill_vocab_mask(mask, idx)  # 约束阶段
+    def accept_token(self, token: int):
+        # 注意顺序: 先条件性 accept，再 transfer_state
+        # 只有已经结束 thinking (tokens_after_think_end >= 0) 时才委托给内层 grammar
+        if self.tokens_after_think_end >= 0:
+            self.grammar.accept_token(token)  # 委托给内层 grammar
+        self.transfer_state(token)            # 然后更新自身状态
+
+    def fill_vocab_mask(self, vocab_mask, idx):
+        if self.tokens_after_think_end >= 0:
+            self.grammar.fill_vocab_mask(vocab_mask, idx)  # 约束阶段
+        # thinking 阶段 (tokens_after_think_end < 0): 不限制词表 (全部允许)
 ```
+
+> **关键修正**: 源码中属性名为 `self.grammar` 而非 `self.wrapped_grammar`。`accept_token()` 的执行顺序是**先条件性 accept_token（仅在 thinking 结束后），再 transfer_state 更新状态**，这保证了 `think_end_token` 本身不会被传给内层 grammar。
 
 时序：
 
@@ -443,4 +525,5 @@ response = client.chat.completions.create(
 
 ## 8. 下一步
 
-- **22 (待定)**: LoRA 适配器支持 (S-LoRA, Punica)
+- **22**: Embedding 与 Rerank 模型 (Pooler, CrossEncodingPooler, SparsePooler)
+- **23**: LoRA 适配器支持 (S-LoRA, Punica, 多后端 SGEMM)

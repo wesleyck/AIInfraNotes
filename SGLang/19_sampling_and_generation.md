@@ -59,9 +59,23 @@ class SamplingParams:
     json_schema: Optional[str] = None
     regex: Optional[str] = None
     ebnf: Optional[str] = None
+    structural_tag: Optional[str] = None       # 结构化标签约束（XML/HTML 标签等）
+
+    # ========== 停止正则 ==========
+    stop_regex: Optional[Union[str, List[str]]] = None  # 停止正则表达式
+
+    # ========== 并行采样 ==========
+    n: int = 1                                 # 每个请求的采样数量
+
+    # ========== 输出控制 ==========
+    no_stop_trim: bool = False                 # 控制停止 token 是否从输出中修剪
+    spaces_between_special_tokens: bool = True # 特殊 token 之间加空格
 
     # ========== Logit 偏置 ==========
     logit_bias: Optional[Dict[str, float]] = None  # token_id → bias
+
+    # ========== 自定义参数 ==========
+    custom_params: Optional[Dict[str, Any]] = None  # 传给 CustomLogitProcessor 的自定义参数
 
     # ========== 确定性采样 ==========
     sampling_seed: Optional[int] = None
@@ -104,17 +118,24 @@ class SamplingBatchInfo:
     need_top_k_sampling: bool        # 是否有请求使用 top_k
     need_min_p_sampling: bool        # 是否有请求使用 min_p
 
+    # ========== Grammar 约束 ==========
+    vocab_size: int                  # 词表大小
+    grammars: Optional[List]
+    vocab_mask: Optional[torch.Tensor]  # [batch_size, vocab_size]
+    apply_mask_func: Optional[Callable]  # Grammar 掩码应用函数
+
     # ========== 惩罚管理 ==========
     penalizer_orchestrator: BatchedPenalizerOrchestrator
     acc_linear_penalties: torch.Tensor  # [batch_size, vocab_size], overlap 模式预计算
 
-    # ========== Grammar 约束 ==========
-    grammars: Optional[List]
-    vocab_mask: Optional[torch.Tensor]  # [batch_size, vocab_size]
-
     # ========== 自定义处理器 ==========
+    has_custom_logit_processor: bool  # 是否有自定义 logit processor
+    custom_params: Optional[List[Optional[Dict[str, Any]]]]  # 每个请求的自定义参数列表
     custom_logit_processor: Optional[Dict]
     logit_bias: Optional[torch.Tensor]  # [batch_size, vocab_size]
+
+    # ========== 设备 ==========
+    device: str = "cuda"              # 设备类型 ("cuda", "npu" 等)
 ```
 
 ### 3.2 创建流程
@@ -276,15 +297,32 @@ class LogitsProcessor(nn.Module):
 ```python
 @dataclass
 class LogitsProcessorOutput:
-    # LogitsProcessor 生成
-    next_token_logits: torch.Tensor      # [seq_len, vocab_size]
-    hidden_states: Optional[torch.Tensor] # 用于投机解码 (EAGLE)
+    ## Part 1: LogitsProcessor 生成 (logits_processor.py)
+    next_token_logits: Optional[torch.Tensor]   # [#seq, vocab_size]，prefill-only scoring 时可为 None
+    hidden_states: Optional[torch.Tensor]        # 用于投机解码 (EAGLE) 的最后隐层
 
-    # Sampler 填充
-    next_token_logprobs: Optional[torch.Tensor]
-    next_token_top_logprobs_val: Optional[List]
-    next_token_top_logprobs_idx: Optional[List]
+    ## Part 2: Sampler 填充 (sampler.py)
+    next_token_logprobs: Optional[torch.Tensor]  # 输出 token 的 log prob
+    next_token_top_logprobs_val: Optional[List]  # 输出位置 top-k logprob 值 [#seq, k]
+    next_token_top_logprobs_idx: Optional[List]  # 输出位置 top-k logprob 索引 [#seq, k]
+    next_token_token_ids_logprobs_val: Optional[List[Union[List[float], Tensor]]]
+        # 指定 token id 的 logprob 值（可为 list 或 GPU tensor，延迟拷贝优化）
+    next_token_token_ids_logprobs_idx: Optional[List]
+        # 指定 token 的索引
+
+    ## Part 3: Prefill-only (LogitsProcessor 生成)
+    input_token_logprobs: Optional[torch.Tensor] # 输入 token 的 logprob [#token]
+    input_top_logprobs_val: Optional[List]        # 输入位置 top-k logprob 值 [#seq, #token, k]
+    input_top_logprobs_idx: Optional[List]        # 输入位置 top-k logprob 索引
+    input_token_ids_logprobs_val: Optional[List[Union[List[float], Tensor]]]
+        # 输入位置指定 token 的 logprob 值
+    input_token_ids_logprobs_idx: Optional[List]  # 输入位置指定 token 的索引
+
+    ## Part 4: Diffusion LLM 专用
+    full_logits: Optional[torch.Tensor]           # 完整 logits（用于 no-sample / diffusion 场景）
 ```
+
+> **说明**: Part 2 中的 `next_token_token_ids_logprobs_val/idx` 用于用户指定 `token_ids_logprobs` 参数时，返回特定 token 的 logprob 值。Part 3 在 prefill-only scoring 场景下填充（如 multi-item scoring），计算输入 token 的 logprob。
 
 ## 6. Sampler
 
@@ -303,12 +341,12 @@ flowchart TD
         S2 -->|No| S3["Step 3: 温度缩放<br/>logits /= temperatures"]
         S3 --> S4["Step 4: Softmax<br/>probs = torch.softmax logits, dim=-1"]
         S4 --> S5["Step 5: 概率过滤 + 采样"]
-        S5 --> S6["Step 6: TP 同步<br/>if SYNC_TOKEN_IDS_ACROSS_TP:<br/>all_reduce token_ids, op=MIN"]
+        S5 --> S6["Step 6: TP 同步<br/>if SYNC_TOKEN_IDS_ACROSS_TP or grammars:<br/>all_reduce token_ids, op=MIN"]
         S2Y --> Result["return batch_next_token_ids"]
         S6 --> Result
     end
 
-    subgraph FlashInfer["FlashInfer 后端 - 最快"]
+    subgraph FlashInfer["FlashInfer 后端 - 最快 (CUDA)"]
         F1["top_k_renorm_prob probs, top_ks"]
         F2["top_p_renorm_prob probs, top_ps"]
         F3["min_p_sampling_from_probs probs, min_ps"]
@@ -320,11 +358,48 @@ flowchart TD
         P2["torch.multinomial probs_filtered"]
     end
 
+    subgraph Ascend["Ascend 后端 - NPU"]
+        A1["torch_npu.npu_top_k_top_p"]
+        A2["torch.multinomial"]
+    end
+
     S5 --> FlashInfer
     S5 --> PyTorch
+    S5 --> Ascend
 ```
 
-### 6.2 Top-K / Top-P / Min-P 过滤算法
+### 6.2 采样后端注册
+
+SGLang 支持三种内置采样后端和自定义后端注册机制：
+
+```python
+# sampler.py
+_BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
+_CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
+
+def register_sampler_backend(backend: str, factory: Callable[[], "Sampler"]) -> None:
+    """注册自定义采样后端工厂函数"""
+    SAMPLING_BACKEND_CHOICES.add(backend)
+    _CUSTOM_SAMPLER_FACTORIES[backend] = factory
+
+def create_sampler(backend: Optional[str] = None) -> Sampler:
+    """创建采样器，优先查找自定义注册，再 fallback 到内置后端"""
+    if backend in _CUSTOM_SAMPLER_FACTORIES:
+        return _CUSTOM_SAMPLER_FACTORIES[backend]()
+    if backend is None or backend in _BUILT_IN_SAMPLING_BACKENDS:
+        return Sampler()
+    raise ValueError(f"Unknown sampling backend '{backend}'")
+```
+
+| 后端 | 底层接口 | 特点 |
+|------|----------|------|
+| `flashinfer` | sgl-kernel (`top_k_top_p_sampling_from_probs`) | GPU rejection sampling，最高性能 |
+| `pytorch` | `torch.multinomial` | 纯 PyTorch 实现，通用 fallback |
+| `ascend` | `torch_npu.npu_top_k_top_p` | 华为 NPU 专用，跳过 softmax 前置 |
+
+> **Ascend 后端特殊点**: Ascend 后端在 `forward()` 中跳过 `torch.softmax`（因为 NPU 的采样接口内部做 softmax），仅在需要 return_logprob 且 `!SGLANG_RETURN_ORIGINAL_LOGPROB` 时才计算 softmax。
+
+### 6.3 Top-K / Top-P / Min-P 过滤算法
 
 | 算法 | 原理 | 示例 |
 |------|------|------|
@@ -336,7 +411,7 @@ flowchart TD
 - `"top_k_first"`: 先 top-k → 再 top-p（分两步 kernel）
 - `"joint"`: 单 kernel 同时应用（更高效）
 
-### 6.3 确定性采样
+### 6.4 确定性采样
 
 通过 Gumbel Trick 实现可复现的采样：
 
@@ -349,6 +424,26 @@ gumbel_noise = -log(-log(uniform))
 # argmax(log_probs + gumbel_noise) 等价于 multinomial 采样
 token = argmax(log(probs) + gumbel_noise)
 ```
+
+### 6.5 TP 同步条件
+
+在 TP（Tensor Parallel）多卡场景下，各 rank 独立执行 sampling，可能因浮点非确定性选择不同的 token。SGLang 通过 `all_reduce` 同步 token ID：
+
+```python
+# sampler.py L208-220
+if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
+    torch.distributed.all_reduce(
+        batch_next_token_ids,
+        op=torch.distributed.ReduceOp.MIN,
+        group=self.tp_sync_group,
+    )
+```
+
+**触发条件** (二选一即触发):
+1. **环境变量** `SYNC_TOKEN_IDS_ACROSS_TP=1` — 用户显式启用，应对 lm_head matmul / sampling kernel 非确定性
+2. **Grammar 约束** `sampling_info.grammars` 非空 — grammar 约束下各 rank 的 vocab_mask 可能因 token 不一致而分歧，必须同步
+
+> **为什么用 MIN?** `all_reduce(op=MIN)` 是一种简单的共识策略：所有 rank 取最小 token ID，保证一致性。开销是一次 all-reduce（通常 ~10us），默认不启用以优化性能。
 
 ## 7. 自定义 Logit Processor
 
@@ -375,10 +470,23 @@ class CustomLogitProcessor(ABC):
 | 处理器 | 功能 |
 |--------|------|
 | `DisallowedTokensLogitsProcessor` | 将指定 token 的 logit 设为 -inf |
-| `ThinkingBudgetLogitProcessor` | 控制 thinking token 的最大长度 |
+| `ThinkingBudgetLogitProcessor` | 控制 thinking token 的最大长度（基类） |
+| `Glm4MoeThinkingBudgetLogitProcessor` | GLM-4.5/4.6/4.5V/4.6V 的思考预算控制 |
 | `Qwen3ThinkingBudgetLogitProcessor` | Qwen3 思维链预算控制 |
 | `DeepSeekR1ThinkingBudgetLogitProcessor` | DeepSeek-R1 思维链预算控制 |
-| `DeepseekOCRNoRepeatNGramLogitProcessor` | 防止 n-gram 重复 |
+| `DeepseekOCRNoRepeatNGramLogitProcessor` | 防止 n-gram 重复（滑动窗口内） |
+
+`ThinkingBudgetLogitProcessor` 的工作原理：通过 `custom_params` 中的 `thinking_budget` 参数，控制 `<think>...</think>` 之间的 token 数量上限。当超过预算时，强制生成换行符 + `</think>` token。各模型子类仅定义不同的特殊 token ID：
+
+```python
+class Glm4MoeThinkingBudgetLogitProcessor(ThinkingBudgetLogitProcessor):
+    """GLM-4.5/4.6/4.5V/4.6V 的思考预算控制"""
+    THINKING_START_TOKEN_ID: int = 151350
+    THINKING_END_TOKEN_ID: int = 151351
+    NEW_LINE_TOKEN_ID: int = 198
+```
+
+用户可通过继承 `CustomLogitProcessor` 基类实现自己的处理器，并通过 `custom_params` 传递请求级参数。
 
 ### 7.3 序列化
 
@@ -396,29 +504,129 @@ processor = CustomLogitProcessor.from_str(json_str)
 
 **文件**: `sgl-kernel/python/sgl_kernel/sampling.py`
 
-高性能 CUDA 采样 kernel，比 PyTorch 原生实现快。
+高性能 CUDA 采样 kernel，基于 GPU rejection sampling 实现（无需显式排序），比 PyTorch 原生实现快。
+
+### 8.1 重归一化 API
 
 ```python
-# 重归一化
-top_k_renorm_prob(probs, top_k)       # in-place top-k + renorm
-top_p_renorm_prob(probs, top_p)       # in-place top-p + renorm
+# Top-K 重归一化: 保留 top-k 概率，其余置零后重新归一化
+top_k_renorm_probs(probs, top_k) -> Tensor
+# probs: [batch_size, num_classes], top_k: Tensor[batch_size] 或 int
 
-# 采样
-top_k_top_p_sampling_from_probs(      # top-k + top-p 联合采样
-    probs, output, indices,
-    top_k_arr, top_k_val,
-    top_p_arr, top_p_val,
-    deterministic, generator
-)
+# Top-P 重归一化: 按累积概率阈值过滤后重新归一化
+top_p_renorm_probs(probs, top_p) -> Tensor
+# probs: [batch_size, num_classes], top_p: Tensor[batch_size] 或 float
 
-min_p_sampling_from_probs(            # min-p 采样
-    probs, output, indices,
-    min_p_arr, min_p_val,
-    deterministic, generator
-)
+# 别名 (兼容)
+top_k_renorm_prob = top_k_renorm_probs
+top_p_renorm_prob = top_p_renorm_probs
 ```
 
-## 9. 端到端数据流示例
+### 8.2 从概率采样 API
+
+```python
+# Top-P 采样 (nucleus sampling)
+top_p_sampling_from_probs(
+    probs,                    # [batch_size, num_classes]
+    top_p,                    # Tensor[batch_size] 或 float
+    indices=None,             # Optional[Tensor], 映射到 probs 行（支持概率复用）
+    deterministic=True,       # 使用确定性 kernel
+    generator=None,           # torch.Generator
+    check_nan=False,          # 检查 NaN
+) -> Tensor                   # [batch_size], int32
+
+# Top-K + Top-P 联合采样
+top_k_top_p_sampling_from_probs(
+    probs,                    # [batch_size, num_classes]
+    top_k,                    # Tensor[batch_size] 或 int
+    top_p,                    # Tensor[batch_size] 或 float
+    indices=None,
+    filter_apply_order="top_k_first",  # "top_k_first" 或 "joint"
+    deterministic=True,
+    generator=None,
+    check_nan=False,
+) -> Tensor                   # [batch_size], int32
+
+# Min-P 采样
+min_p_sampling_from_probs(
+    probs,                    # [batch_size, num_classes]
+    min_p,                    # Tensor[batch_size] 或 float
+    indices=None,
+    deterministic=True,
+    generator=None,
+    check_nan=False,
+) -> Tensor                   # [batch_size], int32
+```
+
+### 8.3 从 Logits 直接采样 API
+
+```python
+# Top-K Mask: 保留 top-k logits，其余设为 -inf
+top_k_mask_logits(logits, top_k) -> Tensor
+
+# Top-K + Top-P 从 Logits 采样 (融合 softmax)
+top_k_top_p_sampling_from_logits(
+    logits,                   # [batch_size, num_classes] (pre-softmax)
+    top_k,                    # Tensor[batch_size] 或 int
+    top_p,                    # Tensor[batch_size] 或 float
+    indices=None,
+    filter_apply_order="top_k_first",  # "top_k_first": mask → softmax → top-p
+                                        # "joint": softmax → 联合 rejection
+    deterministic=True,
+    generator=None,
+    check_nan=False,
+) -> Tensor                   # [batch_size], int32
+```
+
+### 8.4 filter_apply_order 说明
+
+| 模式 | 流程 | 适用场景 |
+|------|------|----------|
+| `"top_k_first"` | `top_k_mask → softmax → top_p_sampling` (两步) | 需严格先 top-k 过滤 |
+| `"joint"` | `softmax → rejection_sampling(top_k, top_p)` (单 kernel) | SGLang 默认，效率更高 |
+
+> **SGLang 中的使用**: `Sampler.forward()` 中 flashinfer 后端调用 `top_k_top_p_sampling_from_probs(..., filter_apply_order="joint")`，而 `min_p` 走分离路径 `top_k_renorm_prob → top_p_renorm_prob → min_p_sampling_from_probs`。
+
+## 9. compute_logprobs_only 方法
+
+**文件**: `srt/layers/sampler.py` L224-271
+
+`Sampler` 类除了 `forward()` 之外，还提供 `compute_logprobs_only()` 方法，用于 **prefill-only scoring** 场景（只计算 logprob，不做采样）。
+
+```python
+def compute_logprobs_only(
+    self,
+    logits_output: LogitsProcessorOutput,
+    sampling_info: SamplingBatchInfo,
+    return_logprob: bool,
+    top_logprobs_nums: List[int],
+    token_ids_logprobs: List[List[int]],
+) -> None:
+    """只计算 logprob，不执行采样。用于 prefill-only scoring 请求。"""
+    logits = self._preprocess_logits(logits_output.next_token_logits, sampling_info)
+    logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
+
+    # 填充 top logprobs
+    if any(x > 0 for x in top_logprobs_nums):
+        logits_output.next_token_top_logprobs_val, ... = get_top_logprobs(logprobs, ...)
+
+    # 填充指定 token 的 logprobs
+    if any(x is not None for x in token_ids_logprobs):
+        logits_output.next_token_token_ids_logprobs_val, ... = get_token_ids_logprobs_batch_optimized(...)
+```
+
+**`forward()` vs `compute_logprobs_only()` 对比**:
+
+| 对比项 | `forward()` | `compute_logprobs_only()` |
+|--------|-------------|--------------------------|
+| 用途 | 完整采样流程 (logits → token) | 仅计算 logprob (scoring) |
+| 返回值 | `batch_next_token_ids` | `None` (in-place 填充 logits_output) |
+| 温度缩放 | 是 (`logits /= temperatures`) | 否 (直接 log_softmax) |
+| Top-K/P 过滤 | 是 | 否 |
+| TP 同步 | 是 (grammar/env flag) | 否 |
+| 典型场景 | 正常生成 | multi-item scoring, logprob-only 请求 |
+
+## 10. 端到端数据流示例
 
 ```mermaid
 flowchart TD
@@ -431,6 +639,6 @@ flowchart TD
     Sampler --> Update["penalizer_orchestrator.cumulate_output_tokens<br/>cumulated_frequency_penalties 0,42 += 0.5<br/>下轮 token 42 惩罚 +0.5"]
 ```
 
-## 10. 下一步
+## 11. 下一步
 
 - **20**: 约束生成 (Grammar Backends, JSON Schema, Regex)

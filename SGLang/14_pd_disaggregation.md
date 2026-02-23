@@ -43,13 +43,20 @@ flowchart LR
 
 ### 1.2 核心文件
 
-| 文件 | 说明 | 行数 |
-|------|------|------|
+| 文件/目录 | 说明 | 行数 |
+|-----------|------|------|
 | `disaggregation/prefill.py` | Prefill 服务器逻辑 | 735 |
 | `disaggregation/decode.py` | Decode 服务器逻辑 | 1025 |
-| `disaggregation/common/` | 共享传输后端 | - |
-| `disaggregation/mooncake/` | Mooncake 后端 | - |
-| `disaggregation/nixl/` | NIXL 后端 | - |
+| `disaggregation/utils.py` | TransferBackend 枚举、工具函数 | - |
+| `disaggregation/kv_events.py` | KV 事件管理 | - |
+| `disaggregation/encode_receiver.py` | 编码接收端 | - |
+| `disaggregation/encode_server.py` | 编码发送端 | - |
+| `disaggregation/base/` | 基础传输抽象 (`KVArgs`, `KVPoll` 等) | - |
+| `disaggregation/common/` | 通用连接工具 (`CommonKVManager/Sender/Receiver`) | - |
+| `disaggregation/mooncake/` | Mooncake 后端 (RDMA/GPU Direct) | - |
+| `disaggregation/nixl/` | NIXL 后端 (RDMA/GPU Direct) | - |
+| `disaggregation/ascend/` | 华为昇腾 NPU KV 传输后端 | - |
+| `disaggregation/fake/` | 测试用假传输后端 (无实际数据搬运) | - |
 
 ## 2. 请求生命周期
 
@@ -120,10 +127,13 @@ flowchart TB
 ```python
 # disaggregation/utils.py
 class TransferBackend(Enum):
-    FAKE = "fake"       # 调试用, 无实际传输
-    MOONCAKE = "mooncake"   # Mooncake P2P
-    NIXL = "nixl"       # NVIDIA NIXL
+    MOONCAKE = "mooncake"   # Mooncake P2P (字节跳动, RDMA/GPU Direct)
+    NIXL = "nixl"           # NVIDIA NIXL (RDMA/GPU Direct, 独立 KV 传输协议)
+    ASCEND = "ascend"       # 华为昇腾 NPU KV 传输后端
+    FAKE = "fake"           # 测试用假传输后端, 无实际数据搬运
 ```
+
+> **ASCEND 后端**: `disaggregation/ascend/` 目录 (`__init__.py`, `conn.py`, `transfer_engine.py`)，专为华为昇腾 NPU 的 KV cache 传输设计，通过 `ASCEND_MF_STORE_URL` 和 `ASCEND_MF_TRANSFER_PROTOCOL` 环境变量配置。
 
 ### 3.2 KV 数据结构
 
@@ -164,6 +174,63 @@ def send_kv_chunk(self, req, last_chunk=False, end_idx=None):
         # 只发送完整 pages 的 KV
         kv_indices = kv_to_page_indices(...)
 ```
+
+### 3.4 M:N TP Size KV Slice 传输
+
+当 Prefill 和 Decode 使用不同的 TP size 时，KV cache 的 head 维度需要重新映射。`send_kvcache_slice()` 方法 (在 `mooncake/conn.py:390` 和 `nixl/conn.py:396` 中实现) 支持这种 M:N TP 配置。
+
+**场景示例**: `prefill_tp_size=4, decode_tp_size=2`
+
+```mermaid
+flowchart LR
+    subgraph Prefill["Prefill (TP=4)"]
+        PR0["Rank 0<br/>heads 0-7"]
+        PR1["Rank 1<br/>heads 8-15"]
+        PR2["Rank 2<br/>heads 16-23"]
+        PR3["Rank 3<br/>heads 24-31"]
+    end
+
+    subgraph Decode["Decode (TP=2)"]
+        DR0["Rank 0<br/>heads 0-15"]
+        DR1["Rank 1<br/>heads 16-31"]
+    end
+
+    PR0 --> DR0
+    PR1 --> DR0
+    PR2 --> DR1
+    PR3 --> DR1
+```
+
+**核心逻辑** (简化自 mooncake/conn.py):
+
+```python
+def send_kvcache_slice(self, ...):
+    """支持 M:N TP size 的 KV head 切片传输"""
+    src_heads_per_rank = num_kv_heads
+    dst_heads_per_rank = num_kv_heads * src_tp_size // dst_tp_size
+
+    if src_tp_size > dst_tp_size:
+        # 多个 prefill rank → 一个 decode rank (聚合)
+        # 每个 prefill rank 发送自己全部 heads
+        src_head_start_offset = 0
+        num_heads_to_send = src_heads_per_rank
+        # 在 dst 侧偏移: 按 local_tp_rank 排列
+        dst_head_start_offset = local_tp_rank_in_group * src_heads_per_rank
+    else:
+        # 一个 prefill rank → 多个 decode rank (拆分)
+        # 只发送 dst rank 需要的 heads 子集
+        src_head_start_offset = (
+            dst_tp_rank_in_group * dst_heads_per_rank
+        ) % src_heads_per_rank
+        num_heads_to_send = dst_heads_per_rank
+        dst_head_start_offset = 0
+```
+
+| 配置 | 行为 | 通信模式 |
+|------|------|----------|
+| `prefill_tp > decode_tp` | 多个 prefill rank KV head 聚合到一个 decode rank | N:1 聚合 |
+| `prefill_tp < decode_tp` | 一个 prefill rank 拆分到多个 decode rank | 1:N 拆分 |
+| `prefill_tp == decode_tp` | 1:1 直接传输 | 1:1 对应 |
 
 ## 4. 内存管理
 
@@ -289,14 +356,17 @@ Mooncake 是字节跳动开源的高性能 P2P 传输库。
 
 ### 7.2 NIXL (NVIDIA)
 
-NVIDIA 的 NCCL-based 传输方案。
+NVIDIA 的独立 KV cache 传输协议，**不基于 NCCL**。
 
 ```
 特点:
-- 基于 NCCL
+- 独立的 KV cache 传输协议 (非 NCCL)
+- 使用 RDMA / GPU Direct RDMA 实现高效 KV cache 搬运
+- 专为 disaggregated serving 场景设计
 - 更好的 NVIDIA 硬件优化
-- 适合同节点传输
 ```
+
+> **注意**: NIXL 与 NCCL 是完全不同的通信库。NCCL 面向集合通信 (all-reduce/all-gather)，而 NIXL 专注于 KV cache 的点对点 RDMA 传输，适合 PD 分离场景下 Prefill → Decode 的 KV 数据搬运。
 
 ### 7.3 选择建议
 
@@ -325,9 +395,42 @@ sequenceDiagram
     Note over D: 接收元数据 + 开始 Decode
 ```
 
-## 9. 监控与调试
+## 9. PD-Multiplexing (同机 Prefill-Decode 复用)
 
-### 9.1 关键指标
+与 PD 分离 (将 Prefill/Decode 部署到不同 GPU 集群) 不同，**PD-Multiplexing** 在同一组 GPU 上同时处理两种工作负载。
+
+### 9.1 核心思路
+
+Decode 阶段是 memory-bound，GPU 计算单元 (SM) 利用率低。PD-Multiplexing 利用这一空闲，在 Decode 间隙分出 SM 执行 Prefill 请求。
+
+### 9.2 实现机制
+
+- **动态 TP Group 切换**: `parallel_state.py` 中 `_PDMUX_PREFILL_TP_GROUP` 为 Prefill 创建独立的 `GroupCoordinator`，通过 `set_pdmux_status()` 在 Prefill/Decode 之间动态切换 (详见 `13_parallel_strategies.md` 第 8 节)
+- **CUDA Stream 隔离**: `multiplex/multiplexing_mixin.py` 中使用独立的 `prefill_stream` 和 `decode_stream`，交替切换执行
+- **ForwardMode.SPLIT_PREFILL**: 专用的 forward 模式，被视为 extend 的变体
+
+### 9.3 与 PD 分离的对比
+
+| 特性 | PD 分离 (Disaggregation) | PD-Multiplexing |
+|------|--------------------------|-----------------|
+| GPU 集群 | 分离部署 | 同一组 GPU |
+| KV 传输 | 跨节点 RDMA | 无需传输 (本地) |
+| 适用场景 | 大规模部署 | 中等规模, 提升 GPU 利用率 |
+| 兼容性 | 支持 Chunked Prefill | 不兼容 Chunked Prefill/Overlap |
+
+### 9.4 启用方式
+
+```bash
+python -m sglang.launch_server \
+    --model-path Qwen/Qwen3-VL-235B-A22B-Thinking \
+    --tp 8 \
+    --enable-pdmux \
+    --pdmux-config-path pdmux_config.json
+```
+
+## 10. 监控与调试
+
+### 10.1 关键指标
 
 ```python
 # 可监控的指标
@@ -337,7 +440,7 @@ sequenceDiagram
 - bootstrap_failed_reqs     # 握手失败请求数
 ```
 
-### 9.2 调试技巧
+### 10.2 调试技巧
 
 ```bash
 # 启用详细日志
@@ -347,7 +450,7 @@ export SGLANG_LOG_LEVEL=debug
 --disaggregation-transfer-backend fake
 ```
 
-## 10. 下一步
+## 11. 下一步
 
 - **15**: sgl-kernel 架构
 - **16**: Attention kernel 实现

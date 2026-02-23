@@ -110,8 +110,23 @@ FP8 是目前推断性能与精度平衡最好的格式，特别是在 H100 (SM9
 # gemm.py
 sgl_per_token_quant_fp8(input, output_q, output_s)
 sgl_per_tensor_quant_fp8(input, output_q, output_s, is_static)
-sgl_per_token_group_quant_8bit(input, output_q, output_s, group_size, ...)
+sgl_per_token_group_quant_8bit(
+    input, output_q, output_s,
+    group_size,                    # 量化分组大小 (如 128)
+    eps,                           # 数值稳定性 epsilon
+    fq_size,                       # 量化格式位宽
+    fq_max,                        # 量化格式最大值
+    scale_offset,                  # 缩放因子偏移
+    fuse_silu_and_mul=False,       # 融合 SiLU + Mul: 将量化与 SiLU 激活函数合并为一个 kernel
+    masked_m=None,                 # 掩码行数: 指定有效行数，跳过 padding 行以节省计算
+    enable_v2=False,               # V2 内核开关: 启用 SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2 优化路径
+)
 ```
+
+**参数说明**:
+- **`fuse_silu_and_mul`**: 在 MoE 的 Gate/Up 投影后，通常需要先做 SiLU 激活再与 Up 分支相乘。启用此选项可将量化与 SiLU+Mul 融合为一个 kernel，减少一次显存读写往返。
+- **`masked_m`**: 在 Grouped GEMM 场景中，不同专家收到的 token 数不同，padding 行无需参与量化计算。通过 `masked_m` 指定实际有效行数，跳过 padding 以提高效率。
+- **`enable_v2`**: 对应 `sgl_per_token_group_quant_fp8` 的优化路径 (`SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2`)，在特定硬件上使用更高效的 warp-level reduction 策略。
 
 ## 7. 权重量化 (W4A16)
 
@@ -142,18 +157,94 @@ output, output_scale = scaled_fp4_quant(input, input_global_scale)
 ```
 - **物理布局**: 缩放因子以特殊的经过混洗 (swizzled) 的布局存储，以匹配硬件 MMA 操作。
 
-### 8.2 计算算子
-- `cutlass_scaled_fp4_mm`: 标准矩阵乘算法。
-- `cutlass_fp4_group_mm`: 针对 MoE 场景的组內矩阵乘。
+### 8.2 FP4 分组/专家量化 API
 
-## 9. QServe 量化 (W4A8)
+除了基础的 `scaled_fp4_quant`，`sgl-kernel` 还提供了面向 MoE 场景的 FP4 分组量化算子：
+
+```python
+# gemm.py
+scaled_fp4_grouped_quant(
+    input,                # [M, K] 输入张量
+    input_global_scale,   # 全局缩放因子
+    mask,                 # 掩码 (iter masked scaled quant，标记有效区域)
+) -> (output_q, output_s)
+```
+- **用途**: 对分组后的 MoE 输入执行 FP4 量化，支持 fused/iter masked scaled quant 模式。
+
+```python
+# gemm.py
+silu_mul_scaled_fp4_grouped_quant_fused(
+    input,                # [M, K] Gate+Up 投影输出
+    input_global_scale,   # 全局缩放因子
+    mask,                 # 掩码
+) -> (output_q, output_s)
+```
+- **用途**: 融合 SiLU+Mul 与 FP4 量化的一体化 kernel (来源: `csrc` L312+)，减少中间显存读写。
+
+```python
+# gemm.py L452-485
+scaled_fp4_experts_quant(
+    input,                # [total_tokens, K] 所有专家的打包输入
+    input_global_scale,   # 全局缩放因子
+    expert_offsets,       # [num_experts] 每个专家的起始偏移
+    blockscale_offsets,   # 块级缩放的偏移
+    topk,                 # TopK 专家数
+    expert_map,           # 专家映射表
+) -> (output_q, output_s)
+```
+- **用途**: 按 MoE packed 输入格式执行 FP4 专家量化，直接处理经 `moe_align_block_size` 排列后的 token 布局。
+
+### 8.3 计算算子
+- `cutlass_scaled_fp4_mm`: 标准矩阵乘算法。
+- `cutlass_fp4_group_mm`: 针对 MoE 场景的组内矩阵乘。
+
+## 9. DeepSeek-V3 专用 GEMM
+
+DeepSeek-V3 模型由于其独特的 MLA (Multi-head Latent Attention) + MoE 架构，在推理时有专门优化的 GEMM 算子。
+
+**来源**: `gemm.py` L422-585
+
+```python
+# 批量 FP8 矩阵乘法 (DeepSeek-V3 专用)
+bmm_fp8(
+    input,        # [B, M, K] 批量输入
+    A_s_scale,    # A 矩阵的静态缩放因子
+    B_s_scale,    # B 矩阵的静态缩放因子
+    B_scale,      # B 矩阵的动态缩放因子
+    dtype,        # 输出数据类型
+    out,          # 预分配输出张量
+) -> torch.Tensor
+```
+- **用途**: DeepSeek-V3 的 MLA 注意力中，需要对多个 latent head 执行批量矩阵乘法。`bmm_fp8` 在 FP8 精度下高效执行此操作。
+
+```python
+# DeepSeek-V3 融合 A 矩阵 GEMM
+dsv3_fused_a_gemm(
+    hidden_states,    # [N, D] 隐藏状态
+    router_weights,   # 路由权重
+    out_dtype,        # 输出数据类型
+) -> torch.Tensor
+```
+- **用途**: 将 DeepSeek-V3 中 MoE 层的 A 矩阵投影与路由权重乘法融合为一个 kernel，减少 kernel launch 开销。
+
+```python
+# DeepSeek-V3 路由器 GEMM
+dsv3_router_gemm(
+    hidden_states,    # [N, D] 隐藏状态
+    router_weights,   # 路由器权重矩阵
+    out_dtype,        # 输出数据类型 (通常为 FP16)
+) -> torch.Tensor
+```
+- **用途**: DeepSeek-V3 路由器的 GEMM 运算，在 FP16 精度下执行以保证路由决策的准确性。
+
+## 10. QServe 量化 (W4A8)
 
 QServe 是一种 W4A8 (4-bit 权重, 8-bit 激活) 的推理算法，`sgl-kernel` 深度集成了其核心算子。
 
 - `qserve_w4a8_per_chn_gemm`: 每通道量化的 W4A8。
 - `qserve_w4a8_per_group_gemm`: 每组量化的 W4A8。
 
-## 10. GGUF 支持
+## 11. GGUF 支持
 
 `sgl-kernel` 对 GGUF (llama.cpp 格式) 提供了原生 CUDA 支持。
 
@@ -161,14 +252,22 @@ QServe 是一种 W4A8 (4-bit 权重, 8-bit 激活) 的推理算法，`sgl-kernel
 
 ```python
 # gguf.py
-ggml_dequantize(weight, quant_type, M, N, dtype) # 执行权重量化
+ggml_dequantize(weight, quant_type, M, N, dtype) # 执行权重反量化 (dequantize): 将 GGUF 格式的低精度权重还原为 FP16/BF16
 ggml_mul_mat_a8(weight, x, quant_type, row)     # A8 表示 8-bit 激活加速
 ```
 
 - **兼容模式**: 支持多种 GGUF 量化类型（Q4_K, Q5_K, Q8_0 等）。
-- **专家加速**: 专门为 GGUF 格式的 MoE 提供了 `ggml_moe_a8` 系列算子。
+- **专家加速**: 专门为 GGUF 格式的 MoE 提供了以下算子：
 
-## 11. 精度与性能对比
+| 函数 | 功能 | 说明 |
+|------|------|------|
+| `ggml_moe_a8` | GGUF MoE 8-bit 激活矩阵乘 | 针对 GGUF 格式 MoE 模型的批量专家计算 |
+| `ggml_moe_a8_vec` | GGUF MoE 混合精度向量运算 | 向量化版本的 MoE 运算，适用于小 batch / decode 场景 |
+| `ggml_moe_get_block_size` | 获取 GGUF MoE block 大小 | 返回指定 GGUF 量化类型的块大小，用于对齐计算 |
+
+> **术语修正**: `ggml_dequantize` 执行的是"反量化 (dequantize)"操作，即将低精度格式还原为高精度，而非"量化 (quantize)"。文档和注释中应统一使用 `{dequantize}` 而非 `{quantize}` 来描述此类操作。
+
+## 12. 精度与性能对比
 
 | 量化方案 | 激活位宽 | 权重位宽 | 硬件建议 | 特点 |
 |----------|----------|----------|----------|------|
@@ -178,6 +277,6 @@ ggml_mul_mat_a8(weight, x, quant_type, row)     # A8 表示 8-bit 激活加速
 | **QServe** | 8 | 4 | All | 优秀的吞吐量平衡 |
 | **GGUF** | 16/8 | 混合 | All | 离线量化生态，多平台兼容 |
 
-## 12. 下一步
+## 13. 下一步
 
 - **19**: 采样与生成控制 (Sampling, Logits Processing)

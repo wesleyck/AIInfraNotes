@@ -44,6 +44,7 @@ flowchart LR
 | `--enable-mixed-chunk` | bool | False | 允许 Prefill + Decode 混合批次 |
 | `--enable-dynamic-chunking` | bool | False | PP 模式下动态调整 chunk 大小 |
 | `--max-prefill-tokens` | int | 16384 | 单批次最大 prefill token 数 |
+| `--prefill-max-requests` | Optional[int] | None | 限制 prefill 批次最大请求数（`server_args.py` L1302） |
 
 ### 2.1 启用方式
 
@@ -146,6 +147,7 @@ class PrefillAdder:
         rem_input_tokens: int,               # 剩余 input token 预算 (max_prefill_tokens)
         rem_chunk_tokens: Optional[int],     # 剩余 chunk token 预算 (chunked_prefill_size)
         mixed_with_decode_tokens: int = 0,   # Mixed Chunk 时的 decode tokens
+        prefill_max_requests: Optional[int] = None,  # 限制每批最大 prefill 请求数
         ...
     ):
         self.rem_input_tokens = rem_input_tokens - mixed_with_decode_tokens
@@ -233,17 +235,24 @@ sequenceDiagram
 
 ## 5. Forward Mode
 
-Chunked Prefill 引入了 `ForwardMode.MIXED` 模式：
+Chunked Prefill 引入了 `ForwardMode.MIXED` 模式。完整的 `ForwardMode` 枚举定义如下：
 
 ```python
-# forward_batch_info.py L70-77
+# forward_batch_info.py L70-96
 class ForwardMode(IntEnum):
-    EXTEND = auto()   # 普通 Prefill
-    DECODE = auto()   # Decode 1 token
-    MIXED = auto()    # Chunked Prefill + Decode 混合
-    IDLE = auto()     # 空闲
-    ...
+    EXTEND = auto()           # Prefill / 序列扩展
+    DECODE = auto()           # 单 token 解码
+    MIXED = auto()            # Chunked Prefill 混合批次
+    IDLE = auto()             # DP Attention 无任务 worker
+    TARGET_VERIFY = auto()    # 投机解码: target 模型验证
+    DRAFT_EXTEND = auto()     # 投机解码: draft 模型扩展
+    DRAFT_EXTEND_V2 = auto()  # 投机解码 v2: draft 固定形状 logits
+    PREBUILT = auto()         # PD 分离: decode worker KV 就绪
+    SPLIT_PREFILL = auto()    # PD-Multiplexing 拆分 Prefill
+    DLLM_EXTEND = auto()      # Diffusion LLM 推理
 ```
+
+> **影响**：ForwardMode 是调度系统核心枚举，遗漏会导致读者无法理解投机解码和 PD 分离的调度路径。
 
 ### 5.1 ForwardMode 状态转换
 

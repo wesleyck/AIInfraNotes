@@ -39,7 +39,7 @@ flowchart TB
 | **Data Parallelism** | DP | Batch | 高吞吐 | 无 (独立) |
 
 **核心文件**:
-- `srt/distributed/parallel_state.py` - 进程组管理 (2027 行)
+- `srt/distributed/parallel_state.py` - 进程组管理 (约 1900 行)
 - `srt/layers/model_parallel.py` - TP 层实现
 - `srt/managers/data_parallel_controller.py` - DP 控制器
 
@@ -502,9 +502,91 @@ python -m sglang.launch_server \
 | 单请求场景 | ✗ | 无法利用 DP |
 
 
-## 8. 配置建议
+## 8. PD-Multiplexing (Prefill-Decode 复用)
 
-### 8.1 单机多卡
+### 8.1 概念
+
+PD-Multiplexing 是一种在**同一组 GPU** 上同时处理 Prefill 和 Decode 请求的并行策略。与 PD 分离 (Disaggregation) 不同，PD-Multiplexing 不需要将 Prefill 和 Decode 部署到不同的 GPU 集群，而是通过**动态切换 TP Group** 和 **CUDA Stream 隔离** 在同一组 GPU 上交替执行两种工作负载。
+
+**核心思路**: 利用 Decode 阶段 GPU 利用率低的特点，在 Decode 间隙分出 SM 执行 Prefill。
+
+### 8.2 动态 TP Group 切换
+
+**文件**: `parallel_state.py` L1414-1432
+
+```python
+# duplicate GroupCoordinator for prefill in PD-Multiplexing
+_PDMUX_PREFILL_TP_GROUP: Optional[GroupCoordinator] = None
+_ENABLE_PDMUX_P_TP: bool = False
+
+def set_pdmux_status(enable_prefill_multiplexing: bool):
+    global _ENABLE_PDMUX_P_TP
+    _ENABLE_PDMUX_P_TP = enable_prefill_multiplexing
+
+def get_tp_group() -> GroupCoordinator:
+    if _ENABLE_PDMUX_P_TP:
+        assert _PDMUX_PREFILL_TP_GROUP is not None, \
+            "tensor model parallel group for PD-Multiplexing Prefill is not initialized"
+        return _PDMUX_PREFILL_TP_GROUP
+    assert _TP is not None, "tensor model parallel group is not initialized"
+    return _TP
+```
+
+**关键机制**: `get_tp_group()` 根据 `_ENABLE_PDMUX_P_TP` 全局标记动态返回不同的 TP Group。当执行 Prefill 时切换到 `_PDMUX_PREFILL_TP_GROUP`，执行 Decode 时使用默认的 `_TP`。
+
+### 8.3 调度循环
+
+**文件**: `multiplex/multiplexing_mixin.py`
+
+PD-Multiplexing 使用独立的 CUDA Stream 分别执行 Prefill 和 Decode：
+
+```python
+# multiplexing_mixin.py (简化)
+while True:
+    with torch.cuda.stream(decode_stream):
+        set_pdmux_status(False)          # Decode 使用默认 TP Group
+        recv_reqs = self.recv_requests()
+        self.process_input_requests(recv_reqs)
+
+    with torch.cuda.stream(prefill_stream):
+        set_pdmux_status(True)           # Prefill 使用专用 TP Group
+        # 执行 split prefill...
+
+    with torch.cuda.stream(decode_stream):
+        set_pdmux_status(False)
+        self.running_batch = self.update_running_batch(self.running_batch)
+        # 执行 decode forward...
+
+    with torch.cuda.stream(prefill_stream):
+        set_pdmux_status(True)
+        # 继续 prefill forward...
+```
+
+配合 `ForwardMode.SPLIT_PREFILL` 使用，该模式在 `forward_batch_info.py` 中定义，被视为 extend 的一种变体。
+
+### 8.4 约束条件
+
+```python
+# server_args.py 中的限制
+assert pp_size == 1,      "PD-Multiplexing 不支持 Pipeline Parallelism"
+assert not chunked_prefill, "PD-Multiplexing 与 Chunked Prefill 不兼容"
+assert not disaggregation,  "PD-Multiplexing 与 PD 分离不兼容"
+assert not overlap_schedule, "PD-Multiplexing 与 Overlap Schedule 不兼容"
+```
+
+### 8.5 启用方式
+
+```bash
+python -m sglang.launch_server \
+    --model-path Qwen/Qwen3-VL-235B-A22B-Thinking \
+    --tp 8 \
+    --enable-pdmux \
+    --pdmux-config-path pdmux_config.json
+```
+
+## 9. 配置建议
+
+### 9.1 单机多卡
 
 | GPU 数量 | 推荐配置 | 说明 |
 |---------|----------|------|
@@ -512,14 +594,14 @@ python -m sglang.launch_server \
 | 4 | TP=4 或 DP=2,TP=2 | 大模型用 TP，高吞吐用 DP |
 | 8 | TP=8 或 DP=2,TP=4 | 根据模型大小选择 |
 
-### 8.2 多机多卡
+### 9.2 多机多卡
 
 | 配置 | 场景 |
 |------|------|
 | TP=8, PP=2 | 16 GPU 跨 2 节点 |
 | DP=2, TP=8 | 16 GPU，2 个独立副本 |
 
-### 8.3 MoE 模型
+### 9.3 MoE 模型
 
 ```bash
 # Qwen3-VL-235B-A22B (MoE) 推荐配置
@@ -528,9 +610,9 @@ python -m sglang.launch_server --model-path Qwen/Qwen3-VL-235B-A22B-Thinking \
     --ep 8  # 或自动推断
 ```
 
-## 9. 调试技巧
+## 10. 调试技巧
 
-### 9.1 查看进程组
+### 10.1 查看进程组
 
 ```python
 from sglang.srt.distributed.parallel_state import (
@@ -546,7 +628,7 @@ print(f"PP size: {get_pipeline_model_parallel_world_size()}")
 print(f"PP rank: {get_pipeline_model_parallel_rank()}")
 ```
 
-### 9.2 通信调试
+### 10.2 通信调试
 
 ```bash
 # 启用 NCCL 调试
@@ -557,7 +639,7 @@ export NCCL_DEBUG_SUBSYS=ALL
 export SGLANG_USE_PYNCCL=0
 ```
 
-## 10. 下一步
+## 11. 下一步
 
 - **14**: PD 分离 (Prefill-Decode Disaggregation)
 - **15**: sgl-kernel 架构

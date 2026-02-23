@@ -26,12 +26,28 @@ flowchart LR
 
 ### 1.2 支持的算法
 
-| 算法 | 说明 | 是否需要 Draft 模型 |
-|------|------|---------------------|
-| `EAGLE` | 基于 EAGLE 架构的投机解码 | 是 (单层 Draft) |
-| `EAGLE3` | EAGLE3 架构，支持 hot token map | 是 (单层 Draft) |
-| `NGRAM` | 基于 N-Gram 匹配的无模型投机 | 否 |
-| `STANDALONE` | 独立 Draft 模型 | 是 (完整模型) |
+完整的算法注册表（`spec_info.py`）：
+
+| 算法 | 别名 | Flags | 说明 | Draft 模型 |
+|------|------|-------|------|-----------|
+| `EAGLE` | `NEXTN` | `EAGLE` | 基于 EAGLE 架构的投机解码 | 是 (单层 Draft) |
+| `EAGLE3` | — | `EAGLE`, `EAGLE3` | EAGLE3 架构，支持 hot token map | 是 (单层 Draft) |
+| `STANDALONE` | — | `STANDALONE` | 独立 Draft 模型 | 是 (完整模型) |
+| `NGRAM` | — | `NGRAM` | 基于 N-Gram 匹配的无模型投机 | 否 |
+
+**扩展机制**：第三方可通过 `register_speculative_algorithm()` 注册自定义算法：
+
+```python
+from sglang.srt.speculative.spec_info import register_speculative_algorithm
+
+# 支持 "override_worker=True" 替换已注册 worker
+register_speculative_algorithm(
+    "MY_ALGO",
+    worker_cls=MyDraftWorker,        # 创建 draft worker 的工厂函数
+    flags=("EAGLE",),                # 复用已有 flag 或定义新 flag
+    aliases=("MY_ALIAS",),           # 可选别名
+)
+```
 
 ---
 
@@ -246,6 +262,56 @@ def load_weights(self, weights):
             self.hot_token_id = loaded_weight + torch.arange(loaded_weight.shape[0])
             continue
 ```
+
+---
+
+## 4A. v2 架构: BaseSpecWorker/BaseDraftWorker 分离模式
+
+SGLang 投机解码现在有两套实现架构：v1（`eagle_worker.py`）和 v2（`eagle_worker_v2.py`）。v2 引入了 **BaseSpecWorker/BaseDraftWorker 分离模式**，将 target 和 draft worker 完全解耦。
+
+### 4A.1 v2 类层次
+
+```python
+# base_spec_worker.py (34 行)
+class BaseDraftWorker(ABC):
+    @abstractmethod
+    def draft(): ...
+    @abstractmethod
+    def draft_extend(): ...
+
+class BaseSpecWorker(ABC):
+    @property
+    @abstractmethod
+    def target_worker(self) -> TpModelWorker: ...   # property 而非直接持有
+    @property
+    @abstractmethod
+    def draft_worker(self) -> BaseDraftWorker: ...   # property 而非直接持有
+    @abstractmethod
+    def clear_cache_pool(self): ...
+```
+
+### 4A.2 v2 实现文件
+
+| 文件 | 类 | 说明 |
+|------|-----|------|
+| `eagle_worker_v2.py` (826 行) | `EagleDraftWorker(BaseDraftWorker)` | Draft model 初始化、draft forward、CUDA graph |
+| `eagle_worker_v2.py` | `EAGLEWorkerV2(BaseSpecWorker)` | 组合 target + draft，verify 逻辑，attention backend 管理 |
+| `eagle_info_v2.py` (489 行) | `assign_extend_cache_locs`, `fill_accepted_out_cache_loc`, `fill_new_verified_id` | v2 专用的 cache loc 分配和验证结果处理函数 |
+
+### 4A.3 v1 vs v2 对比
+
+| 方面 | v1 (`EAGLEWorker`) | v2 (`EAGLEWorkerV2`) |
+|------|---------------------|----------------------|
+| 继承关系 | `EAGLEWorker(TpModelWorker)` | `EAGLEWorkerV2(BaseSpecWorker)` |
+| Draft 模型 | 直接内嵌 | 独立 `EagleDraftWorker(BaseDraftWorker)` |
+| Target 访问 | `self.target_worker` 属性 | `@property target_worker` |
+| ForwardMode | `DRAFT_EXTEND` | `DRAFT_EXTEND_V2`（draft 固定形状 logits） |
+| CUDA Graph | 可选 | 写入 draft extend 和 draft CUDA graph 分别管理 |
+| 设计意义 | target/draft 耦合 | target/draft 完全解耦，支持更灵活的组合 |
+
+### 4A.4 新增 ForwardMode
+
+`DRAFT_EXTEND_V2` 与 `DRAFT_EXTEND` 的区别：v2 模式下 draft worker 完全独立，可以有自己的 attention backend 和 CUDA graph runner。
 
 ---
 
@@ -707,11 +773,28 @@ python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct
 
 | 组件 | 文件 | 说明 |
 |------|------|------|
-| 算法注册 | `speculative/spec_info.py` | `SpeculativeAlgorithm` 注册系统 |
-| EAGLE Worker | `speculative/eagle_worker.py` | EAGLE/EAGLE3 主实现 |
-| Multi-Layer Worker | `speculative/multi_layer_eagle_worker.py` | 多层 EAGLE 实现 |
+| **算法注册** | `speculative/spec_info.py` | `SpeculativeAlgorithm` 注册系统 |
+| **v1 架构** | | |
+| EAGLE Worker v1 | `speculative/eagle_worker.py` | EAGLE/EAGLE3 主实现 (v1, 继承 TpModelWorker) |
 | EAGLE 数据结构 | `speculative/eagle_info.py` | `EagleDraftInput`, `EagleVerifyInput` |
+| **v2 架构** | | |
+| Base ABC | `speculative/base_spec_worker.py` | `BaseSpecWorker` / `BaseDraftWorker` 抽象基类 |
+| EAGLE Worker v2 | `speculative/eagle_worker_v2.py` (826 行) | `EagleDraftWorker` + `EAGLEWorkerV2` 分离实现 |
+| EAGLE Info v2 | `speculative/eagle_info_v2.py` (489 行) | v2 验证结果处理函数 |
+| Draft Utils | `speculative/draft_utils.py` | `DraftBackendFactory` 等 draft 工具 |
+| **Multi-Layer** | | |
+| Multi-Layer Worker v1 | `speculative/multi_layer_eagle_worker.py` (752 行) | 多层 EAGLE (v1, 基于 BaseSpecWorker/BaseDraftWorker) |
+| Multi-Layer Worker v2 | `speculative/multi_layer_eagle_worker_v2.py` (706 行) | 多层 EAGLE (v2) |
+| Multi-Layer Utils | `speculative/multi_layer_eagle_utils.py` (350 行) | Multi-Layer draft CUDA graph 等工具 |
+| Multi-Layer CG | `speculative/multi_layer_eagle_draft_extend_cuda_graph_runner.py` | Multi-Layer draft extend CUDA graph |
+| **Standalone** | | |
+| Standalone Worker | `speculative/standalone_worker.py` | 独立 Draft 模型 worker |
+| **通用工具** | | |
 | Tree 构建 | `speculative/eagle_utils.py` | `build_tree_kernel_efficient` |
 | N-Gram Worker | `speculative/ngram_worker.py` | N-Gram 投机解码 |
+| Spec Utils | `speculative/spec_utils.py` | `select_top_k_tokens`, `generate_token_bitmask` 等 |
+| **CUDA Graph** | | |
+| Draft CG | `speculative/eagle_draft_cuda_graph_runner.py` | Draft CUDA Graph Runner |
+| Draft Extend CG | `speculative/eagle_draft_extend_cuda_graph_runner.py` | Draft Extend CUDA Graph Runner |
+| **模型** | | |
 | EAGLE3 模型 | `models/llama_eagle3.py` | EAGLE3 Draft 模型结构 |
-| CUDA Graph | `speculative/eagle_draft_cuda_graph_runner.py` | Draft CUDA Graph |

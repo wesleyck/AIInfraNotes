@@ -456,10 +456,26 @@ flowchart LR
 
 | 后端 | 文件 | 说明 |
 |------|------|------|
-| **Triton** | `triton_backend.py` | 默认后端，Triton SGEMM 内核 |
-| **Chunked SGMV** | `chunked_backend.py` | 分块 SGMV，优化大批量 |
-| **Torch Native** | `torch_backend.py` | 纯 PyTorch 实现，作为 fallback |
-| **Ascend** | `ascend_backend.py` | 华为 NPU 后端 |
+| **Triton** (`triton`) | `triton_backend.py` | 默认后端，Triton SGEMM 内核 |
+| **Chunked SGMV** (`csgmv`) | `chunked_backend.py` | 分块 SGMV，优化大批量 |
+| **Torch Native** (`torch_native`) | `torch_backend.py` | 纯 PyTorch 实现，作为 fallback |
+| **Ascend** (`ascend`) | `ascend_backend.py` | 华为 NPU 后端 |
+| **FlashInfer** (`flashinfer`) | — | **已废弃** |
+
+完整的后端注册表（`lora/backend/lora_registry.py`）：
+
+```python
+# lora_registry.py L18-50
+LORA_SUPPORTED_BACKENDS = {
+    'triton':       -> TritonLoRABackend,       # 默认，Triton SGEMM
+    'csgmv':        -> ChunkedSgmvLoRABackend,  # 分块 SGMV
+    'torch_native': -> TorchNativeLoRABackend,  # 纯 PyTorch (注意: 不是 'torch')
+    'ascend':       -> AscendLoRABackend,       # 华为 NPU
+    'flashinfer':   -> raise ValueError(...)    # 已废弃，直接抛出异常
+}
+```
+
+> **flashinfer 后端已废弃**: 指定 `--lora-backend flashinfer` 会直接抛出 `ValueError("FlashInfer LoRA backend has been deprecated, please use 'triton' instead.")`，引导用户迁移到 `triton` 后端。
 
 ### 7.2 Segment GEMM
 
@@ -519,6 +535,49 @@ req = Req(
 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
 ```
 
+### 8.4 validate_new_adapter 验证逻辑
+
+**文件**: `srt/lora/lora_manager.py:150-184`
+
+运行时动态加载 adapter 时，`validate_new_adapter` 执行 3 步验证，作为安全守卫防止无效或冲突的 adapter 被加载：
+
+```python
+def validate_new_adapter(self, lora_config: LoRAConfig, lora_ref: LoRARef):
+    # 步骤 1: 名称去重
+    for existing_lora_ref in self.lora_refs.values():
+        if lora_ref.lora_name == existing_lora_ref.lora_name:
+            raise ValueError(f"...{lora_ref.lora_name} is already loaded")
+        # 同路径不同名: 打印 Warning（允许加载但提醒用户）
+        if lora_ref.lora_path == existing_lora_ref.lora_path:
+            logger.warning(f"{lora_ref.lora_path} is already loaded with name: "
+                          f"{existing_lora_ref.lora_name}, but another copy is being loaded...")
+
+    # 步骤 2: 内存池兼容性检查
+    # 检查 adapter 的 rank 和 target_modules 是否与当前内存池配置兼容
+    memory_pool = getattr(self, "memory_pool", None)
+    incompatible = memory_pool and not memory_pool.can_support(lora_config)
+    if incompatible:
+        raise ValueError(f"...rank {lora_config.r} is incompatible with the current "
+                        "LoRA memory pool configuration...")
+
+    # 步骤 3: pinned 上限检查
+    # pinned adapter 数量不能占满所有 slot，至少留 1 个给 unpinned 和 base model
+    if lora_ref.pinned and self.num_pinned_loras >= self.max_loras_per_batch - 1:
+        raise ValueError(f"...not allowed to pin all slots in the LoRA memory pool "
+                        "to avoid starvation for unpinned adapters and base models...")
+```
+
+验证步骤总结：
+
+| 步骤 | 检查内容 | 失败行为 |
+|------|---------|---------|
+| 1a. 名称去重 | adapter 名称是否已存在于 registry | `raise ValueError` (拒绝加载) |
+| 1b. 路径重复提醒 | 同路径不同名 | `logger.warning` (允许加载但警告) |
+| 2. 内存兼容性 | rank 和 target_modules 是否匹配 `memory_pool.can_support()` | `raise ValueError` (拒绝加载) |
+| 3. pinned 上限 | pinned 数量是否达到 `max_loras_per_batch - 1` | `raise ValueError` (防止饥饿) |
+
+步骤 3 的 `-1` 设计确保至少保留 1 个 slot 给 unpinned adapter 或 base model（`None` uid），避免所有 slot 都被 pinned adapter 占满导致其他请求无法调度。
+
 ---
 
 ## 9. CUDA Graph 兼容性
@@ -561,7 +620,7 @@ def prepare_lora_batch(self, forward_batch, weight_indices, lora_ranks, scalings
 | `--max-loras-per-batch` | 单批次最大 LoRA 数 | 8 |
 | `--max-lora-rank` | 最大 LoRA rank | 自动推断 |
 | `--lora-target-modules` | 目标模块列表 | 自动推断 |
-| `--lora-backend` | SGEMM 后端 (triton/csgmv/torch/ascend) | triton |
+| `--lora-backend` | SGEMM 后端 (triton/csgmv/torch_native/ascend) | triton |
 | `--lora-eviction-policy` | 驱逐策略 (lru/fifo) | lru |
 
 ### 10.1 启动示例

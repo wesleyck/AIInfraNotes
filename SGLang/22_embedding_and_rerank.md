@@ -22,19 +22,50 @@ SGLang 通过 `is_generation_model()` 函数判定模型类型：
 def is_generation_model(model_architectures: List[str], is_embedding: bool = False):
     # 方式 1: 根据模型架构自动判定
     if (
+        # Embedding 类
         "LlamaEmbeddingModel" in model_architectures
         or "MistralModel" in model_architectures
         or "BertModel" in model_architectures
+        or "Contriever" in model_architectures
         or "CLIPModel" in model_architectures
         or "XLMRobertaModel" in model_architectures
+        # Rerank / Classification 类
         or "BertForSequenceClassification" in model_architectures
-        # ... 更多非生成架构
+        or "XLMRobertaForSequenceClassification" in model_architectures
+        # Reward Model / Sequence Classification 类
+        or "LlamaForSequenceClassification" in model_architectures
+        or "LlamaForSequenceClassificationWithNormal_Weights" in model_architectures
+        or "InternLM2ForRewardModel" in model_architectures
+        or "Qwen2ForRewardModel" in model_architectures
+        or "Qwen2ForSequenceClassification" in model_architectures
+        or "Qwen3ForSequenceClassification" in model_architectures
     ):
         return False
     # 方式 2: 通过 --is-embedding 参数强制指定
     else:
         return not is_embedding
 ```
+
+完整的非生成模型类别：
+
+| 类别 | 架构类 | 说明 |
+|------|--------|------|
+| **Embedding** | `LlamaEmbeddingModel` | LLaMA 基础 embedding |
+| | `MistralModel` | Mistral embedding (复用 LLaMA) |
+| | `BertModel` | BERT 系列 (BGE, GTE 等) |
+| | `Contriever` | Contriever (继承 BertModel) |
+| | `CLIPModel` | CLIP 文本+视觉 embedding |
+| | `XLMRobertaModel` | 多语言 RoBERTa embedding |
+| **Rerank** | `BertForSequenceClassification` | BERT 交叉编码器 |
+| | `XLMRobertaForSequenceClassification` | 多语言 RoBERTa reranker |
+| **Reward Model** | `LlamaForSequenceClassification` | LLaMA 分类/奖励模型 |
+| | `LlamaForSequenceClassificationWithNormal_Weights` | LLaMA 奖励 (normal weights) |
+| | `InternLM2ForRewardModel` | InternLM2 奖励模型 |
+| | `Qwen2ForRewardModel` | Qwen2 奖励模型 |
+| **Classification** | `Qwen2ForSequenceClassification` | Qwen2 序列分类 |
+| | `Qwen3ForSequenceClassification` | Qwen3 序列分类 |
+
+这些架构类都不属于生成模型，走 embedding/rerank 路径（`is_generation = False`）。Reward Model 和 Classification 模型虽然不做文本生成，但也通过此判定函数被归类到非生成路径，仅执行 prefill 后返回 pooled output。
 
 ```mermaid
 flowchart TD
@@ -339,8 +370,13 @@ class SparsePooler(nn.Module):
     def __init__(self, config):
         self.vocab_size = config.vocab_size
         self.sparse_linear = nn.Linear(config.hidden_size, 1)
+        self._weights_loaded = False          # 安全标记: 确保 load_weights 在 forward 前被调用
 
     def forward(self, hidden_states, forward_batch):
+        # 安全检查: 防止在权重未加载时调用 forward
+        if not self._weights_loaded:
+            raise ValueError("Sparse pooling weights not loaded. Call load_weights() first")
+
         # 1. 计算每个 token 的权重
         token_weights = F.relu(self.sparse_linear(hidden_states)).squeeze(-1)
 
@@ -356,7 +392,14 @@ class SparsePooler(nn.Module):
         sparse_embedding.view(-1).scatter_reduce_(0, flat_indices, token_weights, reduce="amax")
 
         return SparseEmbeddingOutput(embeddings=sparse_embedding)
+
+    def load_weights(self, state_dict: dict):
+        """独立的权重加载方法 (由模型调用)"""
+        self.sparse_linear.load_state_dict(state_dict)
+        self._weights_loaded = True
 ```
+
+**`_weights_loaded` 安全机制**: `SparsePooler` 使用独立的 `load_weights(state_dict)` 方法加载 `sparse_linear` 权重，而非通过标准的模型 `load_state_dict` 流程。`_weights_loaded` 标记确保在 forward 前必须先调用 `load_weights()`，否则抛出 `ValueError`。这是一种防御性编程模式，防止因权重未正确加载（例如 `sparse_linear` 的权重在 checkpoint 中的 key 需要特殊处理时）导致静默的错误推理结果。
 
 ---
 

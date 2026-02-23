@@ -213,14 +213,52 @@ if req.grammar is not None:
 
 为 Thinking 模型（如 Qwen3-VL-Thinking）提供特殊支持：在 thinking 阶段不应用约束，thinking 结束后才激活 grammar。
 
+### 7.1 maybe_init_reasoning() 初始化
+
+`maybe_init_reasoning()` 方法在 grammar 对象创建后调用，根据请求是否启用 reasoning 来设置初始状态：
+
 ```python
-class ReasonerGrammarObject:
-    def accept_token(self, token):
-        if token == self.think_end_id:
-            self.tokens_after_think_end = 0  # 进入约束模式
-        elif self.tokens_after_think_end >= 0:
-            self.wrapped_grammar.accept_token(token)  # 委托给内层 grammar
+# BaseGrammarObject 中 (base_grammar_backend.py L49-50)
+def maybe_init_reasoning(self, reasoning: bool):
+    pass  # 基类默认不做任何事
+
+# ReasonerGrammarObject 中 (reasoner_grammar_backend.py L37-38)
+def maybe_init_reasoning(self, reasoning: bool):
+    self.tokens_after_think_end = -1 if reasoning else 0
+    # reasoning=True:  tokens_after_think_end=-1 → thinking 阶段，不约束
+    # reasoning=False: tokens_after_think_end=0  → 直接进入约束模式（无 thinking）
 ```
+
+调用时机: `get_cached_or_future_value()` 从缓存中取出 grammar 对象后，调用 `copied_value.maybe_init_reasoning(require_reasoning)` 初始化。
+
+### 7.2 ReasonerGrammarObject 实现
+
+```python
+class ReasonerGrammarObject(BaseGrammarObject):
+    def __init__(self, grammar: BaseGrammarObject, think_end_id: int):
+        self.grammar = grammar
+        self.think_end_id = think_end_id
+        self.tokens_after_think_end = -1  # -1: thinking 未结束, 0: 刚结束, +N: 结束后第 N 个 token
+
+    def transfer_state(self, token: int):
+        """状态转移（独立方法）: 更新 tokens_after_think_end 计数器"""
+        if self.tokens_after_think_end == -1 and token == self.think_end_id:
+            self.tokens_after_think_end = 0   # 检测到 think_end → 进入约束模式
+        elif self.tokens_after_think_end >= 0:
+            self.tokens_after_think_end += 1  # 约束模式中，递增计数
+
+    def accept_token(self, token: int):
+        # 注意执行顺序: 先 accept (如果已在约束模式), 再 transfer_state
+        if self.tokens_after_think_end >= 0:
+            self.grammar.accept_token(token)  # 委托给内层 grammar
+        self.transfer_state(token)            # 然后更新状态
+```
+
+**执行顺序解析** (`reasoner_grammar_backend.py` L52-55):
+1. **先判断当前状态**: 如果 `tokens_after_think_end >= 0`（已结束 thinking），则将 token 传给内层 grammar 的 `accept_token()`
+2. **再更新状态**: 调用 `transfer_state(token)` 更新计数器
+
+这意味着 `think_end_id` 本身**不会**被传给内层 grammar（因为检测到 `think_end_id` 时 `tokens_after_think_end` 还是 -1），但之后的 token 都会被 accept。`transfer_state()` 的分离设计使得状态转移逻辑可以被 `rollback_state()` 独立回滚。
 
 ## 8. 跳跃解码 (Jump Forward)
 
@@ -241,10 +279,75 @@ if jump_str:
 |------|---------------------|----------|------|
 | JSON Schema | `json_schema` | `("json", schema)` | `'{"type":"object","properties":{"name":{"type":"string"}}}'` |
 | 正则表达式 | `regex` | `("regex", pattern)` | `'[0-9]{3}-[0-9]{4}'` |
-| EBNF | `ebnf` | `("ebnf", grammar)` | `'root ::= "hello" | "world"'` |
+| EBNF | `ebnf` | `("ebnf", grammar)` | `'root ::= "hello" \| "world"'` |
 | 结构标签 | `structural_tag` | `("structural_tag", json)` | XML/HTML 标签约束 |
+| 结构化模式 | — | `("structural_pattern", pattern)` | 结构化模式约束 |
+| 结构化模式 v2 | — | `("structural_pattern_v2", pattern)` | 结构化模式约束 v2 |
 
-## 10. 与投机解码的交互
+> **dispatch 路由** (`base_grammar_backend.py` `_init_value_dispatch`): 根据 key_type 路由到对应的 `dispatch_*` 方法。`structural_pattern` 和 `structural_pattern_v2` 是扩展类型，通过 `dispatch_structural_pattern()` / `dispatch_structural_pattern_v2()` 分发。
+
+## 10. GrammarStats 性能追踪
+
+**文件**: `srt/constrained/base_grammar_backend.py` L30-39
+
+每个 `BaseGrammarObject` 实例可通过 `grammar_stats` 属性追踪语法操作的性能指标：
+
+```python
+@dataclass
+class GrammarStats:
+    compilation_time: Optional[float] = None      # 编译耗时（秒）
+    schema_count: Optional[int] = None             # schema 数量
+    ebnf_size: Optional[int] = None                # EBNF 规则大小
+    is_cache_hit: bool = False                     # 是否命中编译缓存
+    is_grammar_aborted: bool = False               # 语法是否被中止
+    tree_traversal_time: List[float] = field(default_factory=list)  # 树遍历耗时列表
+    dispatch_type: Optional[str] = None            # dispatch 类型 (json/regex/ebnf/...)
+    num_timeout: int = 0                           # 超时次数
+```
+
+`compilation_time` 在 `_init_value_dispatch()` 中自动记录，其他字段由各后端在编译和运行时填充。
+
+## 11. 自定义后端注册机制
+
+**文件**: `srt/constrained/base_grammar_backend.py` L199-203
+
+SGLang 提供全局注册表 `GRAMMAR_BACKEND_REGISTRY`，允许第三方注册自定义 grammar 后端：
+
+```python
+GRAMMAR_BACKEND_REGISTRY = {}
+
+def register_grammar_backend(name, init_func):
+    """注册自定义 grammar 后端
+
+    Args:
+        name: 后端名称字符串
+        init_func: 工厂函数, 签名: (server_args, tokenizer, vocab_size, eos_token_ids) -> BaseGrammarBackend
+    """
+    GRAMMAR_BACKEND_REGISTRY[name] = init_func
+```
+
+`create_grammar_backend()` 的查找优先级：
+1. **自定义注册** — 先查 `GRAMMAR_BACKEND_REGISTRY`，找到则直接调用工厂函数
+2. **内置后端** — `xgrammar` / `outlines` / `llguidance`
+3. **Reasoning 包装** — 如果启用了 `reasoning_parser` 且 tokenizer 有 `think_end_id`，则用 `ReasonerGrammarBackend` 包装
+
+```python
+def create_grammar_backend(server_args, tokenizer, vocab_size, eos_token_ids):
+    name = server_args.grammar_backend
+    # 1. 优先查自定义注册
+    if name in GRAMMAR_BACKEND_REGISTRY:
+        return GRAMMAR_BACKEND_REGISTRY[name](server_args, tokenizer, vocab_size, eos_token_ids)
+    # 2. 内置后端
+    if name == "xgrammar": ...
+    elif name == "outlines": ...
+    elif name == "llguidance": ...
+    # 3. Reasoning 包装
+    if server_args.reasoning_parser and hasattr(tokenizer, "think_end_id"):
+        grammar_backend = ReasonerGrammarBackend(grammar_backend, tokenizer.think_end_id)
+    return grammar_backend
+```
+
+## 12. 与投机解码的交互
 
 XGrammar 支持 `rollback(k)` 用于投机解码：
 
@@ -255,6 +358,6 @@ grammar.rollback(num_rejected_tokens)
 # MAX_ROLLBACK_TOKENS = 200
 ```
 
-## 11. 下一步
+## 13. 下一步
 
 - **21**: 推理解析与函数调用 (ReasoningParser, FunctionCallParser)

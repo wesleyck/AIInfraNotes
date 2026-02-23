@@ -65,8 +65,12 @@
 
 **Stage A: 前置检查 (L806-825)**
 - 记录加载前可用 GPU 内存
-- `torch.set_num_threads(1)` 减少线程冲突
+- `torch.set_num_threads(1)` — 限制 PyTorch CPU 计算线程数（BLAS/OpenMP），避免与 I/O 线程竞争
 - 检查 CUDA compute capability，低于 sm80 时自动降级 dtype 到 `float16`
+
+> **线程数配置说明**：SGLang 中有两个不同的线程数设置：
+> - `torch.set_num_threads(1)` (`model_runner.py:813-814`)：控制 PyTorch CPU 计算线程（BLAS/OpenMP），设为 1 防止多线程 BLAS 运算与加载 I/O 线程争抢 CPU
+> - `DEFAULT_NUM_THREADS = 8` (`weight_utils.py:364-365`)：safetensors I/O 读取的 `ThreadPoolExecutor` 线程池大小，由 writer 进程 fork 出的 Python ThreadPool 负责并行读取多个 shard 文件
 
 **Stage B: 构建 LoadConfig (L828-855)**
 - 组装 `LoadConfig` dataclass，注入 `load_format`、`download_dir`、`tp_rank`、`draft_model_idx` 等
@@ -84,8 +88,44 @@
 - FP8 KV cache scale 加载
 - 滑动窗口大小检测
 - 记录权重 GPU 内存占用
-- RoPE 缓存预扩展
+- **RoPE 缓存预扩展**（见下方详解）
 - **屏障同步**：`dist.monitored_barrier(...)` 确保所有 TP rank 都完成加载（Mooncake 后端使用 `dist.barrier` 替代）
+
+**Stage E 详解: RoPE 缓存预扩展** (`model_runner.py:967-973`)
+
+模型加载完成后、CUDA Graph capture 之前，调用 `reserve_rope_cache_for_long_sequences()` (`utils/common.py:3679`) 预扩展所有 RoPE 层的 cos/sin cache：
+
+```python
+# utils/common.py:3679-3716
+def reserve_rope_cache_for_long_sequences(model, server_args, model_config):
+    SAFETY_FACTOR = envs.SGLANG_SPEC_EXPANSION_SAFETY_FACTOR.get()
+    MARGIN = envs.SGLANG_ROPE_CACHE_SAFETY_MARGIN.get()
+    ALIGN = envs.SGLANG_ROPE_CACHE_ALIGN.get()
+
+    # 1) 估算基础上下文上界
+    base_ctx = server_args.context_length or model_config.context_len or 2048
+
+    # 2) 投机解码扩展
+    steps = server_args.speculative_num_steps or 0
+    draft = server_args.speculative_num_draft_tokens or 0
+    reserve = base_ctx + steps * draft * SAFETY_FACTOR + MARGIN
+
+    # 3) 对齐以减少重分配频率
+    reserve = (reserve + ALIGN - 1) // ALIGN * ALIGN
+
+    # 4) 递归扩展所有 RoPE 层
+    def reserve_rope_cache_recursive(module):
+        for child in module.children():
+            if hasattr(child, "_ensure_cos_sin_cache_length"):
+                child._ensure_cos_sin_cache_length(reserve - 1)
+            else:
+                reserve_rope_cache_recursive(child)
+    reserve_rope_cache_recursive(model)
+```
+
+**为什么需要预扩展？** CUDA Graph capture 会固化所有 tensor 形状，运行时不能动态扩展。如果 cos_sin_cache 不够长，推理时遇到长序列会因形状不匹配而崩溃。
+
+**`_ensure_cos_sin_cache_length` 的增量计算机制**：不重新计算全量 cache，而是只计算 `[cur_len, new_len)` 范围的 cos/sin 值，通过 `torch.cat` 追加到现有 `cos_sin_cache` 末尾。
 
 ### 2.3 关键配置类
 
@@ -198,7 +238,9 @@ with set_default_torch_dtype(model_config.dtype):
         model = _initialize_model(model_config, self.load_config)
 ```
 
-在 `with target_device:` 内，所有 `nn.Parameter()` / `torch.empty()` 默认分配在 GPU 上（未初始化值）。这样设计的目的是**避免 CPU→GPU 全量拷贝**——参数壳子直接建在 GPU，后续只需把磁盘数据逐个 `copy_` 进去。
+在 `with target_device:` 内，所有 `nn.Parameter()` / `torch.empty()` 默认分配在 GPU 上（未初始化值）。这样设计的目的是**避免 CPU→GPU 全量拷贝**——参数壳子直接建在 GPU，后续 `load_weights()` 逐步 `param.data.copy_(loaded_weight)` 覆盖写入。
+
+> **`DummyModelLoader` 特殊处理**：`DummyModelLoader` 用于测试/profiling 场景，在构造模型后额外调用 `initialize_dummy_weights(model)` 用 `[-1e-3, 1e-3]` 范围的随机值填充所有参数，跳过真正的权重加载。
 
 ---
 
@@ -274,6 +316,11 @@ def safetensors_weights_iterator(hf_weights_files, ..., disable_mmap=False):
 - `f.get_tensor(name)` 触发实际磁盘 I/O，返回**一个** CPU 张量
 - Python generator 的 `yield` 暂停执行，消费端取一个才读一个
 - 消费端处理完后，CPU 张量失去引用，被 GC 回收——内存占用始终是"一个张量"级别
+
+**`weight_loader_disable_mmap` 机制**：
+- **mmap 开启（默认）**：通过 `safetensors.safe_open(device="cpu")` 使用 OS 内存映射，未访问部分不占物理内存，多 rank 可共享页面缓存
+- **mmap 关闭**：通过 `disable_mmap=True`，使用 `open(st_file, "rb")` + `f.read()` 全量读入内存
+- mmap 优势：未访问的 shard 部分不占物理 RAM；同一节点上多个 rank 进程读同一文件时，OS 自动共享页面缓存，避免重复 I/O
 
 ### 4.3 `model.load_weights()` 消费端
 
@@ -369,6 +416,11 @@ def _get_all_weights(self, model_config, model):
 ```
 
 `secondary_weights` 机制用于需要从**额外来源**加载权重的场景（如附属模块、额外编码器等），但绝大多数模型只使用 primary 路径。
+
+> **Python Generator 语义说明**：
+> - **`yield name, tensor`**：将函数变为 generator，惰性执行——调用者 `next()` 一次才执行到下一个 `yield`，实现"消费一个读一个"的流式加载
+> - **`yield from iterable`**：委托给子 generator，等价于 `for item in iterable: yield item`，但更高效。`_get_all_weights` 使用 `yield from` 将 `_get_weights_iterator` 的输出透传给消费者
+> - **流式设计意义**：整个权重加载链（`_get_all_weights` → `_get_weights_iterator` → `safetensors_weights_iterator`）都是 generator 组成的管道。每个 tensor 从磁盘读取后立刻被消费端（`load_weights`）处理并 `copy_` 到 GPU，CPU 端只驻留一个 tensor 的内存
 
 ### 4.7 `stacked_params_mapping` vs `packed_modules_mapping`
 
@@ -687,7 +739,18 @@ def load_model(self, *, model_config, device_config):
 4. 输入 embedding 替换为 `VocabParallelEmbedding`
 5. 输出头创建 `ParallelLMHead` + `LogitsProcessor`
 
-**关键约束**：若 HF 模型未定义 `base_model_tp_plan` 且 `tp_size > 1`，直接报错。
+**关键约束**：若 HF 模型未定义 `base_model_tp_plan` 且 `tp_size > 1`，直接报错。必须通过 `is_backend_compatible()` 检查。
+
+**HF 桥接模型可享受的 SGLang 优化能力**：
+
+| 优化特性 | 可用性 | 说明 |
+|---------|--------|------|
+| RadixAttention | 可用 | `attn_implementation="sglang"` 替换 HF 原生 attention，桥接为 `RadixAttention` |
+| KV Cache (Radix Cache) | 可用 | 共享 SGLang 的前缀缓存机制 |
+| TP 并行 | 部分可用 | 需要 HF 模型定义 `base_model_tp_plan`，否则 `tp_size > 1` 直接报错 |
+| 调度 (Scheduler) | 可用 | 连续批处理、overlap schedule 等全部可用 |
+| Fused MLP Kernels | 不可用 | 不使用 SGLang 的 fused kernels（gate_up_proj 等） |
+| 量化 | 受限 | 依赖 HF 自身的量化支持，不使用 SGLang 的量化方法 |
 
 ### 10.3 设计原则
 

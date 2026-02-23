@@ -2,7 +2,7 @@
 
 > **默认场景**: Qwen/Qwen3-VL-235B-A22B-Thinking 多模态模型
 >
-> **核心组件**: FlashAttention 3/4, CUTLASS MLA, Sparse Attention
+> **核心组件**: FlashAttention 3/4, CUTLASS MLA (SM100), FlashMLA (SM90), Cascade, Sparse Attention
 
 ## 1. 概览
 
@@ -13,33 +13,46 @@ graph TB
         FA3["FlashAttention 3<br/>(SM80-90)"]
         FA4["FlashAttention 4<br/>(实验性)"]
         FI["FlashInfer<br/>(默认)"]
-        MLA["CUTLASS MLA<br/>(Blackwell)"]
+        MLA["CUTLASS MLA<br/>(SM100 Blackwell)"]
+        FMLA["FlashMLA<br/>(SM90 Hopper)"]
         Sparse["Sparse Flash Attn"]
         Triton["Triton Backend"]
     end
-    
+
     subgraph Kernels["sgl-kernel 实现"]
         direction LR
         MLAKernel["cutlass_mla_decode"]
+        FMLAKernel["flash_mla_with_kvcache"]
         Merge["merge_state"]
+        Cascade["cascade"]
         SparseK["fwd_sparse"]
     end
-    
+
     FA3 --> fwd["torch.ops.sgl_kernel.fwd"]
     FA4 --> fwd
     MLA --> MLAKernel
+    FMLA --> FMLAKernel
     Sparse --> SparseK
     FI --> Merge
+    FI --> Cascade
 ```
 
 ### 1.1 Kernel 分类
 
-| Kernel | 文件 | 硬件 | 用途 |
-|--------|------|------|------|
-| `fwd` | `flash_attn.py` | SM80+ | FA3/FA4 前向 |
-| `cutlass_mla_decode` | `cutlass_mla_kernel.cu` | SM100 | DeepSeek MLA |
-| `merge_state` | `merge_attn_states.cu` | All | 分块状态合并 |
-| `fwd_sparse` | `vertical_slash_index.cu` | SM80+ | 稀疏注意力 |
+| Kernel | 源文件 | 硬件 | 用途 |
+|--------|--------|------|------|
+| `fwd` / `fwd_kvcache` | `flash_attn.py` → `flash_extension.cc` | SM80+ | FA3/FA4 前向 |
+| `cutlass_mla_decode` | `csrc/attention/cutlass_mla_kernel.cu` | SM100 | CUTLASS MLA decode (Blackwell) |
+| `cutlass_sm100_mla/*` | `csrc/attention/cutlass_sm100_mla/` | SM100 | SM100 MLA 设备/kernel 实现 |
+| | `├── device/sm100_mla.hpp` | | MLA device-level wrapper |
+| | `├── kernel/sm100_fmha_mla_tma_warpspecialized.hpp` | | TMA Warp-specialized MLA kernel |
+| | `├── kernel/sm100_fmha_mla_reduction.hpp` | | MLA Split-KV reduction kernel |
+| | `└── kernel/sm100_mla_tile_scheduler.hpp` | | Persistent Tile Scheduler |
+| `cascade` | `csrc/attention/cascade.cu` | SM80+ | Cascade attention (合并 2 个 attention 输出) |
+| `merge_state` | `csrc/attention/merge_attn_states.cu` | All | 分块状态合并 (online softmax) |
+| `fwd_sparse` | `csrc/attention/vertical_slash_index.cu` | SM80+ | 稀疏注意力索引转换 |
+| `flash_mla_with_kvcache` | `flash_mla.py` → `flashmla_extension.cc` | SM90 | FlashMLA 后端 (独立项目, 非 CUTLASS MLA) |
+| `flash_mla_sparse_fwd` | `flash_mla.py` | SM90 | FlashMLA 稀疏 prefill |
 
 ## 2. FlashAttention 3/4 集成
 
@@ -221,6 +234,58 @@ workspace_size = cutlass_mla_get_workspace_size(
 ```
 
 > **注意**: `num_kv_splits > 1` 时 Persistent Scheduler 有已知 bug，大 batch 可能 hang
+
+## 3.5 FlashMLA 后端 (SM90, 独立于 CUTLASS MLA)
+
+FlashMLA 是一个**独立维护的项目** (非 FlashInfer 的一部分)，专门针对 MLA 架构的 decode 优化。与 Section 3 的 CUTLASS MLA (SM100 Blackwell 专用) 不同，FlashMLA 运行在 SM90 (H100) 上。
+
+**文件**: `python/sgl_kernel/flash_mla.py` + `csrc/flashmla_extension.cc`
+
+```python
+import sgl_kernel
+
+# Step 1: 计算调度元数据
+tile_scheduler_metadata, num_splits = sgl_kernel.get_mla_metadata(
+    cache_seqlens,              # (batch_size,), torch.int32
+    num_q_tokens_per_head_k,    # num_q_tokens_per_q_seq * num_heads_q // num_heads_k
+    num_heads_k,
+    num_heads_q=None,           # 稀疏注意力时需要
+    is_fp8_kvcache=False,       # 是否使用 FP8 KV Cache
+    topk=None,                  # 稀疏注意力 topk (启用时需传 num_heads_q)
+)
+
+# Step 2: 执行 MLA decode
+out, softmax_lse = sgl_kernel.flash_mla_with_kvcache(
+    q,                          # (batch, seq_len_q, num_heads_q, head_dim)
+    k_cache,                    # (num_blocks, page_block_size, num_heads_k, head_dim)
+    block_table,                # (batch, max_num_blocks_per_seq), torch.int32
+    cache_seqlens,              # (batch,), torch.int32
+    head_dim_v,                 # V 的 head dimension
+    tile_scheduler_metadata,    # 来自 get_mla_metadata
+    num_splits,                 # 来自 get_mla_metadata
+    softmax_scale=None,         # 默认 head_dim^(-0.5)
+    causal=False,
+    descale_q=None,             # FP8 反量化因子 (可选)
+    descale_k=None,
+    is_fp8_kvcache=False,
+    indices=None,               # 稀疏注意力索引 (可选)
+)
+
+# Step 3 (可选): 稀疏 prefill
+out, max_logits, lse = sgl_kernel.flash_mla_sparse_fwd(
+    q, kv, indices, sm_scale, d_v=512
+)
+```
+
+**与 CUTLASS MLA 的区别**:
+
+| 特性 | CUTLASS MLA (Section 3) | FlashMLA 后端 |
+|------|------------------------|---------------|
+| 硬件 | SM100 (Blackwell) | SM90 (Hopper) |
+| 来源 | sgl-kernel 内嵌 CUTLASS 实现 | 独立 FlashMLA 项目 |
+| 接口 | `cutlass_mla_decode(out, q_nope, q_pe, kv_cache, ...)` | `flash_mla_with_kvcache(q, k_cache, block_table, ...)` |
+| FP8 支持 | FP8_E4M3 输入 | FP8 KV Cache |
+| 稀疏支持 | 无 | 支持 (`indices` 参数 + `flash_mla_sparse_fwd`) |
 
 ## 4. 状态合并 (merge_state)
 
@@ -413,8 +478,8 @@ flowchart TB
     Start --> IsMLA
     
     IsMLA -->|Yes| IsSM100
-    IsSM100 -->|Yes| CUTLASS["cutlass_mla_decode"]
-    IsSM100 -->|No| FlashMLA["FlashInfer MLA"]
+    IsSM100 -->|Yes| CUTLASS["cutlass_mla_decode<br/>(CUTLASS SM100)"]
+    IsSM100 -->|No| FlashMLA["FlashMLA backend<br/>(flash_mla.py, SM90)"]
     
     IsMLA -->|No| IsSparse
     IsSparse -->|Yes| SparseFwd["fwd_sparse"]
@@ -472,7 +537,7 @@ else:
 
 | 问题 | 原因 | 解决 |
 |------|------|------|
-| `cutlass_mla_decode` 失败 | 非 SM100 | 使用 FlashInfer MLA |
+| `cutlass_mla_decode` 失败 | 非 SM100 | 使用 FlashMLA 后端 (`flash_mla.py`, SM90) |
 | FA4 不支持 KV 更新 | 设计限制 | 使用 FA3 |
 | 大 batch MLA hang | Split-KV bug | 设置 `num_kv_splits=1` |
 

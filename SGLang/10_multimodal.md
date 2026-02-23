@@ -34,7 +34,7 @@ flowchart TB
 ### 2.1 BaseMultimodalProcessor
 
 ```python
-# base_processor.py L162-901
+# base_processor.py L162-901 (文件共 901 行)
 class BaseMultimodalProcessor(ABC):
     """Base class for all multimodal processors."""
 
@@ -49,8 +49,19 @@ class BaseMultimodalProcessor(ABC):
         self.mm_cache_enabled = server_args.mm_cache_enabled
         self.mm_feature_cache = LRUCache(maxsize=MM_FEATURE_CACHE_SIZE)
 
-        # 并行处理
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+        # 双 executor 并行处理 (L176-182)
+        self.io_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=int(os.environ.get("SGLANG_IO_WORKERS", 4))
+        )  # ThreadPool, 用于 I/O 密集任务 (图片加载/URL 下载)
+        self.cpu_executor = concurrent.futures.ProcessPoolExecutor(
+            mp_context=mp.get_context("fork"),
+            max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
+        )  # ProcessPool, fork 模式, 用于 CPU 密集任务 (图片预处理/resize)
+
+        # 初始化时还设置:
+        # - mm_cache_enabled / mm_feature_cache → 本地 LRU 缓存
+        # - CudaIpcTensorTransportProxy 相关 → CUDA IPC 传输 (如启用)
+        # - NullMemoryProxy / FullMemoryProxy → 显存管理
 
     @abstractmethod
     def process_mm_data(self, input_text, images=None, videos=None, audios=None):
@@ -74,6 +85,7 @@ class BaseMultimodalProcessor(ABC):
 class MultimodalSpecialTokens:
     """Manages special tokens for multimodal inputs."""
 
+    # 基础 token 字段
     image_token: Optional[Union[str, List[str]]] = None   # "<image>"
     video_token: Optional[Union[str, List[str]]] = None   # "<video>"
     audio_token: Optional[Union[str, List[str]]] = None   # "<audio>"
@@ -81,19 +93,26 @@ class MultimodalSpecialTokens:
     video_token_id: Optional[int] = None
     audio_token_id: Optional[int] = None
 
+    # 正则匹配字段 (用于处理非标准 token 格式)
+    image_token_regex: Optional[re.Pattern] = None
+    video_token_regex: Optional[re.Pattern] = None
+    audio_token_regex: Optional[re.Pattern] = None
+    combined_regex: Optional[re.Pattern] = None            # 合并正则，用于分割输入文本
+
+    def build(self, processor) -> "MultimodalSpecialTokens":
+        """初始化入口：convert_to_strs → parse_regex → get_combined_regex"""
+        self.convert_to_strs(processor)    # token id → 字符串 (通过 tokenizer)
+        self.parse_regex()                  # 构建单模态匹配 pattern
+        self.get_combined_regex()           # 合并为分割用 combined pattern
+        return self
+
     def get_modality_of_token(self, token: str) -> Optional[Modality]:
-        """返回 token 对应的模态类型"""
-        if token == self.image_token:
-            return Modality.IMAGE
+        """返回 token 对应的模态类型（先精确匹配，再 regex 匹配）"""
         ...
 
-    def get_combined_regex(self) -> str:
-        """构建用于分割输入的正则表达式"""
-        patterns = []
-        if self.image_token:
-            patterns.append(re.escape(self.image_token))
+    def get_combined_regex(self) -> re.Pattern:
+        """构建合并正则，用于将输入字符串按多模态 token 分割"""
         ...
-        return "|".join(patterns)
 ```
 
 ### 2.3 QwenVLImageProcessor (Qwen3-VL 专用)
@@ -997,17 +1016,30 @@ class Modality(Enum):
 
 ### 7.2 支持的模型
 
-| 模型 | 支持模态 | Processor 类 |
-|------|----------|--------------|
+| 模型 | 支持模态 | Processor 类 / 模型文件 |
+|------|----------|------------------------|
 | **Qwen3-VL** | 图像, 视频 | `QwenVLImageProcessor` |
-| **Qwen2.5-VL** | 图像, 视频 | `QwenVLImageProcessor` |
+| **Qwen2.5-VL** / **Qwen2-VL** | 图像, 视频 | `QwenVLImageProcessor` |
 | **Qwen3-Omni** | 图像, 视频, 音频 | `QwenVLImageProcessor` |
-| **LLaVA** | 图像 | `LLaVAImageProcessor` |
-| **LLaVA-OneVision** | 图像, 视频 | `LLaVAImageProcessor` |
-| **InternVL** | 图像 | `InternVLImageProcessor` |
+| **Qwen2-Audio** | 音频 | `qwen2_audio.py` |
+| **Gemma3** / **Gemma3n** | 图像 | `gemma3_mm.py` / `gemma3n.py` |
+| **LLaVA** / **LLaVA-OneVision** | 图像, 视频 | `LLaVAImageProcessor` |
+| **InternVL** / **InternVL2.5** | 图像 | `InternVLImageProcessor` |
 | **GLM-4V** | 图像 | `GLM4VImageProcessor` |
 | **MiniCPM-V** | 图像, 视频 | `MiniCPMImageProcessor` |
-| **Phi-4-MM** | 图像 | `Phi4MMImageProcessor` |
+| **Pixtral** | 图像 | `pixtral.py` |
+| **Phi-3.5-Vision** / **Phi-4-MM** | 图像 | `Phi4MMImageProcessor` |
+| **MLlama** | 图像 | `mllama.py` |
+| **MLlama4** | 图像 | `mllama4.py` |
+| **KimiVL** | 图像 | `kimi_vl.py` |
+| **DeepSeek-VL2** | 图像 | `deepseek_vl_v2.py` |
+| **Janus-Pro** | 图像 | `janus_pro.py` |
+| **NVILA** / **JetVLM** | 图像 | `nvila.py` |
+| **NanoNextorVL** | 图像 | `nanonextor_vl.py` |
+| **Sarashina2Vision** | 图像 | `sarashina2_vision.py` |
+| **CLIP** | 图像 (Embedding) | `clip.py` |
+| **DotSVLM** | 图像 | `dots_vlm.py` |
+| **PaddleOCR-VL** | 图像 | `paddleocr_vlm.py` |
 
 ## 8. 数据流转
 
