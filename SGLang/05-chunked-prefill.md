@@ -132,6 +132,8 @@ flowchart TB
     style A11 fill:#cce5ff
 ```
 
+> **交叉引用**：`PrefillAdder` 的完整调度策略（包括 token 预算计算、prefix caching 交互、DFS-Weight 排序等）详见 [`04-schedule-policy.md` §6 PrefillAdder 详解](04-schedule-policy.md#6-prefillAdder-详解)。本节聚焦于 Chunked Prefill 相关的分块判断逻辑。
+
 ### 4.2 PrefillAdder 核心参数
 
 ```python
@@ -161,6 +163,8 @@ class PrefillAdder:
 ```
 
 ### 4.3 add_one_req 分块判断
+
+> **交叉引用**：分块截断的完整流程（包括 `add_chunked_req` 续传、`truncation_align_size` 对齐、`budget_state` 预算检查等）详见 [`04-schedule-policy.md` §7 Chunked Prefill 处理](04-schedule-policy.md#7-chunked-prefill-处理)。
 
 ```python
 # schedule_policy.py L570-666
@@ -256,15 +260,21 @@ class ForwardMode(IntEnum):
 
 ### 5.1 ForwardMode 状态转换
 
+> **注意**：`MIXED` 不是 `DECODE` 的后继状态。`MIXED` 是 Scheduler 在 `is_mixed_chunk=True` 时，将新的 Prefill chunk 与正在运行的 Decode 请求合并为一个混合 batch 的结果。它是一种 **batch 级别的模式**，而非单个请求的状态转换。
+
 ```mermaid
 stateDiagram-v2
     [*] --> EXTEND: 新请求
     EXTEND --> DECODE: Prefill 完成
     EXTEND --> EXTEND: Chunked Prefill (继续)
     DECODE --> DECODE: 继续生成
-    DECODE --> MIXED: enable_mixed_chunk
-    MIXED --> DECODE: Chunk 完成
     DECODE --> [*]: 生成完成
+
+    state "Scheduler 批次决策" as SD {
+        [*] --> MIXED: is_mixed_chunk=True 时<br/>合并 Prefill chunk + Decode reqs
+        MIXED --> EXTEND: Chunk 未完成, 继续 Prefill
+        MIXED --> DECODE: Chunk 完成, 回到 Decode
+    }
 ```
 
 ## 6. Mixed Chunk 模式
@@ -346,6 +356,8 @@ flowchart TB
 ```
 
 ## 7. 多模态分块预填充
+
+> 本节涉及多模态概念，详见 [`11-multimodal.md`](11-multimodal.md)。
 
 多模态模型的 Chunked Prefill 需要特殊处理，确保图像/视频 embedding 能够正确地按 chunk 提取。
 
@@ -532,6 +544,8 @@ flowchart TB
 ---
 
 ## 8. PD 分离场景下的 Chunked Prefill
+
+> 本节涉及 PD 分离概念，详见 [`14-pd-disaggregation.md`](14-pd-disaggregation.md)。
 
 在 Prefill-Decode 分离架构中，Chunked Prefill 有独特的处理流程。
 

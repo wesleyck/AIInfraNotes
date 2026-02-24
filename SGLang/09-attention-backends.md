@@ -779,7 +779,7 @@ elif forward_batch.forward_mode.is_extend():
 ## 6. CUDA Graph 与 Attention Backend
 
 > [!NOTE]
-> CUDA Graph 的详细机制 (捕获原理、固定地址约束、batch size 填充策略) 请参考 [07_model_runner.md §5-7](./07_model_runner.md#5-cuda-graph-runner)。
+> CUDA Graph 的详细机制 (捕获原理、固定地址约束、batch size 填充策略) 请参考 [08-model-runner.md §5-7](./08-model-runner.md#5-cuda-graph-runner)。
 > 本节仅介绍 **Attention Backend 特有的** CUDA Graph 接口。
 
 ### 6.1 Backend 需要实现的 CUDA Graph 接口
@@ -1646,5 +1646,5 @@ flowchart LR
 
 ## 16. 下一步
 
-- **09**: 模型加载、权重处理、量化支持
-- **10**: 多模态完整生命周期 (Qwen3-VL)
+- **10**: 模型加载、权重处理、量化支持
+- **11**: 多模态完整生命周期 (Qwen3-VL)

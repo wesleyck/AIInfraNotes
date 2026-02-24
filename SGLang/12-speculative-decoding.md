@@ -265,11 +265,15 @@ def load_weights(self, weights):
 
 ---
 
-## 4A. v2 架构: BaseSpecWorker/BaseDraftWorker 分离模式
+## 4.5 v2 架构: BaseSpecWorker/BaseDraftWorker 分离模式
+
+> **选择规则**：`_create_eagle_worker()`（`spec_info.py` L264-273）根据 `enable_overlap` 标志自动选择：
+> - `--enable-overlap`（overlap schedule）→ `EAGLEWorkerV2`（v2）
+> - 默认（不开 overlap）→ `EAGLEWorker`（v1）
 
 SGLang 投机解码现在有两套实现架构：v1（`eagle_worker.py`）和 v2（`eagle_worker_v2.py`）。v2 引入了 **BaseSpecWorker/BaseDraftWorker 分离模式**，将 target 和 draft worker 完全解耦。
 
-### 4A.1 v2 类层次
+### 4.5.1 v2 类层次
 
 ```python
 # base_spec_worker.py (34 行)
@@ -290,7 +294,7 @@ class BaseSpecWorker(ABC):
     def clear_cache_pool(self): ...
 ```
 
-### 4A.2 v2 实现文件
+### 4.5.2 v2 实现文件
 
 | 文件 | 类 | 说明 |
 |------|-----|------|
@@ -298,7 +302,7 @@ class BaseSpecWorker(ABC):
 | `eagle_worker_v2.py` | `EAGLEWorkerV2(BaseSpecWorker)` | 组合 target + draft，verify 逻辑，attention backend 管理 |
 | `eagle_info_v2.py` (489 行) | `assign_extend_cache_locs`, `fill_accepted_out_cache_loc`, `fill_new_verified_id` | v2 专用的 cache loc 分配和验证结果处理函数 |
 
-### 4A.3 v1 vs v2 对比
+### 4.5.3 v1 vs v2 对比
 
 | 方面 | v1 (`EAGLEWorker`) | v2 (`EAGLEWorkerV2`) |
 |------|---------------------|----------------------|
@@ -309,9 +313,113 @@ class BaseSpecWorker(ABC):
 | CUDA Graph | 可选 | 写入 draft extend 和 draft CUDA graph 分别管理 |
 | 设计意义 | target/draft 耦合 | target/draft 完全解耦，支持更灵活的组合 |
 
-### 4A.4 新增 ForwardMode
+### 4.5.4 新增 ForwardMode
 
 `DRAFT_EXTEND_V2` 与 `DRAFT_EXTEND` 的区别：v2 模式下 draft worker 完全独立，可以有自己的 attention backend 和 CUDA graph runner。
+
+---
+
+## 4.6 MultiLayerEagle (MTP) 架构
+
+### 4.6.1 EAGLE3 vs MTP 核心区别
+
+EAGLE3 和 MTP 都基于 EAGLE 框架，但 draft 策略完全不同：
+
+| 方面 | EAGLE / EAGLE3 | MultiLayerEagle (MTP) |
+|------|---------------|----------------------|
+| Draft 模型层数 | 单层 | 多层（`speculative_num_steps` 层） |
+| 每步推理 | 单层 draft model 执行多步，每步 topk 展开 | 每层 draft model 执行一步 |
+| 模型文件 | `eagle_worker.py` / `eagle_worker_v2.py` | `multi_layer_eagle_worker.py` / `_v2.py` |
+| 启用参数 | `--speculative-algorithm EAGLE` | `--enable-multi-layer-eagle` |
+| 适用模型 | 通用 EAGLE draft model | DeepSeek V3 MTP、Qwen3Next MTP |
+| 注册 flags | `("EAGLE",)` 或 `("EAGLE", "EAGLE3")` | 同 EAGLE，通过 `enable_multi_layer_eagle` 切换 |
+
+### 4.6.2 实现文件与类层次
+
+| 文件 | 类 | 基类 | 说明 |
+|------|-----|------|------|
+| `multi_layer_eagle_worker.py` (753 行) | `MultiLayerEagleWorker` | `TpModelWorker` | v1，继承式，target/draft 耦合 |
+| `multi_layer_eagle_worker_v2.py` (706 行) | `MultiLayerEagleDraftWorker` | `BaseDraftWorker` | v2 draft worker，组合式 |
+| `multi_layer_eagle_worker_v2.py` | `MultiLayerEagleWorkerV2` | `BaseSpecWorker` | v2 spec worker，组合 target + draft |
+
+### 4.6.3 多层 Draft 核心机制
+
+与单层 EAGLE 的关键区别在于 `draft_runner_list`——每个 draft 层有独立的 ModelRunner：
+
+```python
+# multi_layer_eagle_worker_v2.py L128
+self.draft_runner_list = self.draft_worker.model_runner_list  # 每层一个 runner
+
+def mtp_model_runner(self, step: int):  # L161
+    return self.draft_runner_list[step]
+```
+
+**Draft Forward 流程**（v2, `draft_forward()` L271-331）：
+
+```python
+for step_i in range(self.speculative_num_steps):
+    # 每层 draft model 执行一步 forward
+    logits = self.mtp_model_runner(step_i).forward(forward_batch)
+    # 从 logits 中选 topk
+    top_scores, top_indices = torch.topk(logits, self.topk)
+    # 累积 tokens、scores、parent 关系
+    draft_tokens.append(top_indices)
+    parent_list.append(parent_indices)
+```
+
+**Extend 阶段**（`_draft_extend_for_decode()` L408-523）：
+
+验证完成后，需要将已接受的 token 路径固化到每层 draft model 的 KV cache 中：
+
+```python
+for step_i in range(self.speculative_num_steps):
+    # 每层独立执行 extend forward，支持 CUDA graph
+    runner = self.mtp_model_runner(step_i)
+    if runner.cuda_graph_runner and can_use_cuda_graph:
+        logits = runner.cuda_graph_runner.replay(forward_batch)
+    else:
+        logits = runner.forward(forward_batch)
+```
+
+### 4.6.4 适用模型
+
+- **DeepSeek V3 MTP**：使用 `--enable-multi-layer-eagle` 启用，模型自带多层 draft head
+- **Qwen3Next MTP**：`Qwen3NextForCausalLMMTP` 模型类，同样通过 `--enable-multi-layer-eagle` 启用
+
+## 4.7 STANDALONE 算法
+
+STANDALONE 使用独立的完整 draft 模型（而非 EAGLE 的轻量 draft head），适用于没有专用 draft head 的场景。
+
+### 4.7.1 实现结构
+
+```python
+# standalone_worker.py L24
+class StandaloneWorker(EAGLEWorker):
+    """继承 EAGLEWorker，复用其 draft/verify 流程，
+    但使用独立加载的完整模型作为 draft model。"""
+```
+
+| 方面 | EAGLE | STANDALONE |
+|------|-------|-----------|
+| Draft 模型 | 轻量 draft head（共享 embedding/lm_head） | 独立完整模型 |
+| 注册方式 | `register_speculative_algorithm("EAGLE", ...)` | `register_speculative_algorithm("STANDALONE", ...)` |
+| 启用参数 | `--speculative-algorithm EAGLE` | `--speculative-algorithm STANDALONE` |
+| 初始化 | 加载 draft head 权重 | `TpModelWorker.__init__(is_draft_worker=True)` 加载完整模型 |
+
+### 4.7.2 关键初始化差异
+
+```python
+# standalone_worker.py L74-86
+TpModelWorker.__init__(
+    self, ...,
+    is_draft_worker=True,  # 标记为 draft worker
+)
+# 独立加载完整模型权重，不与 target 共享
+```
+
+- 支持 hot token map（`--speculative-eagle-hot-token-map`）
+- 支持 MOE backend context（`speculative_moe_backend_ctx`）
+- Draft/verify 流程完全复用 `EAGLEWorker` 的实现
 
 ---
 
@@ -537,6 +645,15 @@ flowchart TD
     style A2 fill:#e3f2fd
 ```
 
+**Tree 结构语义**：
+
+- **parent/child 关系**：每个 draft token 的 parent 是它在 tree attention mask 中可以 attend 到的前驱 token。child 只能看到从 root 到自身的路径上的所有祖先节点
+- **Tree Attention Mask**：mask 矩阵中 `mask[i][j]=1` 表示 token i 可以看到 token j，即 j 是 i 的祖先（含自身）。非祖先路径上的 token 互相不可见
+- **关键索引含义**：
+  - `retrieve_index`：从 verify 结果中提取每条候选路径的 token 序列，用于判断哪条路径被接受最多
+  - `retrieve_next_token`：每个 draft token 在 verify 输出中对应的 "下一个 token" 位置，用于逐 token 比对是否被 target model 接受
+  - `retrieve_next_sibling`：当某个 token 被拒绝时，跳转到同层的兄弟节点继续检查，实现 tree 的广度优先验证
+
 ---
 
 ## 7. Data Structures
@@ -673,6 +790,34 @@ def _draft_preprocess_decode(self, batch: ScheduleBatch):
     
     # 分配完成后恢复状态 (因为 verify 可能会拒绝)
     self.token_to_kv_pool_allocator.restore_state(backup)
+```
+
+### 9.3 KV Cache 生命周期
+
+Draft 和 Target 模型的 KV Cache 管理遵循 "预分配 → 验证 → 回滚/固化" 的模式：
+
+**1. 预分配**（`_draft_preprocess_decode()`）：
+- 一次性分配 `num_seqs × spec_steps × topk` 个 slot
+- 调用 `alloc_token_slots(backup_state=True)` 保存分配器状态快照
+
+**2. Draft Forward**：
+- 每步 draft forward 将 KV 写入预分配的 slot
+- 多步推理产生 tree 结构的 KV cache
+
+**3. Verify 后回滚**：
+- `token_to_kv_pool_allocator.restore_state(backup)` 回滚未被接受的分配
+- 只有被 target model 验证通过的 token 路径保留
+
+**4. 固化已验证路径**（`_draft_extend_for_decode()` / `forward_draft_extend_after_decode()`）：
+- 将已验证 token path 的 KV cache 固化到 draft model
+- Target model 侧类似：根据 `accept_length_per_req` 修正 KV cache 长度
+
+```mermaid
+flowchart LR
+    A["预分配<br/>num_seqs × steps × topk"] --> B["Draft Forward<br/>写入 KV"]
+    B --> C["Verify"]
+    C -->|"接受"| D["固化 KV<br/>draft_extend"]
+    C -->|"拒绝"| E["回滚<br/>restore_state(backup)"]
 ```
 
 ---

@@ -748,7 +748,7 @@ PrefillAdder 负责选择要 prefill 的请求，管理三层 token 预算 (总�
 - 在预算允许范围内依次添加请求到 `can_run_list`
 - 支持 chunked prefill：预算不够时截断请求
 
-> **详细说明**: PrefillAdder 的预算计算、`add_one_req` 流程、chunked prefill 分块逻辑及 AddReqResult 状态见 **04_schedule_policy.md**。
+> **详细说明**: PrefillAdder 的预算计算、`add_one_req` 流程、chunked prefill 分块逻辑及 AddReqResult 状态见 **04-schedule-policy.md**。
 
 ## 6. 调度策略 (SchedulePolicy)
 
@@ -1665,5 +1665,6 @@ for mb_id in range(pp_loop_size):
 ## 28. 下一步
 
 - **04**: 调度策略深入 (DFS-weight、In-batch prefix caching)
-- **05**: 内存池设计 (ReqToTokenPool, KVCache)
-- **06**: RadixCache 前缀缓存
+- **05**: Chunked Prefill 分块预填充
+- **06**: 内存池设计 (ReqToTokenPool, KVCache)
+- **07**: RadixCache 前缀缓存

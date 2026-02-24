@@ -1,6 +1,6 @@
 # SGLang 推理引擎学习笔记
 
-本系列笔记聚焦于 SGLang 的推理引擎核心（srt 和 sgl-kernel），目标是深入理解其设计与实现。
+本系列笔记聚焦于 SGLang (v0.5.7)的推理引擎核心（srt 和 sgl-kernel），目标是深入理解其设计与实现。
 
 > **默认场景**: 以 **Qwen/Qwen3-VL-235B-A22B-Thinking** 多模态模型为主线
 >
@@ -44,45 +44,45 @@ flowchart TD
 ## 笔记目录
 
 ### Phase 0: 全局架构
-- [ ] `01_architecture.md` - 系统架构、进程模型、event_loop_overlap、请求生命周期
+- [ ] `01-architecture.md` - 系统架构、进程模型、event_loop_overlap、请求生命周期
 
 ### Phase 1: 数据结构
-- [ ] `02_core_data_structures.md` - Req、ScheduleBatch、ModelWorkerBatch、ForwardBatch、MultimodalInputs
+- [ ] `02-core-data-structures.md` - Req、ScheduleBatch、ModelWorkerBatch、ForwardBatch、MultimodalInputs
 
 ### Phase 2: 调度系统
-- [ ] `03_scheduler.md` - Scheduler 事件循环、批次调度、retraction、结果处理
-- [ ] `04_schedule_policy.md` - PrefillAdder、In-batch prefix caching、优先级抢占
+- [ ] `03-scheduler.md` - Scheduler 事件循环、批次调度、retraction、结果处理
+- [ ] `04-schedule-policy.md` - PrefillAdder、In-batch prefix caching、优先级抢占
+- [ ] `05-chunked-prefill.md` - 分块预填充、多模态分块、PD 分离场景
 
 ### Phase 3: 内存管理
-- [ ] `05_memory_pool.md` - GPU/Host 内存池设计、KVCache 变体、分配器
-- [ ] `06_radix_cache.md` - RadixAttention 前缀缓存、逐出策略、锁机制
+- [ ] `06-memory-pool.md` - GPU/Host 内存池设计、KVCache 变体、分配器
+- [ ] `07-radix-cache.md` - RadixAttention 前缀缓存、逐出策略、锁机制
 
 ### Phase 4: 模型执行
-- [ ] `07_model_runner.md` - ModelRunner、CUDA Graph、ForwardBatch
-- [ ] `08_attention_backends.md` - FlashInfer、FlashAttention、Triton 等后端
-- [ ] `09_model_loading.md` - 模型加载、权重处理、量化支持
-- [ ] `10_multimodal.md` - 多模态完整生命周期、VIT 处理、图像缓存
+- [ ] `08-model-runner.md` - ModelRunner、CUDA Graph、ForwardBatch
+- [ ] `09-attention-backends.md` - FlashInfer、FlashAttention、Triton 等后端
+- [ ] `10-model-loading.md` - 模型加载、权重处理、量化支持
+- [ ] `11-multimodal.md` - 多模态完整生命周期、VIT 处理、图像缓存
 
 ### Phase 5: 高级特性
-- [ ] `11_chunked_prefill.md` - 分块预填充
-- [ ] `12_speculative_decoding.md` - EAGLE、NGram 投机解码
-- [ ] `13_parallel_strategies.md` - TP/PP/EP/DP 并行策略
-- [ ] `14_pd_disaggregation.md` - Prefill-Decode 分离
+- [ ] `12-speculative-decoding.md` - EAGLE、NGram 投机解码
+- [ ] `13-parallel-strategies.md` - TP/PP/EP/DP 并行策略
+- [ ] `14-pd-disaggregation.md` - Prefill-Decode 分离
 
 ### Phase 6: Kernel 实现
-- [ ] `15_sgl_kernel_overview.md` - sgl-kernel 架构
-- [ ] `16_attention_kernels.md` - Attention kernel 实现
-- [ ] `17_moe_kernels.md` - MoE kernel 实现
-- [ ] `18_quantization.md` - 量化实现详解
+- [ ] `15-sgl-kernel-overview.md` - sgl-kernel 架构
+- [ ] `16-attention-kernels.md` - Attention kernel 实现
+- [ ] `17-moe-kernels.md` - MoE kernel 实现
+- [ ] `18-quantization.md` - 量化实现详解
 
 ### Phase 7: 生成与约束
-- [ ] `19_sampling_and_generation.md` - 采样参数、惩罚机制、LogitsProcessor、Sampler
-- [ ] `20_constrained_generation.md` - Grammar Backend、JSON Schema、词表掩码、跳跃解码
-- [ ] `21_reasoning_and_function_call.md` - 推理解析 (ReasoningParser)、函数调用 (FunctionCallParser)
+- [ ] `19-sampling-and-generation.md` - 采样参数、惩罚机制、LogitsProcessor、Sampler
+- [ ] `20-constrained-generation.md` - Grammar Backend、JSON Schema、词表掩码、跳跃解码
+- [ ] `21-reasoning-and-function-call.md` - 推理解析 (ReasoningParser)、函数调用 (FunctionCallParser)
 
 ### Phase 8: 特殊模型与适配
-- [ ] `22_embedding_and_rerank.md` - Embedding/Rerank 模型 (Pooler, CrossEncodingPooler, SparsePooler)
-- [ ] `23_lora.md` - LoRA 适配器 (S-LoRA, Punica, 内存池, 多后端)
+- [ ] `22-embedding-and-rerank.md` - Embedding/Rerank 模型 (Pooler, CrossEncodingPooler, SparsePooler)
+- [ ] `23-lora.md` - LoRA 适配器 (S-LoRA, Punica, 内存池, 多后端)
 
 ## 核心文件速查
 

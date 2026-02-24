@@ -20,7 +20,7 @@ flowchart TB
         S1["1: 请求接收 HTTP/API<br/>images=base64/URL<br/>text='&lt;image&gt; Describe this'"]
         S2["2: 预处理 Tokenizer Manager<br/>- 加载图像 PIL/decord<br/>- 调整尺寸 smart_resize<br/>- 计算 grid_thw<br/>- 生成 hash 用于缓存"]
         S3["3: Tokenizer<br/>- 替换 &lt;image&gt; 为 &lt;|image_pad|&gt; * num_patches<br/>- 构建 input_ids + image_offsets"]
-        S4["4: Scheduler 调度<br/>- 检查 MultimodalCache 命中<br/>- 分配 mm_embedding 位置"]
+        S4["4: Scheduler 调度<br/>- 创建 ScheduleBatch<br/>- prepare_for_extend: H2D 搬运"]
         S5["5: VIT 编码 ModelRunner<br/>- 像素值 -> Vision Encoder<br/>- patch_embedding + position_embedding<br/>- Transformer Blocks 可使用 CUDA Graph<br/>- 输出 image_embeddings"]
         S6["6: 嵌入融合<br/>- text_embeddings = embed_tokens input_ids<br/>- text_embeddings 中 image_offsets 替换为 image_embeddings<br/>- 合并后的 hidden_states"]
         S7["7: LLM 推理<br/>Prefill / Decode 使用融合后的 embeddings"]
@@ -258,6 +258,53 @@ def preprocess_video(vr, image_factor=28, video_config={}):
     return frames, (nframes, new_h // image_factor, new_w // image_factor)
 ```
 
+### 3.4 process_and_combine_mm_data() — 多模态数据处理核心入口
+
+`BaseMultimodalProcessor.process_and_combine_mm_data()` 是预处理阶段的核心函数（`base_processor.py` L765-901），负责将原始多模态输入转换为统一的 `MultimodalDataItem` 列表。
+
+```python
+def process_and_combine_mm_data(
+    self,
+    base_output: BaseMultiModalProcessorOutput,
+    mm_tokens: MultimodalSpecialTokens,
+    **kwargs,
+) -> Tuple[List[MultimodalDataItem], torch.Tensor, dict]:
+```
+
+处理流程分为 4 个阶段：
+
+1. **按模态分类**（L789-800）：将输入分为 `raw_images`、`raw_videos`、`raw_audios` 和 `dict_items`（预计算 embedding 或 processor_output 格式）
+
+2. **原始数据处理**（L802-815）：调用 `_process_and_collect_mm_items()` 执行 HuggingFace AutoProcessor，生成 `pixel_values`、`input_ids` 等
+
+3. **字典格式处理**（L818-835）：处理两种特殊输入格式
+   - `processor_output`：已经过 HF processor 的数据，直接收集
+   - `precomputed_embedding`：预计算的 embedding，跳过 VIT 编码
+
+4. **CUDA IPC 包装**（L862-899）：当 `SGL_USE_CUDA_IPC=1` 时，将 GPU tensor 包装为 `CudaIpcTensorTransportProxy`，实现跨进程零拷贝传输
+
+```python
+# base_processor.py L862-879 — CUDA IPC 分支
+if SGL_USE_CUDA_IPC:
+    for item in all_collected_items:
+        if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
+            sync_flag, available_slice = (
+                self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
+                    item.feature
+                )
+            )
+            if isinstance(available_slice, torch.Tensor):
+                available_slice.copy_(item.feature.view(torch.int8).view(-1),
+                                     non_blocking=True)
+                item.feature = CudaIpcTensorTransportProxy(
+                    data=available_slice,
+                    info_data=item.feature,
+                    sync_buffer_meta=sync_flag,
+                )
+```
+
+> **设计要点**：CUDA IPC 使用预分配的内存池（`cudaipc_mmfeature_pool`）而非直接共享 tensor handle，避免了跨进程 GPU 内存泄漏问题。
+
 ## 4. 多模态缓存 (MultimodalCache)
 
 ### 4.1 缓存机制
@@ -309,21 +356,49 @@ class MultiModalStaticCache(MultimodalCache):
 
 ### 4.2 缓存工作流
 
+缓存的 get/set 发生在 **模型 forward 阶段**（而非 Scheduler 调度阶段）。入口是 `get_embedding_and_mask()`，它依次尝试两种路径：
+
 ```python
-# 在 Scheduler 中使用
-def handle_multimodal_request(req):
-    # 1. 计算 hash
-    mm_hash = MultimodalCache.combine_hashes(req.mm_hashes)
-
-    # 2. 检查缓存
-    cached = self.mm_cache.get(req.mm_hashes, mm_hash)
-    if cached is not None:
-        req.mm_embeddings = cached
-        return
-
-    # 3. 未命中: 需要 VIT 编码
-    req.need_mm_encode = True
+# managers/mm_utils.py L857-868 — get_embedding_and_mask()
+# 1. 优先尝试预计算 embedding（来自 precomputed_embedding 格式的输入）
+embedding = _get_precomputed_embedding(
+    embedding_items, prefix_length, extend_length, items_offset_list
+)
+# 2. 未命中则走 chunked prefill 路径（内部使用 embedding_cache）
+if embedding is None:
+    embedding = _get_chunked_prefill_embedding(
+        data_embedding_func, embedding_items, items_size,
+        prefix_length, extend_length, items_offset_list,
+    )
 ```
+
+当前实际调用的缓存路径是 `_get_chunked_prefill_embedding()`：
+
+```python
+# managers/mm_utils.py L563-574 — _get_chunked_prefill_embedding()
+item_hashes = [item.hash for item in embedding_items_per_req]
+embedding_items_hash = MultiModalStaticCache.combine_hashes(item_hashes)
+
+embedding_per_req = embedding_cache.get(item_hashes)        # cache GET
+if embedding_per_req is None:
+    embedding_per_req = data_embedding_func(embedding_items_per_req)  # VIT 编码
+    if not embedding_cache.set(embedding_items_hash, embedding_per_req):  # cache SET
+        print_warning_once("Multimodal embedding cache is full...")
+```
+
+> **注意**：此函数标记为 `# TODO: To be obsoleted`，未来将被 `_get_chunked_prefill_embedding_for_chunked_items()` 替代（见 §4.2.1）。
+
+#### 4.2.1 函数过渡状态
+
+| 函数 | 行号 | 状态 | Cache 设备 |
+|------|------|------|-----------|
+| `_get_chunked_prefill_embedding()` | mm_utils.py L541 | 当前默认，标记 `TODO: To be obsoleted` | GPU |
+| `_get_chunked_prefill_embedding_for_chunked_items()` | mm_utils.py L700 | 未来替代，当前未被调用 | CPU（`.detach().cpu()`） |
+
+切换后的主要变化：
+- Cache 从 GPU 移到 CPU，释放 GPU 显存
+- 读取时需 `.to(target_device)` 搬回 GPU，增加少量延迟
+- 支持按 chunk 粒度缓存（而非按整个请求），提升 chunked prefill 场景的缓存命中率
 
 ### 4.3 ViT DP 模式下的 Cache 架构
 
@@ -340,21 +415,40 @@ def handle_multimodal_request(req):
 
 #### 4.3.1 Cache 存放位置
 
-**核心发现**：Cache 存储在 **CPU 内存**，使用时动态加载到 GPU。
+> **⚠ 当前版本存在两套实现，行为不同**：
+
+| 函数 | 位置 | Cache 存储设备 | 状态 |
+|------|------|---------------|------|
+| `_get_chunked_prefill_embedding()` | mm_utils.py L541 | **GPU**（直接存 VIT 输出 tensor） | 当前默认路径，标记 `TODO: To be obsoleted` |
+| `_get_chunked_prefill_embedding_for_chunked_items()` | mm_utils.py L700 | **CPU**（`.detach().cpu()` 后存入） | 未来路径，当前未被调用 |
+
+**当前默认路径**（GPU cache）：
 
 ```python
-# managers/mm_utils.py L759-769
-def get_embedding_and_mask(...):
-    # 缓存存储时：移动到 CPU
-    embedding_for_cache = embedding_per_chunk.detach().cpu()
-    if not embedding_cache.set(embedding_items_hash, embedding_for_cache):
-        print("[WARN] Multimodal embedding cache is full...")
+# managers/mm_utils.py L563-568 — _get_chunked_prefill_embedding()
+embedding_per_req = embedding_cache.get(item_hashes)
+if embedding_per_req is None:
+    embedding_per_req = data_embedding_func(embedding_items_per_req)
+    embedding_cache.set(embedding_items_hash, embedding_per_req)  # 直接存 GPU tensor
+```
 
-    # 使用时：从 CPU 加载到目标 GPU
+**未来路径**（CPU cache，尚未启用）：
+
+```python
+# managers/mm_utils.py L754-769 — _get_chunked_prefill_embedding_for_chunked_items()
+embedding_per_chunk = embedding_cache.get(embedding_items_hash)
+if embedding_per_chunk is None:
+    embedding_per_chunk = data_embedding_func(embedding_items_per_chunk)
+    embedding_for_cache = embedding_per_chunk.detach().cpu()  # 移到 CPU 再存
+    embedding_cache.set(embedding_items_hash, embedding_for_cache)
+else:
+    # 从 CPU cache 取出后搬回 GPU
     target_device = embedding_items_per_req[0].feature.device
     if embedding_per_chunk.device != target_device:
         embedding_per_chunk = embedding_per_chunk.to(target_device)
 ```
+
+> **总结**：当前版本 cache 实际存储在 GPU，未来版本切换到 CPU cache 后可释放 GPU 显存。
 
 ```mermaid
 flowchart TB
@@ -402,7 +496,7 @@ flowchart TB
         end
 
         subgraph Gather["NCCL All-Gather 后"]
-            ALL["每个 Rank 拥有<br/>**全量 embeddings**"]
+            ALL["每个 Rank 拥有<br/>全量 embeddings"]
         end
 
         Input --> LB --> Ranks
@@ -420,7 +514,7 @@ flowchart TB
 
 完整的数据流转分为 3 个阶段：
 
-> **注意**：阶段 1 不存在 NCCL scatter 或跨 Rank 传输。所有 TP Rank 已通过 `broadcast_pyobj`（见 §4A.2）拥有完整 `pixel_values`，每个 Rank 根据 `tp_rank` 做本地 `torch.cat` 切片提取自己负责的子集。
+> **注意**：阶段 1 不存在 NCCL scatter 或跨 Rank 传输。所有 TP Rank 已通过 `broadcast_pyobj`（见 §4.7.2）拥有完整 `pixel_values`，每个 Rank 根据 `tp_rank` 做本地 `torch.cat` 切片提取自己负责的子集。
 
 ```mermaid
 flowchart TB
@@ -450,7 +544,7 @@ flowchart TB
         P3_PAD["Padding 到 max_len"]
         P3_AG["NCCL All-Gather<br/>GPU → GPU"]
         P3_REORDER["去 Padding + 恢复原始顺序"]
-        P3_CACHE["存入 CPU Cache<br/>embedding.detach().cpu()"]
+        P3_CACHE["存入 Cache<br/>(当前: GPU tensor)"]
         P3_FUSE["融合到 input_embeds<br/>送入 LLM"]
 
         P3_PAD --> P3_AG --> P3_REORDER
@@ -505,7 +599,7 @@ def run_dp_sharded_mrope_vision_model(vision_model, pixel_values, grid_thw_list,
 
 #### 4.3.4 传输方式
 
-> 详细的端到端传输路径分析见 **§4A**。本表仅总结 ViT DP 场景涉及的通信方式。
+> 详细的端到端传输路径分析见 **§4.7**。本表仅总结 ViT DP 场景涉及的通信方式。
 
 | 传输类型 | 方式 | 说明 | 适用场景 |
 |---------|------|------|---------|
@@ -599,7 +693,7 @@ init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 
 | 问题 | 答案 |
 |------|------|
-| Cache 存放位置 | **CPU 内存** (使用 `.detach().cpu()`) |
+| Cache 存放位置 | 当前: **GPU**（直接存 tensor）；未来: **CPU**（`.detach().cpu()`） |
 | 每个 Rank ViT 编码数据 | **部分图像** (负载均衡本地切片，非 NCCL scatter) |
 | 数据流转 | broadcast_pyobj → H2D → 本地切片 → 本地 ViT → All-Gather → 全量 embedding |
 | 跨进程传输方式 | **pickle + CPU Gloo broadcast** (请求分发) + **NCCL** (ViT 输出聚合) + **.to()** (H2D) |
@@ -608,7 +702,7 @@ init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 ```mermaid
 flowchart TB
     subgraph Summary["ViT DP 模式总结"]
-        Q1["Cache 存放?"] --> A1["CPU 内存"]
+        Q1["Cache 存放?"] --> A1["当前 GPU,<br/>未来 CPU"]
         Q2["ViT 编码数据?"] --> A2["部分图像 (本地切片)"]
         Q3["跨进程传输?"] --> A3["pickle + Gloo (请求)<br/>NCCL (ViT 输出)"]
         Q4["Cache 分布?"] --> A4["每 TP Rank 独立副本"]
@@ -620,13 +714,13 @@ flowchart TB
     style A4 fill:#f8d7da
 ```
 
-## 4A. 跨进程多模态数据传输
+## 4.7 跨进程多模态数据传输
 
 本节解答核心问题：**多模态场景下，pixel_values 在多卡 TP + ViT DP 配置中，是通过 CPU pickle 序列化跨进程传输，还是 GPU 间直接拷贝？**
 
 **结论**：默认路径是 **CPU pickle 序列化**。ViT DP 的输出聚合是唯一使用 NCCL GPU-to-GPU 的环节。
 
-### 4A.1 传输路径四阶段总结
+### 4.7.1 传输路径四阶段总结
 
 | 阶段 | 路径 | 机制 | 数据格式 | 源码 |
 |------|------|------|---------|------|
@@ -637,7 +731,7 @@ flowchart TB
 
 只有**阶段 4** 是 GPU 直连通信，前三个阶段全部经过 CPU。
 
-### 4A.2 broadcast_pyobj 实现
+### 4.7.2 broadcast_pyobj 实现
 
 Rank 0 收到请求后需要广播给其他 TP Rank。这里使用的是 **pickle + CPU dist.broadcast**，而非 NCCL：
 
@@ -672,7 +766,7 @@ def broadcast_pyobj(data, rank, dist_group, src=0, force_cpu_device=True):
 
 > **关键点**：`force_cpu_device=True` 意味着使用 CPU process group（Gloo 后端），不走 NCCL。pixel_values 作为 CPU tensor 被 pickle 序列化传输。
 
-### 4A.3 prepare_for_extend 中的双路径
+### 4.7.3 prepare_for_extend 中的双路径
 
 每个 Rank 收到请求后，在 `prepare_for_extend()` 中将 pixel_values 从 CPU 搬到 GPU：
 
@@ -693,7 +787,7 @@ for mm_input in multimodal_inputs:
             )
 ```
 
-### 4A.4 完整数据流时序图
+### 4.7.4 完整数据流时序图
 
 ```mermaid
 sequenceDiagram
@@ -733,7 +827,7 @@ sequenceDiagram
     end
 ```
 
-### 4A.5 三种传输优化
+### 4.7.5 三种传输优化
 
 默认路径（CPU pickle）在大图像或多 TP Rank 场景下可能成为瓶颈。SGLang 提供三种优化手段：
 
@@ -800,6 +894,8 @@ else:
 - **收益**：减少 CPU 占用，避免单线程 Scheduler 被大量 from_dict 阻塞
 
 ## 5. VIT CUDA Graph
+
+> **使用范围**：当前仅 `qwen3_vl.py`、`qwen2_5_vl.py` 和 `layers/attention/vision.py` 使用 ViT CUDA Graph。Graph key 是 `x_3d.shape[0]`（即序列长度 / patch 总数），而非 batch size。
 
 ### 5.1 ViTCudaGraphRunner
 
@@ -1041,25 +1137,9 @@ class Modality(Enum):
 | **DotSVLM** | 图像 | `dots_vlm.py` |
 | **PaddleOCR-VL** | 图像 | `paddleocr_vlm.py` |
 
-## 8. 数据流转
+## 8. 优化策略
 
-```mermaid
-flowchart TB
-    subgraph DataFlow["多模态数据流转"]
-        direction TB
-        HTTP["HTTP Request<br/>images: base64/URL<br/>messages: role=user, content='&lt;image&gt; Describe'"]
-        TM["Tokenizer Manager<br/>process_mm_data_async<br/>- images: PIL.Image list<br/>- pixel_values: B,C,H,W tensor<br/>- image_grid_thw<br/>- input_ids with IMG_PAD"]
-        REQ["Req 对象<br/>- mm_data: pixel_values + image_grid_thw<br/>- mm_hashes<br/>- image_offsets: IMG_PAD 位置"]
-        SCHED["Scheduler<br/>ScheduleBatch -> ModelWorkerBatch<br/>- 检查 MultimodalCache<br/>- 分配 mm_embedding_loc"]
-        MR["ModelRunner ForwardBatch<br/>- VIT 编码: pixel_values -> image_embeddings<br/>- 缓存: mm_cache.set hash, embeddings<br/>- 融合 + LLM forward"]
-
-        HTTP --> TM --> REQ --> SCHED --> MR
-    end
-```
-
-## 9. 优化策略
-
-### 9.1 图像缓存
+### 8.1 图像缓存
 
 ```python
 # 启用多模态缓存
@@ -1068,14 +1148,14 @@ python -m sglang.launch_server \
     --mm-cache-size 2048  # MB
 ```
 
-### 9.2 VIT CUDA Graph
+### 8.2 VIT CUDA Graph
 
 ```bash
 # 对于 Triton/FA3 backend
 export SGLANG_VIT_ENABLE_CUDA_GRAPH=1
 ```
 
-### 9.3 VIT DP Encoder (Data Parallel 编码)
+### 8.3 VIT DP Encoder (Data Parallel 编码)
 
 启用 `--mm-enable-dp-encoder` 后，VIT 编码会在多个 GPU 上并行执行：
 
@@ -1086,7 +1166,7 @@ python -m sglang.launch_server \
     --mm-enable-dp-encoder  # 启用 VIT DP
 ```
 
-#### 9.3.1 为什么需要 VIT DP？
+#### 8.3.1 为什么需要 VIT DP？
 
 默认情况下，VIT 编码在每个 TP rank 上执行完全相同的计算（冗余），浪费计算资源：
 
@@ -1117,7 +1197,7 @@ flowchart TB
     style DPMode fill:#ccffcc
 ```
 
-#### 9.3.1a ViT DP 权重复制机制
+#### 8.3.1.1 ViT DP 权重复制机制
 
 启用 `--mm-enable-dp-encoder` 后，ViT 的所有层使用 `tp_size=1, tp_rank=0` 初始化，**每个 TP Rank 持有完整的 ViT 权重副本**（而非 TP 分片）：
 
@@ -1147,7 +1227,9 @@ class VisionMLP(nn.Module):
 
 权衡取舍是：**用权重复制的额外显存换取 ViT 计算的线性加速和消除逐层 all-reduce**。
 
-#### 9.3.2 负载均衡算法
+> **未开启 ViT DP 时的默认行为**：ViT 使用标准 TP 切分（`tp_size > 1` 时），每个 `ColumnParallelLinear` / `RowParallelLinear` 层按 TP 分片加载权重，`RowParallelLinear` 在每层输出后执行 `all-reduce` 聚合部分和。此时每个 Rank 编码全量图像，但每层都有通信开销。
+
+#### 8.3.2 负载均衡算法
 
 不同图像的 patch 数量可能差异很大，简单轮询分配会导致负载不均衡：
 
@@ -1206,7 +1288,7 @@ def get_dp_encoder_lb_assignment(
     return shuffle_indices, gpu_sample_counts, gpu_loads
 ```
 
-#### 9.3.3 完整执行流程
+#### 8.3.3 完整执行流程
 
 ```python
 # multimodal/mm_utils.py L465-651
@@ -1270,7 +1352,9 @@ def run_dp_sharded_mrope_vision_model(
     return torch.cat(original_order_embeddings, dim=0)
 ```
 
-## 附录: VIT DP 完整请求生命周期
+## 9. VIT DP 完整请求生命周期
+
+> 本节从原附录提升为独立章节，提供 ViT DP 模式下完整的端到端请求处理流程参考。注意：cache 的 get/set 操作发生在 `managers/mm_utils.py` 的 `_get_chunked_prefill_embedding()` 中（model forward 阶段），Scheduler 仅通过 `init_mm_embedding_cache()` 完成初始化。
 
 ### 整体流程概览
 
@@ -1485,8 +1569,8 @@ flowchart TB
 | 3. 调度 | `Scheduler` | `get_next_batch_to_run()` |
 | 3. 调度 | `MultiModalStaticCache` | `get()`, `set()` |
 | 4. 模型前向 | `Qwen3VLForConditionalGeneration` | `forward()` |
-| 4A. 跨进程传输 | `utils/common.py` | `broadcast_pyobj()` |
-| 4A. 跨进程传输 | `schedule_batch.py` | `prepare_for_extend()` |
+| 4.7 跨进程传输 | `utils/common.py` | `broadcast_pyobj()` |
+| 4.7 跨进程传输 | `schedule_batch.py` | `prepare_for_extend()` |
 | 5. VIT DP | `multimodal/mm_utils.py` | `get_dp_encoder_lb_assignment()` |
 | 5. VIT DP | `multimodal/mm_utils.py` | `run_dp_sharded_mrope_vision_model()` |
 | 5. VIT DP | `Qwen3VLMoeVisionModel` | `forward()` |

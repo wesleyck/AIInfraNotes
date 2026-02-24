@@ -212,7 +212,7 @@ GPU 两次 forward 之间有短暂间隙，这是 Phase 1+2（接收请求 + 调
 
 `event_loop_overlap()` 的核心是一个 **result_queue 延迟处理**机制：当前批次的结果放入队列，等到下一轮循环、GPU 已经在处理新批次时再由 CPU 处理。连续 prefill 或特殊模式下会禁用 overlap，立即处理结果。
 
-> **详细代码分析、流程图、`is_disable_overlap_for_batch` 条件、`result_queue` 机制**: 见 **03_scheduler.md §2**
+> **详细代码分析、流程图、`is_disable_overlap_for_batch` 条件、`result_queue` 机制**: 见 **03-scheduler.md §2**
 
 ### 3.3 get_next_batch_to_run() 调度逻辑
 
@@ -226,7 +226,7 @@ GPU 两次 forward 之间有短暂间隙，这是 Phase 1+2（接收请求 + 调
 
 **调度优先级**: Prefill > Decode（例外：`batch_is_full` 为 True 且无 `chunked_req` 时跳过 prefill）
 
-> **完整流程图、代码分析、"为什么没有 get_new_batch_decode"**: 见 **03_scheduler.md §4**
+> **完整流程图、代码分析、"为什么没有 get_new_batch_decode"**: 见 **03-scheduler.md §4**
 
 ## 4. 请求生命周期 (以 Qwen3-VL 多模态请求为例)
 
@@ -343,7 +343,7 @@ flowchart LR
     E --> F["ForwardBatch"]
 ```
 
-> **详细说明**: 各数据结构的字段定义、转换方法及生命周期管理见 **02_core_data_structures.md**。
+> **详细说明**: 各数据结构的字段定义、转换方法及生命周期管理见 **02-core-data-structures.md**。
 
 **输出数据**:
 

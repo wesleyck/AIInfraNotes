@@ -377,6 +377,8 @@ class AddReqResult(Enum):
 
 ## 7. Chunked Prefill 处理
 
+> **完整专题**：Chunked Prefill 的完整生命周期、多模态分块、PD 分离场景等详见 [`05-chunked-prefill.md`](05-chunked-prefill.md)。
+
 ### 7.1 add_chunked_req
 
 处理已经在进行 chunked prefill 的请求：
@@ -517,5 +519,6 @@ total_tokens = req.extend_input_len + min(
 
 ## 13. 下一步
 
-- **05**: KV Cache 内存池设计 (memory_pool.py)
-- **06**: RadixCache 前缀缓存实现 (radix_cache.py)
+- **05**: Chunked Prefill 分块预填充 (chunked_prefill.md)
+- **06**: KV Cache 内存池设计 (memory_pool.py)
+- **07**: RadixCache 前缀缓存实现 (radix_cache.py)

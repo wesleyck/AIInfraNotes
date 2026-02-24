@@ -45,6 +45,10 @@ flowchart TB
 
 ## 2. Tensor Parallelism (TP)
 
+> **Why**：单个 GPU 放不下完整的模型权重。TP 将每层内的权重矩阵沿特定维度切分到多个 GPU，使每个 GPU 只持有部分权重。
+>
+> **目标层**：Attention 的 QKV/O 投影 + FFN 的 Gate/Up/Down 线性层（即 `ColumnParallelLinear` / `RowParallelLinear`）。
+
 ### 2.1 工作原理
 
 TP 将模型权重沿特定维度切分到多个 GPU，每个 GPU 持有权重的一部分。
@@ -176,7 +180,21 @@ def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
 | PyMscclpp | ✗ | ✓ |
 | torch.distributed | ✓ | ✗ |
 
+### 3.4 通信原语与使用场景
+
+| 原语 | 使用场景 | 语义 |
+|------|---------|------|
+| **all-reduce** | TP 中 `RowParallelLinear` 输出聚合 | 每个 rank 持有部分和，all-reduce 后每个 rank 得到完整结果 |
+| **all-gather** | DP Attention 中收集各 rank 的 partial results | 各 rank 持有不同数据片段，拼接为完整序列 |
+| **all-to-all** | EP 中 token 按专家分发 + 结果收回 | 双向 shuffle：发送端按目标专家路由，接收端收集本地专家的输入 |
+| **P2P send/recv** | PP 中 stage 间传递 hidden_states | 单向流水线：上游 stage send，下游 stage recv |
+| **broadcast** | TP 中 Rank 0 分发请求/数据 | Rank 0 通过 Gloo CPU broadcast 将请求广播给所有 TP rank |
+
 ## 4. Pipeline Parallelism (PP)
+
+> **Why**：跨节点带宽有限（如 InfiniBand），层间只需传递 hidden_states（一个 `[batch, hidden_size]` tensor），通信量远小于 TP 的 all-reduce。PP 按 Transformer 层划分到不同节点，最小化跨节点通信。
+>
+> **目标层**：按 Transformer Block 整层划分（如 Layer 0-15 → Node 0，Layer 16-31 → Node 1）。
 
 ### 4.1 工作原理
 
@@ -229,6 +247,10 @@ def recv_tensor_dict(self, src=None):
 
 ## 5. Expert Parallelism (EP)
 
+> **Why**：MoE 模型的专家数量多（如 Qwen3-VL-235B 有 128 个专家），单卡放不下所有专家权重。EP 将 FFN 中的 MoE 专家层分配到不同 GPU，每个 GPU 只持有部分专家。
+>
+> **目标层**：仅 MoE FFN 层中的专家权重（`FusedMoE` / `EPMoE`），非 MoE 层（如 Attention）不受影响。
+
 ### 5.1 MoE 模型并行
 
 EP 将 MoE 层的不同专家分配到不同 GPU。
@@ -278,6 +300,10 @@ Qwen3-VL-235B-A22B 是 MoE 模型：
 - 推荐配置: EP=8 (每 GPU 16 专家)
 
 ## 6. Data Parallelism (DP)
+
+> **Why**：提升吞吐量。每个 DP worker 持有完整的模型副本（可能内部再做 TP 切分），独立处理不同的请求 batch。不切分模型权重，纯粹通过副本并行增加处理能力。
+>
+> **目标层**：不切分任何层——每个 DP worker 是完整模型（或完整 TP 组）。
 
 ### 6.1 工作原理
 
@@ -583,6 +609,44 @@ python -m sglang.launch_server \
     --enable-pdmux \
     --pdmux-config-path pdmux_config.json
 ```
+
+## 8.6 并行策略兼容性与组合关系
+
+### 8.6.1 核心组合规则
+
+**TP + EP 共存**：EP 消耗 TP 的 rank，两者共享同一组 GPU：
+
+```
+moe_tp_size = tp_size // ep_size
+```
+
+例如 `tp=8, ep=4` 时，MoE 层的 `moe_tp_size=2`（每 2 个 GPU 做 TP），非 MoE 层仍用 `tp_size=8`。
+
+**PP + TP 正交**：PP 按层切分 scope，TP 在每层内切分权重，互不冲突。可自由组合。
+
+**DP 独立于 TP/PP**：每个 DP worker 是一个完整的 TP（× PP）组，DP worker 之间无模型权重通信。
+
+### 8.6.2 兼容性矩阵
+
+| 组合 | 兼容性 | 说明 |
+|------|:------:|------|
+| TP + EP | ✓ | EP 消耗 TP rank，`moe_tp_size = tp_size // ep_size` |
+| TP + PP | ✓ | 正交：PP 切层，TP 切层内权重 |
+| TP + DP | ✓ | 每个 DP worker 是完整 TP 组 |
+| EP + PP | ✓ | PP 切层，EP 切 MoE 专家 |
+| DP + PP | ✓ | 每个 DP worker 是完整 PP pipeline |
+| DP Attention + TP | ✓ | DP Attention 在 TP 组内运行，无任务 worker 使用 `ForwardMode.IDLE` |
+| PD-Mux + PP | ✗ | PD-Multiplexing 不支持 Pipeline Parallelism |
+| PD-Mux + Chunked Prefill | ✗ | 互斥 |
+| PD-Mux + Overlap Schedule | ✗ | 互斥 |
+
+### 8.6.3 逐层并行 vs Scope 并行
+
+| 类型 | 策略 | 作用范围 |
+|------|------|---------|
+| 逐层并行 | TP、EP | 在每个 Transformer Block 内部生效，切分该层的权重/专家 |
+| Scope 并行 | PP | 按 Transformer Block 划分 scope，不同 stage 处理不同层 |
+| 副本并行 | DP | 不切分，完整模型副本独立处理不同 batch |
 
 ## 9. 配置建议
 

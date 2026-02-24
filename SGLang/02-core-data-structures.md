@@ -815,5 +815,6 @@ for req in running_batch.reqs:
 
 - **03**: Scheduler 事件循环、批次调度、retraction
 - **04**: 调度策略与 PrefillAdder
-- **05**: 内存池设计 (ReqToTokenPool, KVCache)
-- **06**: RadixCache 前缀缓存
+- **05**: Chunked Prefill 分块预填充
+- **06**: 内存池设计 (ReqToTokenPool, KVCache)
+- **07**: RadixCache 前缀缓存

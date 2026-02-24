@@ -405,7 +405,7 @@ Decode 阶段是 memory-bound，GPU 计算单元 (SM) 利用率低。PD-Multiple
 
 ### 9.2 实现机制
 
-- **动态 TP Group 切换**: `parallel_state.py` 中 `_PDMUX_PREFILL_TP_GROUP` 为 Prefill 创建独立的 `GroupCoordinator`，通过 `set_pdmux_status()` 在 Prefill/Decode 之间动态切换 (详见 `13_parallel_strategies.md` 第 8 节)
+- **动态 TP Group 切换**: `parallel_state.py` 中 `_PDMUX_PREFILL_TP_GROUP` 为 Prefill 创建独立的 `GroupCoordinator`，通过 `set_pdmux_status()` 在 Prefill/Decode 之间动态切换 (详见 `13-parallel-strategies.md` 第 8 节)
 - **CUDA Stream 隔离**: `multiplex/multiplexing_mixin.py` 中使用独立的 `prefill_stream` 和 `decode_stream`，交替切换执行
 - **ForwardMode.SPLIT_PREFILL**: 专用的 forward 模式，被视为 extend 的变体
 
