@@ -1,8 +1,8 @@
 # SGLang 调度策略详解
 
-> **默认场景**: Qwen/Qwen3-VL-235B-A22B-Thinking 多模态模型
+> **默认场景**: Qwen3.5 混合架构模型（Full Attention + Linear Attention/GatedDeltaNet + MoE + MTP）
 >
-> **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存
+> **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存 + EPLB + MTP + 线性注意力
 
 ## 1. 调度策略概览
 
@@ -517,7 +517,18 @@ total_tokens = req.extend_input_len + min(
 | 优先处理长输出 | LOF | 避免长请求饥饿 |
 | 禁用缓存 | FCFS | CacheAware 无意义 |
 
-## 13. 下一步
+## 13. PrefillDelayer 与调度策略的协作 (v0.5.9 新增)
+
+在 DP Attention 场景下，`PrefillDelayer`（`srt/managers/prefill_delayer.py`，256行）在 `get_new_batch_prefill()` 之前介入，通过全局协商机制决定是否允许本轮 prefill。
+
+### SWA 模型的调度策略差异
+
+Qwen3.5 包含 SWA (Sliding Window Attention) 层，调度策略需要考虑：
+- SWA 层的 KV Cache 只保留窗口内的 token，内存分配策略不同
+- `is_hybrid_swa` 标志影响 `alloc_for_extend()` 和 `alloc_for_decode()` 的分配逻辑
+- PrefillAdder 在计算可用内存时需要区分 full attention 层和 SWA 层的内存需求
+
+## 14. 下一步
 
 - **05**: Chunked Prefill 分块预填充 (chunked_prefill.md)
 - **06**: KV Cache 内存池设计 (memory_pool.py)

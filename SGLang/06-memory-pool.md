@@ -1,8 +1,8 @@
 # SGLang 内存池设计详解
 
-> **默认场景**: Qwen/Qwen3-VL-235B-A22B-Thinking 多模态模型
+> **默认场景**: Qwen3.5 混合架构模型（Full Attention + Linear Attention/GatedDeltaNet + MoE + MTP）
 >
-> **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存
+> **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存 + EPLB + MTP + 线性注意力
 
 ## 1. 内存池架构概览
 
@@ -1112,7 +1112,75 @@ stats.kv_cache_usage      # KV Cache 使用率
 stats.running_req_count   # 运行请求数
 ```
 
-## 11. 下一步
+## 11. SWA 内存池 (v0.5.9 新增)
+
+**文件**: `srt/mem_cache/swa_memory_pool.py` (461行)
+
+Qwen3.5 等混合架构模型同时包含 Full Attention 层和 SWA (Sliding Window Attention) 层，需要双池架构分别管理两种层的 KV Cache。
+
+### 核心类
+
+| 类 | 行号 | 说明 |
+|----|------|------|
+| `SWAKVPool(KVCache)` | L20 | SWA 层的 KV Cache 池，只保留窗口内的 token |
+| `SWATokenToKVPoolAllocator` | L223 | SWA 专用的 token-to-KV 分配器 |
+
+### 双池架构
+
+```
+Full Attention 层 → MHATokenToKVPool (保留全部 KV)
+SWA 层           → SWAKVPool (只保留窗口内 KV)
+```
+
+SWA 层的内存需求远小于 Full Attention 层，双池架构可以显著减少总内存占用。
+
+## 12. Sparsity 支持 (v0.5.9 新增)
+
+**文件**: `srt/mem_cache/sparsity/`
+
+稀疏性感知的内存管理，支持根据注意力稀疏模式动态调整 KV Cache 的保留策略。
+
+| 子目录/文件 | 说明 |
+|------------|------|
+| `algorithms/base_algorithm.py` | 稀疏算法基类 |
+| `algorithms/deepseek_nsa.py` | DeepSeek NSA 稀疏算法 |
+| `algorithms/quest_algorithm.py` | Quest 稀疏算法 |
+| `backend/backend_adaptor.py` | 后端适配器 |
+| `core/sparse_coordinator.py` | 稀疏协调器 |
+| `factory.py` | 工厂函数 |
+
+## 13. Mamba/Linear Attention 状态管理
+
+Qwen3.5 的 GatedDeltaNet 层需要 Mamba 状态缓存，由 `MambaPool`（`memory_pool.py:186`）管理。
+
+### KV Cache 变体总览 (v0.5.9)
+
+| 类 | 行号 | 适用模型 |
+|----|------|---------|
+| `MHATokenToKVPool` | L697 | 标准 MHA 模型 |
+| `MHATokenToKVPoolFP4` | L1040 | FP4 量化 MHA |
+| `HybridLinearKVPool` | L1183 | 混合线性注意力模型 (Qwen3.5) |
+| `MLATokenToKVPool` | L1377 | MLA 模型 (DeepSeek) |
+| `MLATokenToKVPoolFP4` | L1601 | FP4 量化 MLA |
+| `NSATokenToKVPool` | L1730 | NSA 模型 |
+| `DoubleSparseTokenToKVPool` | L1886 | 双稀疏模型 |
+| `SWAKVPool` | swa_memory_pool.py:20 | SWA 层专用 |
+
+## 14. Host 内存池 (v0.5.9 扩展)
+
+**文件**: `srt/mem_cache/memory_pool_host.py` (1190行)
+
+Host 内存池用于 KV Cache 的 CPU 卸载，支持 PD 分离场景下 Decode 端的 KV Cache 管理。
+
+| 类 | 行号 | 说明 |
+|----|------|------|
+| `HostTensorAllocator` | L62 | Host 内存分配器基类 |
+| `HostKVCache` | L136 | Host KV Cache 基类 |
+| `MHATokenToKVPoolHost` | L274 | MHA Host 内存池 |
+| `MLATokenToKVPoolHost` | L686 | MLA Host 内存池 |
+| `NSATokenToKVPoolHost` | L1028 | NSA Host 内存池 |
+
+## 15. 下一步
 
 - **07**: RadixCache 前缀缓存 (radix_cache.py)
 - **08**: ModelRunner 与 CUDA Graph

@@ -1,15 +1,10 @@
 # SGLang 推理引擎学习笔记
 
-本系列笔记聚焦于 SGLang (v0.5.7)的推理引擎核心（srt 和 sgl-kernel），目标是深入理解其设计与实现。
+本系列笔记聚焦于 SGLang (v0.5.9)的推理引擎核心（srt 和 sgl-kernel），目标是深入理解其设计与实现。
 
-> **默认场景**: 以 **Qwen/Qwen3-VL-235B-A22B-Thinking** 多模态模型为主线
+> **默认场景**: Qwen3.5 混合架构模型（Full Attention + Linear Attention/GatedDeltaNet + MoE + MTP）
 >
-> **启用特性**:
-> - PD 分离 (Prefill-Decode Disaggregation)
-> - Chunked Prefill
-> - ViT DP (Vision Transformer Data Parallel)
-> - Overlap Schedule (`event_loop_overlap`)
-> - 多模态缓存 (Multimodal Cache)
+> **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存 + EPLB + MTP + 线性注意力
 
 ## 端到端 Pipeline
 
@@ -59,15 +54,16 @@ flowchart TD
 - [ ] `07-radix-cache.md` - RadixAttention 前缀缓存、逐出策略、锁机制
 
 ### Phase 4: 模型执行
-- [ ] `08-model-runner.md` - ModelRunner、CUDA Graph、ForwardBatch
-- [ ] `09-attention-backends.md` - FlashInfer、FlashAttention、Triton 等后端
+- [ ] `08-model-runner.md` - ModelRunner、CUDA Graph、ForwardBatch、Batch Overlap 集成
+- [ ] `09-attention-backends.md` - FlashInfer、FlashAttention、Triton、线性注意力、TBO 等 17 种后端
 - [ ] `10-model-loading.md` - 模型加载、权重处理、量化支持
 - [ ] `11-multimodal.md` - 多模态完整生命周期、VIT 处理、图像缓存
+- [ ] `24-batch-overlap.md` - Batch Overlap（SBO/TBO）计算-通信重叠
 
 ### Phase 5: 高级特性
 - [ ] `12-speculative-decoding.md` - EAGLE、NGram 投机解码
-- [ ] `13-parallel-strategies.md` - TP/PP/EP/DP 并行策略
-- [ ] `14-pd-disaggregation.md` - Prefill-Decode 分离
+- [ ] `13-parallel-strategies.md` - TP/PP/EP/DP 并行策略、EPLB、Elastic EP
+- [ ] `14-pd-disaggregation.md` - Prefill-Decode 分离、KV 事件管理
 
 ### Phase 6: Kernel 实现
 - [ ] `15-sgl-kernel-overview.md` - sgl-kernel 架构
@@ -89,13 +85,13 @@ flowchart TD
 | 模块 | 关键文件 | 行号 | 说明 |
 |------|----------|------|------|
 | 入口 | `srt/entrypoints/engine.py` | ~900 | Engine 类，进程启动 |
-| 调度 | `srt/managers/scheduler.py` | 1099 | event_loop_overlap |
-| 调度 | `srt/managers/scheduler.py` | 1778 | get_next_batch_to_run |
-| 批次 | `srt/managers/schedule_batch.py` | 484 | Req 类 |
-| 批次 | `srt/managers/schedule_batch.py` | 1156 | ScheduleBatch 类 |
-| 批次 | `srt/managers/schedule_batch.py` | 2189 | ModelWorkerBatch 类 |
-| 前向 | `srt/model_executor/forward_batch_info.py` | 227 | ForwardBatch 类 |
-| 模式 | `srt/model_executor/forward_batch_info.py` | 70 | ForwardMode 枚举 |
+| 调度 | `srt/managers/scheduler.py` | 1135 | event_loop_overlap |
+| 调度 | `srt/managers/scheduler.py` | 1875 | get_next_batch_to_run |
+| 批次 | `srt/managers/schedule_batch.py` | 512 | Req 类 |
+| 批次 | `srt/managers/schedule_batch.py` | 1202 | ScheduleBatch 类 |
+| 批次 | `srt/managers/schedule_batch.py` | 2337 | ModelWorkerBatch 类 |
+| 前向 | `srt/model_executor/forward_batch_info.py` | 231 | ForwardBatch 类 |
+| 模式 | `srt/model_executor/forward_batch_info.py` | 74 | ForwardMode 枚举 |
 | 策略 | `srt/managers/schedule_policy.py` | - | 调度策略 |
 | 内存 | `srt/mem_cache/memory_pool.py` | - | KV Cache 内存池 |
 | 缓存 | `srt/mem_cache/radix_cache.py` | - | Radix 前缀缓存 |
@@ -119,6 +115,14 @@ flowchart TD
 | LoRA | `srt/lora/lora_registry.py` | - | LoRA 注册表 (请求路由) |
 | LoRA | `srt/lora/mem_pool.py` | - | LoRA GPU 内存池 |
 | LoRA | `srt/lora/layers.py` | - | LoRA 模块替换层 |
+| 重叠 | `srt/batch_overlap/two_batch_overlap.py` | - | TBO 双批重叠 |
+| 重叠 | `srt/batch_overlap/single_batch_overlap.py` | - | SBO 单批重叠 |
+| EPLB | `srt/eplb/eplb_manager.py` | - | 专家负载均衡管理 |
+| 弹性EP | `srt/elastic_ep/elastic_ep.py` | - | 弹性专家并行 |
+| DLLM | `srt/dllm/` | - | 分布式 LLM |
+| SWA内存 | `srt/mem_cache/swa_memory_pool.py` | - | SWA 双池内存 |
+| SWA缓存 | `srt/mem_cache/swa_radix_cache.py` | - | SWA Radix 缓存 |
+| KV事件 | `srt/disaggregation/kv_events.py` | - | PD 分离事件系统 |
 
 ## 学习建议
 

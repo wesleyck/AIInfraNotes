@@ -1,5 +1,9 @@
 # SGLang Embedding 与 Rerank 模型详解
 
+> **默认场景**: Qwen3.5 混合架构模型（Full Attention + Linear Attention/GatedDeltaNet + MoE + MTP）
+>
+> **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存 + EPLB + MTP + 线性注意力
+
 ## 1. 概览
 
 SGLang 除了支持生成式 LLM 推理外，还原生支持 **Embedding** 和 **Rerank** 模型。这两类任务的核心区别在于：

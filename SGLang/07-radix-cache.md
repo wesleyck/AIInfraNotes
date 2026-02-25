@@ -1,8 +1,8 @@
 # SGLang RadixCache 前缀缓存详解
 
-> **默认场景**: Qwen/Qwen3-VL-235B-A22B-Thinking 多模态模型
+> **默认场景**: Qwen3.5 混合架构模型（Full Attention + Linear Attention/GatedDeltaNet + MoE + MTP）
 >
-> **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存
+> **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存 + EPLB + MTP + 线性注意力
 
 ## 1. RadixCache 概览
 
@@ -1036,7 +1036,63 @@ def evict(self, num_tokens: int):
 
 ---
 
-## 14. 下一步
+## 14. SWA RadixCache (v0.5.9 新增)
+
+**文件**: `srt/mem_cache/swa_radix_cache.py` (1188行)
+
+管理 Full Attention 和 SWA 两种 attention 层的缓存。Qwen3.5 等混合架构模型需要同时维护两套缓存树。
+
+### 核心类
+
+| 类 | 行号 | 说明 |
+|----|------|------|
+| `TreeNode` | L58 | 缓存树节点 |
+| `LRUList` | L118 | LRU 逐出列表 |
+| `SWARadixCache(BasePrefixCache)` | L339 | SWA Radix 缓存主类 |
+
+## 15. BasePrefixCache 接口重构 (v0.5.9)
+
+**文件**: `srt/mem_cache/base_prefix_cache.py`
+
+v0.5.9 引入了结构化参数类，统一了各 RadixCache 子类的接口：
+
+| 参数类 | 说明 |
+|--------|------|
+| `MatchPrefixParams` (L35) | 前缀匹配参数：key、cow_mamba、req |
+| `InsertParams` (L46) | 插入参数：key、value、mamba_value、prev_prefix_len、swa_evicted_seqlen、chunked、priority |
+| `InsertResult` (L65) | 插入结果：prefix_len、mamba_exist |
+| `EvictParams` (L73) | 逐出参数：num_tokens、swa_num_tokens、mamba_num |
+| `EvictResult` (L82) | 逐出结果：num_tokens_evicted、swa_num_tokens_evicted、mamba_num_evicted |
+| `MatchResult` (L91) | 匹配结果：device/host 索引、命中长度、mamba 分支信息 |
+
+## 16. 存储后端更新 (v0.5.9)
+
+**文件**: `srt/mem_cache/storage/`
+
+v0.5.9 新增了多个外部存储后端：
+
+| 后端 | 目录 | 说明 |
+|------|------|------|
+| NIXL | `nixl/` | NVIDIA NIXL 高性能传输 |
+| aibrix_kvcache | `aibrix_kvcache/` | AIBrix KV Cache 存储 |
+| EIC | `eic/` | EIC 存储后端 |
+| HF3FS | `hf3fs/` | HuggingFace 3FS 文件系统 |
+| LMCache | `lmcache/` | LMCache 集成 |
+| Mooncake | `mooncake_store/` | Mooncake 分布式存储 |
+
+## 17. Mamba RadixCache (v0.5.9 更新)
+
+**文件**: `srt/mem_cache/mamba_radix_cache.py` (1232行)
+
+为 Qwen3.5 等包含线性注意力层的模型提供 Mamba 状态的 Radix 缓存支持。
+
+| 类 | 行号 | 说明 |
+|----|------|------|
+| `TreeNode` | L63 | 缓存树节点 |
+| `LRUList` | L117 | LRU 逐出列表 |
+| `MambaRadixCache(BasePrefixCache)` | L371 | Mamba Radix 缓存主类 |
+
+## 18. 下一步
 
 - **08**: ModelRunner 与 CUDA Graph
 - **09**: Attention 后端 (FlashInfer, FlashAttention)

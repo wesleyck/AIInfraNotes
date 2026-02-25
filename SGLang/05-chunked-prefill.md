@@ -923,3 +923,17 @@ python -m sglang.launch_server \
 | PD 分离处理 | `disaggregation/prefill.py` | `process_batch_result_disagg_prefill()` |
 | PD KV 传输 | `disaggregation/prefill.py` | `send_kv_chunk()` |
 
+## 14. PrefillDelayer 与 Chunked Prefill (v0.5.9 新增)
+
+在 DP Attention 场景下，`PrefillDelayer`（`srt/managers/prefill_delayer.py`）与 Chunked Prefill 交互：
+
+- PrefillDelayer 在 `get_new_batch_prefill()` 之前决定是否允许 prefill
+- 如果 PrefillDelayer 延迟了 prefill，正在进行的 chunked prefill 请求（`chunked_req`）仍会继续处理
+- 水位线机制确保 chunked prefill 不会因为 PrefillDelayer 的延迟而饥饿
+
+### SWA 模型的分块策略
+
+Qwen3.5 的混合架构（Full Attention + SWA 层）对分块策略有特殊影响：
+- SWA 层只需要窗口内的 KV Cache，分块时可以更激进地释放窗口外的缓存
+- `is_hybrid_swa` 标志影响 chunk 大小的计算和内存预算
+

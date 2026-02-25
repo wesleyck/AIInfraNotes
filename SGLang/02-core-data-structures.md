@@ -1,8 +1,8 @@
 # SGLang 核心数据结构详解
 
-> **默认场景**: Qwen/Qwen3-VL-235B-A22B-Thinking 多模态模型
+> **默认场景**: Qwen3.5 混合架构模型（Full Attention + Linear Attention/GatedDeltaNet + MoE + MTP）
 >
-> **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存
+> **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存 + EPLB + MTP + 线性注意力
 
 本文详细分析 SGLang 调度系统的**四个**核心数据结构，以及它们之间的转换关系。
 
@@ -45,13 +45,13 @@ flowchart TB
 ```mermaid
 flowchart TD
     subgraph Pipeline["数据流转换流程"]
-        REQ["<b>Req</b> (请求级别) 调度核心<br/>schedule_batch.py:484<br/>• 单个请求的完整生命周期状态<br/>• 包含输入、输出、KV Cache、多模态等"]
+        REQ["<b>Req</b> (请求级别) 调度核心<br/>schedule_batch.py:512<br/>• 单个请求的完整生命周期状态<br/>• 包含输入、输出、KV Cache、多模态等"]
         
-        SB["<b>ScheduleBatch</b> (调度级别)<br/>schedule_batch.py:1156<br/>• 由 Scheduler 管理<br/>• 包含多个 Req 的批次信息<br/>• 主要在 CPU 上"]
+        SB["<b>ScheduleBatch</b> (调度级别)<br/>schedule_batch.py:1202<br/>• 由 Scheduler 管理<br/>• 包含多个 Req 的批次信息<br/>• 主要在 CPU 上"]
         
-        MWB["<b>ModelWorkerBatch</b> (执行级别)<br/>schedule_batch.py:2189<br/>• 解耦调度数据与执行数据<br/>• 仅保留前向计算所需字段<br/>• 不持有内存池/调度策略引用"]
+        MWB["<b>ModelWorkerBatch</b> (执行级别)<br/>schedule_batch.py:2337<br/>• 解耦调度数据与执行数据<br/>• 仅保留前向计算所需字段<br/>• 不持有内存池/调度策略引用"]
         
-        FB["<b>ForwardBatch</b> (GPU 级别) ★ 前向核心<br/>forward_batch_info.py:227<br/>• 由 ModelRunner 管理<br/>• 全部是 GPU Tensor<br/>• 包含 attention backend、位置编码等"]
+        FB["<b>ForwardBatch</b> (GPU 级别) ★ 前向核心<br/>forward_batch_info.py:231<br/>• 由 ModelRunner 管理<br/>• 全部是 GPU Tensor<br/>• 包含 attention backend、位置编码等"]
 
         REQ --> SB
         SB -->|batch.get_model_worker_batch| MWB
@@ -65,7 +65,7 @@ flowchart TD
 
 ## 2. Req 类详解
 
-**定义**: `schedule_batch.py:484`
+**定义**: `schedule_batch.py:512`
 
 `Req` 类表示单个请求的完整生命周期状态。
 
@@ -119,7 +119,7 @@ class Req:
         self.cached_tokens = 0              # 命中缓存的 token 数量
 ```
 
-#### 多模态信息 (Qwen3-VL)
+#### 多模态信息 (Qwen3.5)
 
 ```python
         # ========== 多模态输入 ==========
@@ -184,7 +184,7 @@ class Req:
 
 ## 3. ScheduleBatch 类详解
 
-**定义**: `schedule_batch.py:1156`
+**定义**: `schedule_batch.py:1202`
 
 `ScheduleBatch` 是调度层的批次抽象，由 `Scheduler` 管理。
 
@@ -234,7 +234,7 @@ class ScheduleBatch:
 
 ### 3.2 ForwardMode 枚举
 
-**定义**: `srt/model_executor/forward_batch_info.py:70`
+**定义**: `srt/model_executor/forward_batch_info.py:74`
 
 ```python
 class ForwardMode(IntEnum):
@@ -377,7 +377,7 @@ def get_model_worker_batch(self) -> ModelWorkerBatch:
 
 ## 4. ModelWorkerBatch 类详解
 
-**定义**: `schedule_batch.py:2189`
+**定义**: `schedule_batch.py:2337`
 
 `ModelWorkerBatch` 是传递给 `TPWorker.forward_batch_generation()` 的数据结构。
 
@@ -430,7 +430,7 @@ class ModelWorkerBatch:
 | 数据位置 | 混合 (CPU + GPU) | 主要 GPU |
 | 用途 | 调度决策 | 调度层→执行层解耦/传输 |
 
-## 5. MultimodalInputs 类 (Qwen3-VL)
+## 5. MultimodalInputs 类 (Qwen3.5)
 
 **定义**: `schedule_batch.py:~300`
 
@@ -473,9 +473,9 @@ class MultimodalInputs:
     mrope_position_delta: Optional[torch.Tensor] = None
 ```
 
-### M-ROPE 位置编码 (Qwen3-VL)
+### M-ROPE 位置编码 (Qwen3.5)
 
-Qwen3-VL 使用 **Multimodal Rotary Position Embedding**：
+Qwen3.5 继承 Qwen3-VL 的 **Multimodal Rotary Position Embedding**：
 
 ```python
 # mrope_positions shape: [3, seq_len]
@@ -489,7 +489,7 @@ Qwen3-VL 使用 **Multimodal Rotary Position Embedding**：
 
 ## 6. ForwardBatch 类详解
 
-**定义**: `forward_batch_info.py:227`
+**定义**: `forward_batch_info.py:231`
 
 `ForwardBatch` 是模型前向传播的核心数据结构，由 `ModelRunner` 管理，包含所有 GPU Tensor。
 
@@ -522,7 +522,7 @@ class ForwardBatch:
     extend_prefix_lens: torch.Tensor    # 每个请求的前缀长度
     extend_start_loc: torch.Tensor      # 每个请求在 input_ids 中的起始位置
 
-    # ========== 多模态 (Qwen3-VL) ==========
+    # ========== 多模态 (Qwen3.5) ==========
     mm_inputs: List[MultimodalInputs]   # 多模态输入列表
     mrope_positions: torch.Tensor       # [3, seq_len], M-ROPE 位置编码
 
@@ -596,7 +596,7 @@ def init_new(cls, batch: ModelWorkerBatch, model_runner: ModelRunner):
 
 > **ModelWorkerBatch 的设计意图**：它不是"跨进程传输"的 IPC 结构，而是一个**解耦层（decoupling layer）**。
 > `ScheduleBatch` 持有完整的 `Req` 对象（包含生命周期管理、KV 缓存引用、调度策略字段），这些字段对模型前向计算毫无意义。
-> `get_model_worker_batch()` 方法（`schedule_batch.py:2070`）从 `ScheduleBatch` 中**仅提取前向计算所需的数据**（input_ids、seq_lens、out_cache_loc、sampling_info 等），
+> `get_model_worker_batch()` 方法（`schedule_batch.py:~2170`）从 `ScheduleBatch` 中**仅提取前向计算所需的数据**（input_ids、seq_lens、out_cache_loc、sampling_info 等），
 > 生成一个不依赖 Req 对象的纯数据容器，再由 `TpModelWorker` 传给 `ForwardBatch.init_new()` 做最终 GPU Tensor 化。
 >
 > 这种设计使得 Scheduler 可以在 overlap 模式下**立刻回收 ScheduleBatch**去做下一轮调度，
@@ -604,7 +604,7 @@ def init_new(cls, batch: ModelWorkerBatch, model_runner: ModelRunner):
 
 ## 7. 数据流转示例
 
-### 7.1 Prefill 阶段 (Qwen3-VL 图像请求)
+### 7.1 Prefill 阶段 (Qwen3.5 图像请求)
 
 ```mermaid
 sequenceDiagram
@@ -808,10 +808,40 @@ for req in running_batch.reqs:
 | `req_to_token_pool` | ReqToTokenPool | 请求→token 映射 |
 | `token_to_kv_pool` | KVCache | token→KV 映射 |
 | `mm_inputs` | List | 多模态输入 |
-| `mrope_positions` | Tensor | M-ROPE 位置 (Qwen3-VL) |
+| `mrope_positions` | Tensor | M-ROPE 位置 (Qwen3.5) |
 | `extend_start_loc` | Tensor | Extend 起始位置 |
 
-## 9. 下一步
+## 9. v0.5.9 新增数据结构
+
+### 9.1 ForwardBatchDeepSeekMHAMixin
+
+**文件**: `srt/model_executor/forward_batch_deepseek_mha_mixin.py` (9681行)
+
+为 DeepSeek MHA (Multi-Head Attention) 模型提供的 ForwardBatch 扩展 mixin，包含 MLA chunked prefix cache 在 chunked prefill 中使用的专用字段。由于 DeepSeek 的 MLA 架构特殊性，需要额外的 KV cache 索引和元数据管理。
+
+### 9.2 GraphInputBuffers
+
+**文件**: `srt/model_executor/input_buffers.py` (8047行)
+
+从 ModelRunner 中重构出来的独立模块，管理 CUDA Graph 的输入缓冲区。将图输入缓冲区的分配、填充、复用逻辑集中管理，减少 ModelRunner 的复杂度。
+
+```python
+@dataclass
+class GraphInputBuffers:
+    # CUDA Graph 捕获时使用的固定大小输入缓冲区
+    # 每次 forward 前将实际数据拷贝到这些缓冲区
+```
+
+### 9.3 ForwardMode 新增值 (v0.5.9)
+
+相比 v0.5.7，ForwardMode 枚举新增了以下值：
+
+| 值 | 说明 |
+|---|------|
+| `DLLM_EXTEND` | Diffusion LLM 的 extend 模式 |
+| `SPLIT_PREFILL` | PD 复用场景的分割 prefill |
+
+## 10. 下一步
 
 - **03**: Scheduler 事件循环、批次调度、retraction
 - **04**: 调度策略与 PrefillAdder

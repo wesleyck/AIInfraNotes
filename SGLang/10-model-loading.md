@@ -634,7 +634,7 @@ checkpoint 文件:
 
 ### 8.2 `hf_to_sglang_mapper` 名称映射
 
-Qwen VL 系列（Qwen2-VL、Qwen2.5-VL、Qwen3-VL）需要做 HF → SGLang 命名转换，因为 HF 和 SGLang 的模块层次不同：
+Qwen VL 系列（Qwen2-VL、Qwen2.5-VL、Qwen3.5）需要做 HF → SGLang 命名转换，因为 HF 和 SGLang 的模块层次不同：
 
 ```python
 # qwen2_vl.py:430
@@ -760,3 +760,36 @@ def load_model(self, *, model_config, device_config):
 | **非热路径直接复用 HF** | Config、Tokenizer、Processor、简单投影层、激活函数 |
 | **视觉编码器是中间地带** | 单卡/小模型用 HF 黑盒；需 TP 时用 SGLang 重写版 |
 | **TransformersForCausalLM 桥解决长尾** | 140+ 原生实现覆盖主流模型，桥让新模型开箱即用 |
+
+---
+
+## 11. 新增模型支持 (v0.5.9)
+
+### Qwen3.5 模型文件
+
+| 文件 | 行数 | 说明 |
+|------|------|------|
+| `models/qwen3_5.py` | 1345 | Qwen3.5 主模型（Qwen3_5ForCausalLM L651, Qwen3_5MoeForCausalLM L828） |
+| `models/qwen3_5_mtp.py` | 347 | Qwen3.5 MTP 支持 |
+| `models/qwen3_next.py` | 1179 | Qwen3Next 模型 |
+| `models/qwen3_next_mtp.py` | 112 | Qwen3Next MTP 支持 |
+
+### DeepSeek 通用模块
+
+**目录**: `srt/models/deepseek_common/`
+
+| 文件 | 说明 |
+|------|------|
+| `attention_backend_handler.py` | Attention 后端处理器 |
+| `attention_forward_methods/` | Attention 前向方法集合 |
+| `deepseek_weight_loader.py` | DeepSeek 权重加载器 |
+| `utils.py` | 工具函数 |
+
+### Checkpoint Engine
+
+**目录**: `srt/checkpoint_engine/`
+
+| 文件 | 说明 |
+|------|------|
+| `checkpoint_engine_worker.py` | Checkpoint 引擎 Worker |
+| `update.py` | Checkpoint 更新逻辑 |

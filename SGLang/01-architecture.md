@@ -1,8 +1,8 @@
 # SGLang 系统架构详解
 
-> **默认场景**: Qwen/Qwen3-VL-235B-A22B-Thinking 多模态模型
+> **默认场景**: Qwen3.5 混合架构模型（Full Attention + Linear Attention/GatedDeltaNet + MoE + MTP）
 >
-> **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存
+> **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存 + EPLB + MTP + 线性注意力
 
 ## 1. 进程模型
 
@@ -74,7 +74,7 @@ TP>1 时每个 rank 一个 Scheduler 进程，但**只有 rank 0** 持有 ZMQ �
 | 进程 | 组件 | 职责 |
 |------|------|------|
 | Main | HTTP Server | 接收 HTTP/gRPC 请求 |
-| Main | TokenizerManager | 文本分词(text->token_id)、多模态预处理 (Qwen3-VL 图像/视频处理) |
+| Main | TokenizerManager | 文本分词(text->token_id)、多模态预处理 (Qwen3.5 图像/视频处理) |
 | Subprocess | Scheduler (×TP) | 批次调度、GPU 执行；仅 rank 0 负责 ZMQ 通信 |
 | Subprocess | Detokenizer | token 解码为文本(token_id -> text) |
 
@@ -114,10 +114,10 @@ class TokenizerManager:
         self.mm_processor = get_mm_processor(...)  # 多模态处理器 (如 QwenVLImageProcessor)
 ```
 
-**Qwen3-VL 多模态处理器**: `srt/multimodal/processors/qwen_vl.py:QwenVLImageProcessor` (L223)
+**Qwen3.5 多模态处理器**: `srt/multimodal/processors/qwen_vl.py:QwenVLImageProcessor` (L223)
 
 ```python
-# Qwen3-VL 处理器支持的模型
+# Qwen3.5 处理器支持的模型
 class QwenVLImageProcessor(SGLangBaseProcessor):
     models = [
         Qwen2VLForConditionalGeneration,
@@ -125,6 +125,8 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         Qwen3VLForConditionalGeneration,  # Qwen3-VL
         Qwen3VLMoeForConditionalGeneration,
         Qwen3OmniMoeForConditionalGeneration,
+        Qwen3_5ForCausalLM,               # Qwen3.5
+        Qwen3_5MoeForCausalLM,            # Qwen3.5 MoE
     ]
 ```
 
@@ -139,8 +141,20 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 4. 调用 TPWorker 执行模型前向
 
 ```python
-# 核心类
-class Scheduler:
+# 核心类 (v0.5.9 继承链)
+class Scheduler(
+    SchedulerOutputProcessorMixin,
+    SchedulerUpdateWeightsMixin,
+    SchedulerProfilerMixin,
+    SchedulerMetricsMixin,
+    SchedulerDisaggregationDecodeMixin,
+    SchedulerDisaggregationPrefillMixin,
+    SchedulerMultiplexMixin,
+    SchedulerRuntimeCheckerMixin,       # v0.5.9 新增: 运行时检查
+    SchedulerPPMixin,
+    SchedulerDPAttnMixin,
+    SchedulerDllmMixin,                 # v0.5.9 新增: dLLM 支持
+):
     def __init__(self, ...):
         self.waiting_queue = []      # 等待队列 init_running_status
         self.running_batch = None    # 正在运行的批次 init_running_status
@@ -170,7 +184,7 @@ class Scheduler:
 
 SGLang 默认使用 **overlap 模式** 的事件循环，通过 CPU/GPU 重叠执行来提高吞吐量。
 
-**文件**: `srt/managers/scheduler.py:event_loop_overlap()` (L1099)
+**文件**: `srt/managers/scheduler.py:event_loop_overlap()` (L1135)
 
 ### 3.1 Overlap 机制原理
 
@@ -216,7 +230,7 @@ GPU 两次 forward 之间有短暂间隙，这是 Phase 1+2（接收请求 + 调
 
 ### 3.3 get_next_batch_to_run() 调度逻辑
 
-**文件**: `srt/managers/scheduler.py:get_next_batch_to_run()` (L1778)
+**文件**: `srt/managers/scheduler.py:get_next_batch_to_run()` (L1875)
 
 调度的统一入口，按以下顺序决定下一个批次：
 1. 处理上轮 chunked prefill 残留请求（缓存 + 释放 `req_pool_idx`）
@@ -228,7 +242,7 @@ GPU 两次 forward 之间有短暂间隙，这是 Phase 1+2（接收请求 + 调
 
 > **完整流程图、代码分析、"为什么没有 get_new_batch_decode"**: 见 **03-scheduler.md §4**
 
-## 4. 请求生命周期 (以 Qwen3-VL 多模态请求为例)
+## 4. 请求生命周期 (以 Qwen3.5 多模态请求为例)
 
 一个包含图像的生成请求的完整流程：
 
@@ -394,24 +408,67 @@ SGLang 有两种启动方式，入口不同:
 | 函数 | 文件 | 行号 | 作用 |
 |------|------|------|------|
 | `_launch_subprocesses()` | engine.py | ~900 | 启动所有进程 |
-| `event_loop_overlap()` | scheduler.py | 1099 | 主调度循环 (默认) |
-| `get_next_batch_to_run()` | scheduler.py | 1778 | 获取下一批次 (统一入口) |
-| `get_new_batch_prefill()` | scheduler.py | 1861 | 创建 Prefill 批次 |
-| `update_running_batch()` | scheduler.py | 2073 | 更新 Decode 批次 |
-| `run_batch()` | scheduler.py | 2162 | 执行批次前向 |
+| `event_loop_overlap()` | scheduler.py | 1135 | 主调度循环 (默认) |
+| `get_next_batch_to_run()` | scheduler.py | 1875 | 获取下一批次 (统一入口) |
+| `get_new_batch_prefill()` | scheduler.py | ~1960 | 创建 Prefill 批次 |
+| `update_running_batch()` | scheduler.py | ~2170 | 更新 Decode 批次 |
+| `run_batch()` | scheduler.py | ~2260 | 执行批次前向 |
 | `forward_batch_generation()` | tp_worker.py | - | 模型前向 |
 
 ### 6.3 核心数据结构
 
 | 数据结构 | 文件 | 行号 | 说明 |
 |----------|------|------|------|
-| `Req` | schedule_batch.py | 484 | 请求级别状态 |
-| `ScheduleBatch` | schedule_batch.py | 1156 | 调度层批次 |
-| `ModelWorkerBatch` | schedule_batch.py | 2189 | Worker 层批次 |
-| `ForwardBatch` | forward_batch_info.py | 227 | GPU 层批次 |
-| `ForwardMode` | forward_batch_info.py | 70 | 前向模式枚举 |
+| `Req` | schedule_batch.py | 512 | 请求级别状态 |
+| `ScheduleBatch` | schedule_batch.py | 1202 | 调度层批次 |
+| `ModelWorkerBatch` | schedule_batch.py | 2337 | Worker 层批次 |
+| `ForwardBatch` | forward_batch_info.py | 231 | GPU 层批次 |
+| `ForwardMode` | forward_batch_info.py | 74 | 前向模式枚举 |
 
 ## 7. 下一步
 
 理解了全局架构后，下一步深入学习：
 - **02**: 核心数据结构详解 (`Req`, `ScheduleBatch`, `ModelWorkerBatch`, `ForwardBatch`)
+
+## 8. Batch Overlap 调度模式 (v0.5.9 新增)
+
+v0.5.9 引入了 `batch_overlap/` 模块，提供比 `event_loop_overlap` 更细粒度的计算-通信重叠优化，特别适用于 MoE 模型（如 Qwen3.5）。
+
+**文件**: `srt/batch_overlap/`
+
+| 模式 | 文件 | 行数 | 说明 |
+|------|------|------|------|
+| SBO (Single Batch Overlap) | `single_batch_overlap.py` | 145 | 单批重叠：在一个 batch 的 forward 内部重叠计算与通信 |
+| TBO (Two Batch Overlap) | `two_batch_overlap.py` | 1074 | 双批重叠：两个 batch 的 forward 交替执行，一个做计算时另一个做通信 |
+| Operations | `operations.py` | 214 | 重叠操作定义 |
+| Strategy | `operations_strategy.py` | 296 | 操作策略选择 |
+
+**与 event_loop_overlap 的关系**:
+- `event_loop_overlap` 是 Scheduler 级别的 CPU/GPU 重叠（调度 vs 前向）
+- `batch_overlap` 是 ModelRunner 级别的计算/通信重叠（MoE all-to-all vs attention 计算）
+- 两者可以同时启用，互不冲突
+
+> **详细分析**: 见 **24-batch-overlap.md**
+
+## 9. PrefillDelayer (v0.5.9 新增)
+
+**文件**: `srt/managers/prefill_delayer.py` (256行)
+
+在 DP Attention 场景下，多个 DP worker 需要协商 prefill 时机。PrefillDelayer 通过状态机和全局协商机制，延迟 prefill 直到所有 worker 准备就绪，避免负载不均。
+
+包含水位线强制允许机制：当等待队列过长时，即使未完成协商也强制允许 prefill。
+
+> **详细分析**: 见 **03-scheduler.md**
+
+## 10. 新增入口 (v0.5.9)
+
+### Anthropic API 入口
+
+**文件**: `srt/entrypoints/anthropic/`
+
+| 文件 | 说明 |
+|------|------|
+| `protocol.py` | Anthropic API 协议定义 |
+| `serving.py` | Anthropic API 服务实现 |
+
+提供与 Anthropic Messages API 兼容的端点，扩展了 SGLang 的 API 兼容性。

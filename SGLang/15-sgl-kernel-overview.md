@@ -1,8 +1,8 @@
 # SGLang sgl-kernel 架构详解
 
-> **默认场景**: Qwen/Qwen3-VL-235B-A22B-Thinking 多模态模型
+> **默认场景**: Qwen3.5 混合架构模型（Full Attention + Linear Attention/GatedDeltaNet + MoE + MTP）
 >
-> **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存
+> **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存 + EPLB + MTP + 线性注意力
 
 ## 1. 概览
 
@@ -46,6 +46,10 @@ sgl-kernel/
 │   │   ├── pos_enc.cu / rope.cu       #   位置编码 / RoPE
 │   │   └── topk.cu                    #   Fast TopK kernel
 │   ├── expert_specialization/         # 专家特化 GEMM
+│   │   ├── es_fp8_blockwise.cu        #   FP8 blockwise grouped MM
+│   │   ├── es_sm100_mxfp8_blockscaled.cu  # SM100 MXFP8 grouped MM
+│   │   └── es_sm100_mxfp8_blockscaled_group_quant.cu  # SM100 分组量化
+│   ├── expert_specialization/         # 专家特化 GEMM (FP8/MXFP8, SM90/SM100)
 │   │   ├── es_fp8_blockwise.cu        #   FP8 blockwise grouped MM
 │   │   ├── es_sm100_mxfp8_blockscaled.cu  # SM100 MXFP8 grouped MM
 │   │   └── es_sm100_mxfp8_blockscaled_group_quant.cu  # SM100 分组量化
@@ -173,6 +177,8 @@ merge_state(v_a, s_a, v_b, s_b, v_merged, s_merged)
 | FP4 | `cutlass_scaled_fp4_mm` | SM100+ (Blackwell) |
 | GPTQ | `gptq_marlin_gemm` | GPTQ 模型 |
 | AWQ | `awq_dequantize` | AWQ 模型 |
+
+> **v0.5.9 变更**: AOT Marlin kernels 已移除 (`gptq_marlin_repack`、`awq_marlin_repack` 等预编译 repack 算子)。Marlin GEMM 本身仍保留，但 repack 操作改为运行时处理。
 
 ```python
 # FP8 矩阵乘法
@@ -598,7 +604,46 @@ with torch.cuda.graph(graph):
     # ...
 ```
 
-## 9. 下一步
+## 9. 多平台支持 (v0.5.9 新增)
+
+sgl-kernel 从 v0.5.9 开始扩展了多平台后端支持，不再局限于 NVIDIA CUDA。
+
+### 9.1 MUSA (摩尔线程)
+
+- **扩展注册**: `csrc/common_extension_musa.cc` — 替代 `common_extension.cc` 的 MUSA 版本
+- **构建配置**: `pyproject_musa.toml` + `setup_musa.py` — 独立的 MUSA 构建流程
+- **适配方式**: 通过条件编译和独立的扩展注册文件，将 CUDA kernel 映射到 MUSA 后端
+
+### 9.2 ROCm (AMD)
+
+- **扩展注册**: `csrc/common_extension_rocm.cc` — ROCm 平台的算子注册
+- **构建配置**: `pyproject_rocm.toml` + `setup_rocm.py` — 独立的 ROCm 构建流程
+- **头文件**: `include/pytorch_extension_utils_rocm.h` — ROCm 兼容的 PyTorch 扩展工具
+- **测试**: AMD 确定性 AllReduce 测试 (`tests/test_amd_deterministic_custom_allreduce.py`)
+
+### 9.3 CPU 后端
+
+- **入口**: `csrc/cpu/interface.cpp` + `csrc/cpu/torch_extension_cpu.cpp`
+- **构建配置**: `pyproject_cpu.toml`
+- **支持的 kernel**:
+
+| 文件 | 功能 |
+|------|------|
+| `flash_attn.cpp` | CPU FlashAttention 实现 |
+| `gemm_int4.cpp` | INT4 GEMM |
+| `gemm_int8.cpp` | INT8 GEMM |
+| `gemm_fp8.cpp` | FP8 GEMM |
+| `moe_int4.cpp` | INT4 MoE |
+| `moe_int8.cpp` | INT8 MoE |
+| `moe_fp8.cpp` | FP8 MoE |
+| `norm.cpp` | RMSNorm 等 |
+| `rope.cpp` | RoPE 位置编码 |
+| `topk.cpp` | TopK 路由 |
+| `decode.cpp` / `extend.cpp` | Decode/Extend 阶段 |
+
+- **架构**: 支持 x86_64 和 aarch64，利用 AVX/NEON 向量指令加速
+
+## 10. 下一步
 
 - **16**: Attention kernel 详解 (FlashAttention, MLA, Sparse)
 - **17**: MoE kernel 详解 (路由, Grouped GEMM)

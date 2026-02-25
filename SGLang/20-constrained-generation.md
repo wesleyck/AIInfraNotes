@@ -1,6 +1,8 @@
 # SGLang 约束生成详解
 
-> **默认场景**: Qwen/Qwen3-VL-235B-A22B-Thinking 多模态模型
+> **默认场景**: Qwen3.5 混合架构模型（Full Attention + Linear Attention/GatedDeltaNet + MoE + MTP）
+>
+> **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存 + EPLB + MTP + 线性注意力
 >
 > **核心组件**: Grammar Backend, Vocab Mask, Jump Forward
 
@@ -39,6 +41,8 @@ SGLang 通过 `--grammar-backend` 参数选择后端：
 | **xgrammar** | C++ 实现, CUDA 优化, bitmask | JSON, Regex, EBNF, StructuralTag | 生产环境 (默认) |
 | **outlines** | Python 实现, FSM 方式 | JSON, Regex | 轻量级/兼容 |
 | **llguidance** | Python 实现, bitmask | JSON, Regex, EBNF, StructuralTag | 研究 |
+| **reasoner** | 包装器，委托给上述后端 | 同被包装后端 | Thinking 模型 (自动启用) |
+| **自定义** | 通过 `GRAMMAR_BACKEND_REGISTRY` 注册 | 自定义 | 第三方扩展 |
 | **none** | 禁用 | — | 不需要约束生成 |
 
 ```python
@@ -358,6 +362,64 @@ grammar.rollback(num_rejected_tokens)
 # MAX_ROLLBACK_TOKENS = 200
 ```
 
-## 13. 下一步
+## 13. Reasoner Grammar Backend（v0.5.9 新增章节）
+
+**文件**: `srt/constrained/reasoner_grammar_backend.py`
+
+Reasoner Grammar Backend 是专为推理模型（Thinking 模型）设计的 Grammar 后端包装器。它解决了一个核心问题：在 `<think>...</think>` 思考阶段，模型应自由生成，不受 grammar 约束；只有 thinking 结束后，才激活约束生成。
+
+### 13.1 架构
+
+```mermaid
+flowchart TD
+    A["create_grammar_backend()"] --> B{"reasoning_parser 启用?"}
+    B -->|"否"| C["返回原始后端<br/>(XGrammar/Outlines/LLGuidance)"]
+    B -->|"是"| D["ReasonerGrammarBackend<br/>包装原始后端"]
+    D --> E["每个请求创建<br/>ReasonerGrammarObject"]
+    E --> F["包装原始 GrammarObject"]
+```
+
+`ReasonerGrammarBackend` 不是独立的 grammar 实现，而是一个**装饰器/包装器**，委托给内层的真实后端（如 XGrammar）。它在 `create_grammar_backend()` 中自动启用：
+
+```python
+# base_grammar_backend.py
+if server_args.reasoning_parser and hasattr(tokenizer, "think_end_id"):
+    grammar_backend = ReasonerGrammarBackend(grammar_backend, tokenizer.think_end_id)
+```
+
+### 13.2 ReasonerGrammarObject 状态机
+
+```python
+class ReasonerGrammarObject(BaseGrammarObject):
+    def __init__(self, grammar: BaseGrammarObject, think_end_id: int):
+        self.grammar = grammar           # 内层 grammar 对象
+        self.think_end_id = think_end_id
+        self.tokens_after_think_end = -1
+        # -1: thinking 阶段 (不约束)
+        #  0: 刚检测到 think_end_id
+        # >0: thinking 结束后的 token 计数
+```
+
+核心方法：
+
+- `accept_token(token)`: 先条件性委托给内层 grammar（仅 `tokens_after_think_end >= 0` 时），再调用 `transfer_state(token)` 更新状态
+- `fill_vocab_mask(vocab_mask, idx)`: thinking 阶段不填充掩码（全部允许），结束后委托给内层 grammar
+- `maybe_init_reasoning(reasoning)`: 根据请求是否启用 reasoning 设置初始状态（`-1` 或 `0`）
+- `rollback(k)`: 支持投机解码回滚，同时回滚内层 grammar 和自身状态
+
+### 13.3 与 Scheduler 的集成
+
+Scheduler 初始化时注入 `think_end_id`：
+
+```python
+# scheduler.py
+if self.server_args.reasoning_parser and self.tokenizer:
+    reasoning_parser = ReasoningParser(model_type=self.server_args.reasoning_parser, ...)
+    self.tokenizer.think_end_id = self.tokenizer.encode(
+        reasoning_parser.detector.think_end_token, add_special_tokens=False
+    )[0]
+```
+
+## 14. 下一步
 
 - **21**: 推理解析与函数调用 (ReasoningParser, FunctionCallParser)

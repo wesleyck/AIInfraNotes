@@ -436,7 +436,7 @@ def create_flashinfer_kv_indices_triton(
 
 FlashInfer 是 SGLang 默认的 Attention 后端，由 [flashinfer-ai](https://github.com/flashinfer-ai/flashinfer) 提供高性能 kernel。
 
-### 5.1 Qwen3 / Qwen3-VL 特殊处理
+### 5.1 Qwen3 / Qwen3.5 特殊处理
 
 ```python
 # flashinfer_backend.py L162-172
@@ -451,7 +451,7 @@ if (
 ```
 
 > [!NOTE]
-> Qwen3 系列模型（包括 Qwen3-VL 235B）由于其 attention head 配置和序列长度，需要更大的 FlashInfer workspace buffer。SGLang 自动检测并设置为 512MB。
+> Qwen3 系列模型（包括 Qwen3.5 235B）由于其 attention head 配置和序列长度，需要更大的 FlashInfer workspace buffer。SGLang 自动检测并设置为 512MB。
 
 ### 5.2 核心架构
 
@@ -1644,7 +1644,93 @@ flowchart LR
 
 ---
 
-## 16. 下一步
+## 16. 线性注意力后端 (v0.5.9 新增)
+
+Qwen3.5 的 GatedDeltaNet 层使用线性注意力，v0.5.9 新增了专门的后端支持。
+
+### linear/ 子目录
+
+| 文件 | 说明 |
+|------|------|
+| `lightning_attn.py` | Lightning Attention 后端 |
+| `seg_la.py` | Segmented Linear Attention 后端 |
+| `linear_metadata.py` | 线性注意力元数据管理 |
+
+### FLA (Flash Linear Attention)
+
+**文件**: `srt/layers/attention/fla/` (18个文件)
+
+Flash Linear Attention 子系统，包含 chunk 操作、fused recurrent、KDA 等 Triton kernel 实现。为 Qwen3.5 的线性注意力层提供高性能计算支持。
+
+## 17. 新增 Attention 后端 (v0.5.9)
+
+v0.5.9 新增了大量 attention 后端，后端总数翻倍：
+
+### 标准 Attention 后端
+
+| 后端 | 文件 | 说明 |
+|------|------|------|
+| Wave | `wave_backend.py` + `wave_ops/` | Wave Attention 后端，含 decode/extend/prefill 三种 attention |
+| TRT-LLM MHA | `trtllm_mha_backend.py` | TensorRT-LLM MHA 后端（非 MLA 模型） |
+| Torch Flex | `torch_flex_backend.py` | PyTorch Flex Attention 后端 |
+| TBO | `tbo_backend.py` | Two Batch Overlap 专用后端 |
+
+### MLA 后端
+
+| 后端 | 文件 | 说明 |
+|------|------|------|
+| TRT-LLM MLA | `trtllm_mla_backend.py` | TensorRT-LLM MLA 后端 |
+| CUTLASS MLA | `cutlass_mla_backend.py` | CUTLASS MLA 后端 |
+
+### 混合/线性 Attention 后端
+
+| 后端 | 文件 | 说明 |
+|------|------|------|
+| Hybrid Linear | `hybrid_linear_attn_backend.py` | 混合线性注意力后端，组合 full attention + linear attention |
+
+### 特殊包装后端 (via attn_backend_wrapper)
+
+| 后端 | 说明 |
+|------|------|
+| GDNAttnBackend | 混合 GDN 模型 |
+| Mamba2AttnBackend | Mamba2 模型 |
+| KimiLinearAttnBackend | Kimi 线性注意力 |
+| LightningAttentionBackend | Lightning Attention |
+| HybridLinearAttnBackend | 混合线性注意力包装器 |
+
+## 18. 注册后端总览 (v0.5.9)
+
+**文件**: `srt/layers/attention/attention_registry.py`
+
+v0.5.9 注册了 17 个后端：
+
+| 注册名 | 后端类 | 说明 |
+|--------|--------|------|
+| `flashinfer` | FlashInferAttnBackend / FlashInferMLAAttnBackend | MLA 感知 |
+| `trtllm_mla` | TRTLLMMLABackend | MLA 模型专用 |
+| `aiter` | AiterAttnBackend | AIter 后端 |
+| `wave` | WaveAttnBackend | Wave 后端 |
+| `ascend` | AscendAttnBackend | NPU 硬件 |
+| `nsa` | NativeSparseAttnBackend | 原生稀疏注意力 |
+| `triton` | TritonAttnBackend / DoubleSparseAttnBackend | 条件选择 |
+| `torch_native` | TorchNativeAttnBackend | PyTorch 原生 |
+| `flex_attention` | TorchFlexAttnBackend | Flex Attention |
+| `flashmla` | FlashMLABackend | Flash MLA |
+| `fa3` | FlashAttentionBackend | FlashAttention v3 |
+| `fa4` | FlashAttentionBackend | FlashAttention v4 |
+| `cutlass_mla` | CutlassMLABackend | CUTLASS MLA |
+| `trtllm_mha` | TRTLLMHAAttnBackend | 非 MLA 模型 |
+| `intel_amx` | IntelAMXAttnBackend | Intel AMX |
+| `dual_chunk_flash_attn` | DualChunkFlashAttentionBackend | 双 chunk |
+| `intel_xpu` | XPUAttentionBackend | Intel XPU |
+
+### NSA 后端扩展
+
+`nsa/` 目录新增了 MTP 验证和预计算相关文件：
+- `nsa_mtp_verification.py` - MTP 验证
+- `nsa_backend_mtp_precompute.py` - MTP 预计算
+
+## 19. 下一步
 
 - **10**: 模型加载、权重处理、量化支持
-- **11**: 多模态完整生命周期 (Qwen3-VL)
+- **11**: 多模态完整生命周期 (Qwen3.5)

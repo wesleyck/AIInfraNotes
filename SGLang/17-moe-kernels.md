@@ -1,8 +1,8 @@
 # SGLang MoE Kernel 实现详解
 
-> **默认场景**: DeepSeek-V3 / Qwen2-57B-A14B
+> **默认场景**: Qwen3.5 混合架构模型（Full Attention + Linear Attention/GatedDeltaNet + MoE + MTP）
 >
-> **核心组件**: Fused Gating, Token Alignment, Grouped GEMM
+> **核心组件**: Fused Gating, Token Alignment, Grouped GEMM, Token Dispatcher, MoE Runner
 
 ## 1. MoE 执行流程
 

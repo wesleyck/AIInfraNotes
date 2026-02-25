@@ -1,8 +1,8 @@
 # SGLang ModelRunner 与 CUDA Graph 详解
 
-> **默认场景**: Qwen/Qwen3-VL-235B-A22B-Thinking 多模态模型
+> **默认场景**: Qwen3.5 混合架构模型（Full Attention + Linear Attention/GatedDeltaNet + MoE + MTP）
 >
-> **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存
+> **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存 + EPLB + MTP + 线性注意力
 
 ## 1. ModelRunner 概览
 
@@ -892,7 +892,7 @@ class ForwardBatch:
 | **目标阶段** | Decode (is_decode=True) | Prefill/Extend (LLM 部分) | Vision Encoder (ViT 部分) |
 | **捕获维度** | batch_size | num_tokens | seq_len (image patch 数) |
 | **捕获时机** | 启动时预捕获所有 bs | 启动时预捕获 | **懒加载** — 首次遇到新 shape 时 |
-| **典型场景** | 逐 token 生成 | MoE 模型长序列 Prefill | Qwen2.5-VL / Qwen3-VL |
+| **典型场景** | 逐 token 生成 | MoE 模型长序列 Prefill | Qwen2.5-VL / Qwen3.5 |
 | **独立性** | 独立 | 独立（与 Decode CG 可共存） | **独立于 Piecewise**，用标准 `torch.cuda.CUDAGraph` |
 | **torch.compile** | 可选（compile_bs 子集） | 内置 | **不使用** |
 | **文件** | cuda_graph_runner.py | piecewise_cuda_graph_runner.py | vit_cuda_graph_runner.py |
@@ -1033,9 +1033,9 @@ class ViTCudaGraphRunner:
 1. **按 seq_len 捕获** (不是 batch_size)，因为 image patch 数量决定 seq_len
 2. **懒加载捕获** - 首次遇到新 shape 时创建图，非启动时预捕获
 3. **支持 Qwen2.5-VL 窗口注意力** (`fullatt_block_indexes`, `cu_window_seqlens`)
-4. **支持 Qwen3-VL deepstack** (`deepstack_visual_indexes`, `deepstack_merger_list`)
+4. **支持 Qwen3.5 deepstack** (`deepstack_visual_indexes`, `deepstack_merger_list`)
 
-**Qwen3-VL 调用流程**:
+**Qwen3.5 调用流程**:
 ```python
 # qwen3_vl.py forward()
 def forward(self, x, grid_thw):
@@ -1220,7 +1220,7 @@ flowchart TD
     S2["场景 2: MoE 模型<br/>DeepSeek, Qwen-MoE"] --> S2A["使用: --enable-piecewise-cuda-graph"]
     S2A --> S2B["原因: MoE 的 EP 通信与<br/>torch.compile 结合更好"]
 
-    S3["场景 3: 多模态<br/>Qwen2.5-VL, Qwen3-VL"] --> S3A["使用: SGLANG_VIT_ENABLE_CUDA_GRAPH=1"]
+    S3["场景 3: 多模态<br/>Qwen2.5-VL, Qwen3.5"] --> S3A["使用: SGLANG_VIT_ENABLE_CUDA_GRAPH=1"]
     S3A --> S3B["原因: VIT 部分 shape 固定时可加速"]
     S3B --> S3C["注意: VIT 不使用 torch.compile"]
 
@@ -1377,7 +1377,7 @@ seq_lens_cpu = buffers.populate_from_forward_batch(
 
 ## 14. 多模态请求执行流程
 
-以 Qwen3-VL 处理带图片请求为例：
+以 Qwen3.5 处理带图片请求为例：
 
 ```mermaid
 flowchart TB
@@ -1547,7 +1547,47 @@ ModelRunner.forward()
 | 调试/开发 | `--disable-cuda-graph` |
 | 低延迟优先 | 开启 PDMux (`--enable-pdmux`) |
 
-## 17. 下一步
+## 17. Batch Overlap 集成 (v0.5.9 新增)
+
+ModelRunner 在 `forward()` 方法中与 `batch_overlap/` 模块协作，支持 SBO/TBO 两种重叠模式。
+
+**文件**: `srt/model_executor/model_runner.py` (2688行)
+
+### 关键方法 (v0.5.9 行号)
+
+| 方法 | 行号 | 说明 |
+|------|------|------|
+| `ModelRunner` 类定义 | L278 | 主类 |
+| `forward_decode` | L2284 | Decode 前向 |
+| `forward_extend` | L2307 | Extend 前向 |
+| `forward_idle` | L2347 | Idle 前向 |
+| `forward_split_prefill` | L2366 | Split Prefill 前向 |
+| `forward` | L2387 | 统一前向入口 |
+
+当启用 batch overlap 时，ModelRunner 使用 SBO 或 TBO 的 forward 路径替代标准 forward，在 MoE 层的 all-to-all 通信与 attention 计算之间实现重叠。
+
+> **详细分析**: 见 **24-batch-overlap.md**
+
+## 18. KV Cache Mixin (v0.5.9 新增)
+
+**文件**: `srt/model_executor/model_runner_kv_cache_mixin.py`
+
+KV Cache 管理逻辑从 model_runner.py 抽取到独立 mixin，包括：
+- KV Cache 的初始化和配置
+- 内存池的创建和管理
+- CUDA Graph 中 KV Cache 的处理
+
+## 19. 其他新增模块 (v0.5.9)
+
+| 文件 | 说明 |
+|------|------|
+| `input_buffers.py` (8047行) | CUDA Graph 输入缓冲区管理（`GraphInputBuffers` 类），从 ModelRunner 重构出来 |
+| `hook_manager.py` (83行) | Hook 管理器，支持在 forward 过程中注入自定义逻辑 |
+| `cpu_graph_runner.py` | CPU Graph Runner，用于 CPU 端的图执行 |
+| `piecewise_cuda_graph_runner.py` | 分段 CUDA Graph Runner，支持更灵活的图捕获策略 |
+| `forward_batch_deepseek_mha_mixin.py` (9681行) | DeepSeek MHA 专用的 ForwardBatch 扩展 |
+
+## 20. 下一步
 
 - **09**: Attention 后端 (FlashInfer, FlashAttention, Triton)
 - **10**: 模型加载、权重处理、量化支持

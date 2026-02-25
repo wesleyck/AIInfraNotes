@@ -1,6 +1,8 @@
 # SGLang 采样与生成控制详解
 
-> **默认场景**: Qwen/Qwen3-VL-235B-A22B-Thinking 多模态模型
+> **默认场景**: Qwen3.5 混合架构模型（Full Attention + Linear Attention/GatedDeltaNet + MoE + MTP）
+>
+> **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存 + EPLB + MTP + 线性注意力
 >
 > **核心组件**: SamplingParams, SamplingBatchInfo, LogitsProcessor, Sampler, PenaltyLib
 
@@ -639,6 +641,53 @@ flowchart TD
     Sampler --> Update["penalizer_orchestrator.cumulate_output_tokens<br/>cumulated_frequency_penalties 0,42 += 0.5<br/>下轮 token 42 惩罚 +0.5"]
 ```
 
-## 11. 下一步
+## 11. v0.5.9 更新
+
+### 11.1 确定性采样哈希函数改进
+
+v0.5.9 将确定性采样的哈希函数从简单的线性组合升级为 **MurmurHash3** 算法，显著改善了哈希质量和采样的均匀性。
+
+**文件**: `srt/layers/utils/hash.py`
+
+旧版本使用简单的乘法-异或组合：
+```python
+# v0.5.7
+step_seed = (seed * 19349663) ^ (position * 73856093)
+```
+
+新版本使用 Triton 实现的 MurmurHash3 32-bit：
+```python
+# v0.5.9 - srt/layers/utils/hash.py
+def murmur_hash32(seed, positions, col_indices):
+    """MurmurHash3 32-bit, Triton kernel 实现
+    将 64-bit seed + 32-bit position + 32-bit col_index 作为 4 个 4-byte block 混合"""
+    # 每个 block 经过 murmur3_mix (乘法 + 旋转 + 异或)
+    # 最终 fmix32 做 avalanche 处理
+```
+
+改进点：
+- 使用标准 MurmurHash3 算法，雪崩效应更好（输入微小变化导致输出完全不同）
+- Triton kernel 实现，GPU 上高效并行
+- 输入扩展为 `(seed, position, col_index)` 三元组，每个 vocab token 有独立哈希值
+- `sampling_batch_info.py` 中 `sampling_seed` 字段配合 `enable_deterministic_inference` 全局开关使用
+
+### 11.2 自定义 Logit Processor 更新
+
+**文件**: `srt/sampling/custom_logit_processor.py`
+
+v0.5.9 新增了多个内置 `ThinkingBudgetLogitProcessor` 子类，覆盖更多推理模型：
+
+| 处理器 | 模型 | THINKING_START_TOKEN_ID | THINKING_END_TOKEN_ID |
+|--------|------|------------------------|----------------------|
+| `Glm4MoeThinkingBudgetLogitProcessor` | GLM-4.5/4.6/4.5V/4.6V | 151350 | 151351 |
+| `Qwen3ThinkingBudgetLogitProcessor` | Qwen3 系列 | 151667 | 151668 |
+| `DeepSeekR1ThinkingBudgetLogitProcessor` | DeepSeek-R1 | 128798 | 128799 |
+
+另外新增 `DeepseekOCRNoRepeatNGramLogitProcessor`，用于 DeepSeek-OCR 场景的 n-gram 去重：
+- 在滑动窗口 (`window_size`) 内检测 n-gram (`ngram_size`) 重复
+- 将重复 token 的 logit 设为 `-inf`
+- 支持 `whitelist_token_ids` 白名单豁免
+
+## 12. 下一步
 
 - **20**: 约束生成 (Grammar Backends, JSON Schema, Regex)

@@ -2,7 +2,7 @@
 
 ## 1. 概述
 
-SGLang 的多模态系统处理图像、视频、音频等非文本输入，支持 Qwen3-VL、LLaVA、InternVL 等模型。
+SGLang 的多模态系统处理图像、视频、音频等非文本输入，支持 Qwen3.5、LLaVA、InternVL 等模型。
 
 > **⚠ 同名文件区分**：本文涉及两个 `mm_utils.py`，功能完全不同：
 >
@@ -115,7 +115,7 @@ class MultimodalSpecialTokens:
         ...
 ```
 
-### 2.3 QwenVLImageProcessor (Qwen3-VL 专用)
+### 2.3 QwenVLImageProcessor (Qwen3.5 专用)
 
 ```python
 # processors/qwen_vl.py L223-417
@@ -971,7 +971,7 @@ export SGLANG_VIT_ENABLE_CUDA_GRAPH=1
 
 ## 6. 嵌入融合
 
-### 6.1 融合流程 (Qwen3-VL)
+### 6.1 融合流程 (Qwen3.5)
 
 > **重要区分**：SGLang 的嵌入融合**不在**模型的 `forward()` 中直接完成（与 HuggingFace 原始实现不同）。融合逻辑位于 `managers/mm_utils.py` 的 `embed_mm_inputs()` 中，由 `general_mm_embed_routine()` 统一调用。
 
@@ -1053,9 +1053,9 @@ def get_rope_index(
     return position_ids
 ```
 
-### 6.3 Deepstack 机制 (Qwen3-VL)
+### 6.3 Deepstack 机制 (Qwen3.5)
 
-Qwen3-VL 引入 **Deepstack** 机制：在 ViT 的中间层捕获特征，注入到 LLM decoder 的浅层，使浅层 decoder 也获得多分辨率视觉特征。
+Qwen3.5 引入 **Deepstack** 机制：在 ViT 的中间层捕获特征，注入到 LLM decoder 的浅层，使浅层 decoder 也获得多分辨率视觉特征。
 
 #### 6.3.1 ViT 端：中间层特征捕获
 
@@ -1114,7 +1114,7 @@ class Modality(Enum):
 
 | 模型 | 支持模态 | Processor 类 / 模型文件 |
 |------|----------|------------------------|
-| **Qwen3-VL** | 图像, 视频 | `QwenVLImageProcessor` |
+| **Qwen3.5** | 图像, 视频 | `QwenVLImageProcessor` |
 | **Qwen2.5-VL** / **Qwen2-VL** | 图像, 视频 | `QwenVLImageProcessor` |
 | **Qwen3-Omni** | 图像, 视频, 音频 | `QwenVLImageProcessor` |
 | **Qwen2-Audio** | 音频 | `qwen2_audio.py` |
@@ -1144,7 +1144,7 @@ class Modality(Enum):
 ```python
 # 启用多模态缓存
 python -m sglang.launch_server \
-    --model-path Qwen/Qwen3-VL-7B \
+    --model-path Qwen/Qwen3.5-7B \
     --mm-cache-size 2048  # MB
 ```
 
@@ -1161,7 +1161,7 @@ export SGLANG_VIT_ENABLE_CUDA_GRAPH=1
 
 ```bash
 python -m sglang.launch_server \
-    --model-path Qwen/Qwen3-VL-7B \
+    --model-path Qwen/Qwen3.5-7B \
     --tp 4 \
     --mm-enable-dp-encoder  # 启用 VIT DP
 ```
@@ -1221,7 +1221,7 @@ class VisionMLP(nn.Module):
 | ViT 通信开销 | 每层 all-reduce | 仅最终 all-gather |
 | ViT 计算量 | 全量图像 | 分片图像（`/tp_size`） |
 
-以 Qwen3-VL-235B 的 ViT（约 1.1B 参数，FP16 约 2.2GB）为例：
+以 Qwen3.5-235B 的 ViT（约 1.1B 参数，FP16 约 2.2GB）为例：
 - `tp=8` 默认模式：每 Rank 约 275MB ViT 权重，但每 Rank 编码所有图像
 - `tp=8` ViT DP 模式：每 Rank 约 2.2GB ViT 权重（多占 ~1.9GB），但每 Rank 仅编码 1/8 图像
 
@@ -1605,6 +1605,12 @@ export SGLANG_LOG_LEVEL=debug
 
 ```bash
 python -m sglang.launch_server \
-    --model-path Qwen/Qwen3-VL-7B \
+    --model-path Qwen/Qwen3.5-7B \
     --mm-cache-size 0  # 禁用缓存
 ```
+
+---
+
+## 11. v0.5.9 多模态更新
+
+Qwen3.5 继承 Qwen3VL 的 Vision 架构，但 text backbone 是混合架构（Full Attention + Linear Attention + MoE）。多模态处理流程与 Qwen3-VL 基本一致，主要变化在 text backbone 的推理路径。

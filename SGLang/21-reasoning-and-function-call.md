@@ -1,6 +1,8 @@
 # SGLang 推理解析与函数调用详解
 
-> **默认场景**: Qwen/Qwen3-VL-235B-A22B-Thinking 多模态模型
+> **默认场景**: Qwen3.5 混合架构模型（Full Attention + Linear Attention/GatedDeltaNet + MoE + MTP）
+>
+> **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存 + EPLB + MTP + 线性注意力
 >
 > **核心组件**: ReasoningParser, FunctionCallParser, BaseFormatDetector, StructuralTag
 
@@ -51,12 +53,13 @@ ReasoningParser.DetectorMap = {
     "glm45":                Qwen3Detector,
     "gpt-oss":              GptOssDetector,        # 使用 HarmonyParser
     "kimi":                 KimiDetector,          # Unicode 标记符
-    "kimi_k2":              DeepSeekR1Detector,
+    "kimi_k2":              Qwen3Detector,         # v0.5.9: 改为 Qwen3Detector (原 DeepSeekR1Detector)
     "qwen3":                Qwen3Detector,
     "qwen3-thinking":       Qwen3Detector,         # force_reasoning=True (强制覆盖)
     "minimax":              Qwen3Detector,          # force_reasoning=True (强制覆盖)
     "minimax-append-think": MiniMaxAppendThinkDetector,
     "step3":                DeepSeekR1Detector,
+    "step3p5":              DeepSeekR1Detector,     # v0.5.9 新增
     "nano_v3":              NanoV3Detector,
     "interns1":             Qwen3Detector,
 }
@@ -164,10 +167,14 @@ flowchart TD
     B --> L["MistralDetector - mistral"]
     B --> M["PythonicDetector - pythonic"]
     B --> N["Qwen25Detector - qwen, qwen25"]
-    B --> O["Qwen3CoderDetector - qwen3_coder"]
+    B --> O["Qwen3CoderDetector - qwen3_coder, step3p5"]
     B --> P["Step3Detector - step3"]
     B --> Q["MinimaxM2Detector - minimax-m2"]
     B --> R["InternlmDetector - interns1"]
+    B --> S["TrinityDetector - trinity"]
+    B --> T["Lfm2Detector - lfm2"]
+    B --> U["HermesDetector - hermes"]
+    B --> V["GigaChat3Detector - gigachat3"]
 ```
 
 ### 3.2 核心数据类型
@@ -523,7 +530,83 @@ response = client.chat.completions.create(
 )
 ```
 
-## 8. 下一步
+## 8. v0.5.9 函数调用检测器大幅扩展
+
+### 8.1 ToolCallParserEnum 完整注册表
+
+v0.5.9 将函数调用检测器从约 10 个扩展到 **22 个**，覆盖了主流推理模型的工具调用格式。
+
+**文件**: `srt/function_call/function_call_parser.py`
+
+```python
+FunctionCallParser.ToolCallParserEnum = {
+    # === DeepSeek 系列 ===
+    "deepseekv3":   DeepSeekV3Detector,     # 原始 V3 格式
+    "deepseekv31":  DeepSeekV31Detector,    # v0.5.9 新增: V3.1 格式
+    "deepseekv32":  DeepSeekV32Detector,    # v0.5.9 新增: V3.2 格式
+    # === GLM 系列 ===
+    "glm":          Glm4MoeDetector,
+    "glm45":        Glm4MoeDetector,
+    "glm47":        Glm47MoeDetector,       # v0.5.9 新增: GLM-4.7 MoE
+    # === Qwen 系列 ===
+    "qwen":         Qwen25Detector,
+    "qwen25":       Qwen25Detector,
+    "qwen3_coder":  Qwen3CoderDetector,     # v0.5.9 新增: Qwen3 Coder 多块格式
+    # === 其他模型 ===
+    "gpt-oss":      GptOssDetector,         # v0.5.9 新增: GPT-OSS (HarmonyParser)
+    "kimi_k2":      KimiK2Detector,         # v0.5.9 新增: Kimi K2
+    "lfm2":         Lfm2Detector,           # v0.5.9 新增: LFM-2
+    "llama3":       Llama32Detector,
+    "mimo":         MiMoDetector,           # v0.5.9 新增: MiMo
+    "mistral":      MistralDetector,
+    "pythonic":     PythonicDetector,       # v0.5.9 新增: Pythonic 语法
+    "step3":        Step3Detector,          # v0.5.9 新增: Step-3
+    "step3p5":      Qwen3CoderDetector,     # v0.5.9 新增: Step-3.5 (复用 Qwen3Coder)
+    "minimax-m2":   MinimaxM2Detector,      # v0.5.9 新增: MiniMax M2
+    "trinity":      TrinityDetector,        # v0.5.9 新增: Trinity
+    "interns1":     InternlmDetector,       # v0.5.9 新增: InternLM S1
+    "hermes":       HermesDetector,         # v0.5.9 新增: Hermes 格式
+    "gigachat3":    GigaChat3Detector,      # v0.5.9 新增: GigaChat-3
+}
+```
+
+### 8.2 core_types.py 更新
+
+`core_types.py` 保持了简洁的数据模型设计，核心类型未变：
+
+```python
+class ToolCallItem(BaseModel):
+    tool_index: int
+    name: Optional[str] = None
+    parameters: str  # JSON string
+
+class StreamingParseResult(BaseModel):
+    normal_text: str = ""
+    calls: List[ToolCallItem] = []
+
+@dataclass
+class StructureInfo:
+    begin: str       # 工具调用开始标记
+    end: str         # 工具调用结束标记
+    trigger: str     # 触发约束生成的 token
+```
+
+新增 `_GetInfoFunc` 类型别名，用于 `structure_info()` 方法的返回类型标注。
+
+### 8.3 supports_structural_tag 分布
+
+v0.5.9 中不支持 structural_tag 的 detector 增多：
+
+| 不支持 structural_tag 的 Detector | 原因 |
+|----------------------------------|------|
+| `PythonicDetector` | Pythonic 语法非 JSON |
+| `MiMoDetector` | 自定义 XML 格式 |
+| `MinimaxM2Detector` | 自定义格式 |
+| `Qwen3CoderDetector` (含 step3p5) | 自定义多块格式 |
+| `Step3Detector` | 自定义格式 |
+| `Glm4MoeDetector` / `Glm47MoeDetector` | 自定义格式 |
+
+## 9. 下一步
 
 - **22**: Embedding 与 Rerank 模型 (Pooler, CrossEncodingPooler, SparsePooler)
 - **23**: LoRA 适配器支持 (S-LoRA, Punica, 多后端 SGEMM)

@@ -1,8 +1,8 @@
 # SGLang Attention Kernel 实现详解
 
-> **默认场景**: Qwen/Qwen3-VL-235B-A22B-Thinking 多模态模型
+> **默认场景**: Qwen3.5 混合架构模型（Full Attention + Linear Attention/GatedDeltaNet + MoE + MTP）
 >
-> **核心组件**: FlashAttention 3/4, CUTLASS MLA (SM100), FlashMLA (SM90), Cascade, Sparse Attention
+> **核心组件**: FlashAttention 3/4, CUTLASS MLA (SM100), FlashMLA (SM90), Cascade, Sparse Attention, Wave Attention, NSA
 
 ## 1. 概览
 
@@ -53,6 +53,9 @@ graph TB
 | `fwd_sparse` | `csrc/attention/vertical_slash_index.cu` | SM80+ | 稀疏注意力索引转换 |
 | `flash_mla_with_kvcache` | `flash_mla.py` → `flashmla_extension.cc` | SM90 | FlashMLA 后端 (独立项目, 非 CUTLASS MLA) |
 | `flash_mla_sparse_fwd` | `flash_mla.py` | SM90 | FlashMLA 稀疏 prefill |
+| `wave_backend` | `wave_backend.py` (Triton) | All | Wave Attention (decode/extend/prefill) |
+| `nsa_backend` | `nsa_backend.py` + `nsa/` | SM80+ | NSA 稀疏注意力 + MTP 支持 |
+| `cpu_flash_attn` | `csrc/cpu/flash_attn.cpp` | CPU | CPU FlashAttention (x86_64/aarch64) |
 
 ## 2. FlashAttention 3/4 集成
 
@@ -541,6 +544,58 @@ else:
 | FA4 不支持 KV 更新 | 设计限制 | 使用 FA3 |
 | 大 batch MLA hang | Split-KV bug | 设置 `num_kv_splits=1` |
 
-## 9. 下一步
+## 9. Wave Attention Kernel (v0.5.9 新增)
+
+Wave Attention 是一种基于 Triton 实现的 attention 后端，针对 decode/extend/prefill 三个阶段分别提供优化的 kernel。
+
+**文件**: `python/sglang/srt/layers/attention/wave_backend.py`
+
+### 9.1 核心设计
+
+- 基于 Triton JIT 编译，动态适配不同硬件
+- 自动计算最优 KV split 数量 (`get_num_kv_splits_triton`)，根据序列长度和 SM 数量动态调整并行度
+- 支持 GQA/MQA (通过 `num_group = num_heads // num_kv_heads`)
+- 支持 Paged KV Cache
+
+### 9.2 与其他后端的关系
+
+| 特性 | Wave Attention | FlashInfer | FlashAttention 3 |
+|------|---------------|------------|-------------------|
+| 实现语言 | Triton | CUDA C++ | CUDA C++ |
+| 编译方式 | JIT | AOT | AOT |
+| 硬件适配 | 自动 (Triton) | 手动优化 | 手动优化 |
+| Split-KV | 动态计算 | 固定/启发式 | 固定 |
+
+## 10. NSA Kernel 扩展 (v0.5.9 新增)
+
+NSA (Native Sparse Attention) 在 v0.5.9 中扩展了 MTP (Multi-Token Prediction) 支持。
+
+**文件目录**: `python/sglang/srt/layers/attention/nsa/`
+
+### 10.1 新增文件
+
+| 文件 | 功能 |
+|------|------|
+| `nsa_mtp_verification.py` | NSA 与 MTP 联合验证逻辑，确保投机解码中稀疏注意力的正确性 |
+| `nsa_backend_mtp_precompute.py` | MTP 预计算后端，在 prefill 阶段预先计算 NSA 所需的索引和元数据 |
+| `nsa_indexer.py` | NSA 索引器，负责稀疏 token 选择和索引构建 |
+| `nsa_backend.py` | NSA 注意力后端主入口 (位于 `layers/attention/` 目录) |
+
+### 10.2 MTP + NSA 协作
+
+在 MTP 场景下，draft model 生成多个候选 token，NSA 需要在验证阶段正确处理稀疏注意力模式。`nsa_mtp_verification.py` 负责协调两者的交互，`nsa_backend_mtp_precompute.py` 则在 prefill 阶段预计算稀疏索引以减少验证延迟。
+
+## 11. CPU FlashAttention (v0.5.9 新增)
+
+**文件**: `sgl-kernel/csrc/cpu/flash_attn.cpp`
+
+sgl-kernel 的 CPU 后端新增了 FlashAttention 实现，支持在纯 CPU 环境下运行推理。
+
+- 利用 AVX/NEON 向量指令加速 attention 计算
+- 支持 x86_64 和 aarch64 架构
+- 与 GPU 版本共享相同的 Python API 接口，通过 `csrc/cpu/interface.cpp` 统一注册
+- 适用于边缘部署、CPU-only 推理等场景
+
+## 12. 下一步
 
 - **17**: MoE kernel 详解 (路由, Grouped GEMM)

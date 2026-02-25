@@ -943,3 +943,21 @@ python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct
 | Draft Extend CG | `speculative/eagle_draft_extend_cuda_graph_runner.py` | Draft Extend CUDA Graph Runner |
 | **模型** | | |
 | EAGLE3 模型 | `models/llama_eagle3.py` | EAGLE3 Draft 模型结构 |
+
+---
+
+## 14. Standalone Worker V2 (v0.5.9 新增)
+
+**文件**: `srt/speculative/standalone_worker_v2.py`
+
+继承 EagleDraftWorker，不共享 embeddings/lm_head，适用于 draft 模型与 target 模型架构差异较大的场景。
+
+## 15. Multi-Layer EAGLE 扩展 (v0.5.9)
+
+| 文件 | 说明 |
+|------|------|
+| `multi_layer_eagle_draft_extend_cuda_graph_runner.py` | 多层 EAGLE Draft Extend CUDA Graph Runner |
+| `multi_layer_eagle_utils.py` | 多层 EAGLE 工具函数 |
+| `multi_layer_eagle_worker_v2.py` | 多层 EAGLE Worker V2 |
+| `eagle_info_v2.py` | EAGLE V2 信息结构 |
+| `draft_utils.py` | Draft 工具函数 |

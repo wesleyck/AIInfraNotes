@@ -1,8 +1,8 @@
 # SGLang 并行策略详解
 
-> **默认场景**: Qwen/Qwen3-VL-235B-A22B-Thinking 多模态模型
+> **默认场景**: Qwen3.5 混合架构模型（Full Attention + Linear Attention/GatedDeltaNet + MoE + MTP）
 >
-> **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存
+> **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存 + EPLB + MTP + 线性注意力
 
 ## 1. 概览
 
@@ -247,7 +247,7 @@ def recv_tensor_dict(self, src=None):
 
 ## 5. Expert Parallelism (EP)
 
-> **Why**：MoE 模型的专家数量多（如 Qwen3-VL-235B 有 128 个专家），单卡放不下所有专家权重。EP 将 FFN 中的 MoE 专家层分配到不同 GPU，每个 GPU 只持有部分专家。
+> **Why**：MoE 模型的专家数量多（如 Qwen3.5-235B 有 128 个专家），单卡放不下所有专家权重。EP 将 FFN 中的 MoE 专家层分配到不同 GPU，每个 GPU 只持有部分专家。
 >
 > **目标层**：仅 MoE FFN 层中的专家权重（`FusedMoE` / `EPMoE`），非 MoE 层（如 Attention）不受影响。
 
@@ -292,9 +292,9 @@ else:
     _MOE_EP = init_model_parallel_group(group_ranks, ...)
 ```
 
-### 5.3 Qwen3-VL-235B-A22B EP 配置
+### 5.3 Qwen3.5-235B-A22B EP 配置
 
-Qwen3-VL-235B-A22B 是 MoE 模型：
+Qwen3.5-235B-A22B 是 MoE 模型：
 - 总专家数: 128
 - 激活专家: 22 (Top-K=8)
 - 推荐配置: EP=8 (每 GPU 16 专家)
@@ -470,7 +470,7 @@ class DpPaddingMode(IntEnum):
 
 ### 7.5 ViT DP (多模态场景)
 
-对于 Qwen3-VL 等多模态模型，ViT 处理可以使用 DP Attention 优化：
+对于 Qwen3.5 等多模态模型，ViT 处理可以使用 DP Attention 优化：
 
 ```mermaid
 flowchart TB
@@ -502,7 +502,7 @@ flowchart TB
 **启用 ViT DP**:
 ```bash
 python -m sglang.launch_server \
-    --model-path Qwen/Qwen3-VL-235B-A22B-Thinking \
+    --model-path Qwen/Qwen3.5-235B-A22B \
     --tp 8 \
     --dp 2 \
     --enable-dp-attention
@@ -604,7 +604,7 @@ assert not overlap_schedule, "PD-Multiplexing 与 Overlap Schedule 不兼容"
 
 ```bash
 python -m sglang.launch_server \
-    --model-path Qwen/Qwen3-VL-235B-A22B-Thinking \
+    --model-path Qwen/Qwen3.5-235B-A22B \
     --tp 8 \
     --enable-pdmux \
     --pdmux-config-path pdmux_config.json
@@ -668,8 +668,8 @@ moe_tp_size = tp_size // ep_size
 ### 9.3 MoE 模型
 
 ```bash
-# Qwen3-VL-235B-A22B (MoE) 推荐配置
-python -m sglang.launch_server --model-path Qwen/Qwen3-VL-235B-A22B-Thinking \
+# Qwen3.5-235B-A22B (MoE) 推荐配置
+python -m sglang.launch_server --model-path Qwen/Qwen3.5-235B-A22B \
     --tp 8 \
     --ep 8  # 或自动推断
 ```
@@ -703,7 +703,58 @@ export NCCL_DEBUG_SUBSYS=ALL
 export SGLANG_USE_PYNCCL=0
 ```
 
-## 11. 下一步
+## 11. EPLB (Expert Parallel Load Balancing) (v0.5.9 新增)
+
+**目录**: `srt/eplb/`
+
+Qwen3.5 等 MoE 模型在 EP 场景下需要动态负载均衡。EPLB 通过监控专家负载分布，动态调整专家到 GPU 的映射。
+
+| 文件 | 说明 |
+|------|------|
+| `eplb_manager.py` | EPLB 管理器 |
+| `expert_distribution.py` | 专家分布统计 |
+| `expert_location_dispatch.py` | 专家位置调度 |
+| `expert_location_updater.py` | 专家位置更新 |
+| `eplb_algorithms/deepseek.py` | DeepSeek EPLB 算法 |
+| `eplb_algorithms/deepseek_vec.py` | DeepSeek 向量化 EPLB |
+| `eplb_algorithms/elasticity_aware.py` | 弹性感知 EPLB |
+| `eplb_simulator/reader.py` | EPLB 模拟器 |
+
+## 12. Elastic EP (v0.5.9 新增)
+
+**文件**: `srt/elastic_ep/elastic_ep.py`
+
+弹性专家并行，支持动态调整 EP 的并行度。
+
+## 13. DLLM (Distributed LLM) (v0.5.9 新增)
+
+**目录**: `srt/dllm/`
+
+分布式 LLM 支持，包含：
+
+| 文件 | 说明 |
+|------|------|
+| `config.py` | DLLM 配置 |
+| `algorithm/base.py` | 算法基类 |
+| `algorithm/joint_threshold.py` | 联合阈值算法 |
+| `algorithm/low_confidence.py` | 低置信度算法 |
+| `mixin/req.py` | 请求 Mixin |
+| `mixin/scheduler.py` | 调度器 Mixin |
+
+## 14. Token Dispatcher 多后端 (v0.5.9 扩展)
+
+`srt/layers/moe/token_dispatcher/` 新增多个后端：
+
+| 后端 | 文件 | 说明 |
+|------|------|------|
+| DeepEP | `deepep.py` | DeepEP 通信后端 |
+| FuseEP | `fuseep.py` | 融合 EP 后端 |
+| Mooncake | `mooncake.py` | Mooncake 通信后端 |
+| MoriEP | `moriep.py` | Mori EP 后端 |
+| FlashInfer | `flashinfer.py` | FlashInfer 后端 |
+| Standard | `standard.py` | 标准后端 |
+
+## 15. 下一步
 
 - **14**: PD 分离 (Prefill-Decode Disaggregation)
 - **15**: sgl-kernel 架构

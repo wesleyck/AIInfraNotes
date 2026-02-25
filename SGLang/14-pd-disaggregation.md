@@ -1,8 +1,8 @@
 # SGLang PD 分离 (Prefill-Decode Disaggregation)
 
-> **默认场景**: Qwen/Qwen3-VL-235B-A22B-Thinking 多模态模型
+> **默认场景**: Qwen3.5 混合架构模型（Full Attention + Linear Attention/GatedDeltaNet + MoE + MTP）
 >
-> **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存
+> **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存 + EPLB + MTP + 线性注意力
 
 ## 1. 概览
 
@@ -314,7 +314,7 @@ def resume_retracted_reqs(self):
 
 ```bash
 python -m sglang.launch_server \
-    --model-path Qwen/Qwen3-VL-235B-A22B-Thinking \
+    --model-path Qwen/Qwen3.5-235B-A22B \
     --tp 4 \
     --disaggregation-mode prefill \
     --disaggregation-transfer-backend mooncake \
@@ -325,7 +325,7 @@ python -m sglang.launch_server \
 
 ```bash
 python -m sglang.launch_server \
-    --model-path Qwen/Qwen3-VL-235B-A22B-Thinking \
+    --model-path Qwen/Qwen3.5-235B-A22B \
     --tp 8 \
     --disaggregation-mode decode \
     --disaggregation-transfer-backend mooncake \
@@ -422,7 +422,7 @@ Decode 阶段是 memory-bound，GPU 计算单元 (SM) 利用率低。PD-Multiple
 
 ```bash
 python -m sglang.launch_server \
-    --model-path Qwen/Qwen3-VL-235B-A22B-Thinking \
+    --model-path Qwen/Qwen3.5-235B-A22B \
     --tp 8 \
     --enable-pdmux \
     --pdmux-config-path pdmux_config.json
@@ -450,7 +450,48 @@ export SGLANG_LOG_LEVEL=debug
 --disaggregation-transfer-backend fake
 ```
 
-## 11. 下一步
+## 12. KV 事件管理 (v0.5.9 新增)
+
+**文件**: `srt/disaggregation/kv_events.py` (426行)
+
+事件发布/订阅系统，用于 PD 分离场景下的 KV Cache 状态同步。
+
+| 类 | 行号 | 说明 |
+|----|------|------|
+| `EventBatch` | L38 | 事件批次 |
+| `KVCacheEvent` | L49 | KV Cache 事件基类 |
+| `BlockStored` | L64 | 块存储事件 |
+| `BlockRemoved` | L73 | 块移除事件 |
+| `AllBlocksCleared` | L78 | 全部清除事件 |
+| `ZmqEventPublisher` | L126 | ZMQ 事件发布器（含 replay buffer） |
+| `EventPublisherFactory` | L400 | 发布器工厂 |
+
+## 13. KV Cache 卸载 (v0.5.9 新增)
+
+**文件**: `srt/disaggregation/decode_kvcache_offload_manager.py`
+
+Decode 端 KV Cache 到 Host 内存的卸载管理，减少 GPU 内存压力。
+
+## 14. 多硬件后端 (v0.5.9 扩展)
+
+| 后端 | 目录 | 说明 |
+|------|------|------|
+| NIXL | `nixl/conn.py` | NVIDIA NIXL 高性能传输 |
+| Mori | `mori/conn.py` | Mori 传输后端 |
+| Ascend | `ascend/conn.py` + `transfer_engine.py` | 华为 Ascend NPU |
+| Mooncake | `mooncake/conn.py` | Mooncake 分布式传输 |
+| Fake | `fake/conn.py` | 测试用假后端 |
+| Common | `common/conn.py` | 通用传输后端 |
+
+## 15. Encode Server/Receiver (v0.5.9 新增)
+
+| 文件 | 说明 |
+|------|------|
+| `encode_server.py` | Encode 端服务器 |
+| `encode_receiver.py` | Encode 端接收器 |
+| `decode_schedule_batch_mixin.py` | Decode 端调度批次 Mixin |
+
+## 16. 下一步
 
 - **15**: sgl-kernel 架构
 - **16**: Attention kernel 实现

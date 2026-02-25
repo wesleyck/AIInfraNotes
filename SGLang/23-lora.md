@@ -1,5 +1,9 @@
 # SGLang LoRA 适配器详解
 
+> **默认场景**: Qwen3.5 混合架构模型（Full Attention + Linear Attention/GatedDeltaNet + MoE + MTP）
+>
+> **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存 + EPLB + MTP + 线性注意力
+
 ## 1. 概览
 
 ### 1.1 LoRA 原理
@@ -464,18 +468,49 @@ flowchart LR
 
 完整的后端注册表（`lora/backend/lora_registry.py`）：
 
+v0.5.9 将后端注册改为 **装饰器模式**，通过 `@register_lora_backend(name)` 注册工厂函数：
+
 ```python
-# lora_registry.py L18-50
-LORA_SUPPORTED_BACKENDS = {
-    'triton':       -> TritonLoRABackend,       # 默认，Triton SGEMM
-    'csgmv':        -> ChunkedSgmvLoRABackend,  # 分块 SGMV
-    'torch_native': -> TorchNativeLoRABackend,  # 纯 PyTorch (注意: 不是 'torch')
-    'ascend':       -> AscendLoRABackend,       # 华为 NPU
-    'flashinfer':   -> raise ValueError(...)    # 已废弃，直接抛出异常
-}
+# lora/backend/lora_registry.py
+LORA_SUPPORTED_BACKENDS = {}
+
+def register_lora_backend(name):
+    def decorator(fn):
+        LORA_SUPPORTED_BACKENDS[name] = fn
+        return fn
+    return decorator
+
+@register_lora_backend("triton")
+def create_triton_backend():
+    from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
+    return TritonLoRABackend
+
+@register_lora_backend("csgmv")
+def create_triton_csgmv_backend():
+    from sglang.srt.lora.backend.chunked_backend import ChunkedSgmvLoRABackend
+    return ChunkedSgmvLoRABackend
+
+@register_lora_backend("ascend")
+def create_ascend_backend():
+    from sglang.srt.lora.backend.ascend_backend import AscendLoRABackend
+    return AscendLoRABackend
+
+@register_lora_backend("torch_native")
+def create_torch_native_backend():
+    from sglang.srt.lora.backend.torch_backend import TorchNativeLoRABackend
+    return TorchNativeLoRABackend
+
+@register_lora_backend("flashinfer")
+def create_flashinfer_backend():
+    raise ValueError("FlashInfer LoRA backend has been deprecated, ...")
 ```
 
-> **flashinfer 后端已废弃**: 指定 `--lora-backend flashinfer` 会直接抛出 `ValueError("FlashInfer LoRA backend has been deprecated, please use 'triton' instead.")`，引导用户迁移到 `triton` 后端。
+这种设计的优势：
+- **延迟导入**: 工厂函数内部才 import 具体后端类，避免未安装依赖时的导入错误
+- **可扩展**: 第三方可通过 `@register_lora_backend("custom")` 注册自定义后端
+- **统一入口**: `get_backend_from_name(name)` 查找注册表并调用工厂函数
+
+> **flashinfer 后端已废弃**: 指定 `--lora-backend flashinfer` 会直接抛出 `ValueError`，引导用户迁移到 `triton` 后端。
 
 ### 7.2 Segment GEMM
 
@@ -701,3 +736,136 @@ sequenceDiagram
     TM->>Registry: release(lora_id)
     TM-->>Client: 响应
 ```
+
+---
+
+## 12. LoRA Overlap Loader（v0.5.9 新增）
+
+**文件**: `srt/lora/lora_overlap_loader.py`
+
+LoRA Overlap Loader 实现了 LoRA 权重的**异步重叠加载**机制：在模型推理的同时，利用独立的 CUDA Stream 异步加载下一个 LoRA 权重到 GPU 内存池，减少权重切换的延迟。
+
+### 12.1 核心设计
+
+```mermaid
+flowchart TD
+    A["Scheduler 检测到<br/>下一批需要新 LoRA"] --> B["try_overlap_load_lora(lora_id)"]
+    B --> C["_check_overlap_load_status()"]
+    C --> D{"状态?"}
+    D -->|"NOT_LOADED"| E["_try_start_overlap_load()"]
+    D -->|"LOADING"| F["返回 False<br/>(仍在加载中)"]
+    D -->|"LOADED"| G["wait_event + 返回 True<br/>(加载完成)"]
+    E --> H{"内存池有空间?"}
+    H -->|"是"| I["在 load_stream 上<br/>异步 fetch_new_loras"]
+    H -->|"否"| J["返回 False<br/>(无法加载)"]
+    I --> K["record CudaEvent"]
+    K --> L["返回 False<br/>(开始加载)"]
+```
+
+### 12.2 关键实现
+
+```python
+class LoRAOverlapLoader:
+    def __init__(self, lora_manager):
+        self.lora_manager = lora_manager
+        self.load_stream = device_module.Stream()          # 独立 CUDA Stream
+        self.lora_to_overlap_load_event: Dict[str, CudaEvent] = {}  # 追踪异步加载事件
+
+    def try_overlap_load_lora(self, lora_id, running_loras) -> bool:
+        """检查并尝试异步加载 LoRA，返回是否已加载完成"""
+        status = self._check_overlap_load_status(lora_id)
+        if status == LoRAOverlapLoadStatus.LOADING:
+            return False                    # 仍在加载
+        elif status == LoRAOverlapLoadStatus.NOT_LOADED:
+            self._try_start_overlap_load(lora_id, running_loras)
+            return False                    # 刚开始加载
+        else:  # LOADED
+            return True                     # 加载完成
+```
+
+### 12.3 三阶段状态机
+
+```python
+class LoRAOverlapLoadStatus(Enum):
+    LOADED = auto()      # 加载完成，可以使用
+    LOADING = auto()     # 正在异步加载中
+    NOT_LOADED = auto()  # 尚未开始加载
+```
+
+状态转换通过 `CudaEvent.query()` 非阻塞检查：
+- `NOT_LOADED` → 调用 `_try_start_overlap_load()` → `LOADING`
+- `LOADING` → `event.query()` 返回 True → `LOADED`（同时 `current_stream.wait_event(event)` 确保同步）
+
+### 12.4 与 LoRAManager 的集成
+
+`LoRAManager` 通过 `enable_lora_overlap_loading` 参数控制是否启用重叠加载：
+
+```python
+# lora_manager.py
+self.enable_lora_overlap_loading = server_args.enable_lora_overlap_loading
+
+# 启用时，LoRA 权重在 CPU 上 pin memory 以加速 H2D 传输
+if self.enable_lora_overlap_loading:
+    lora_adapter.pin_weights_in_cpu()
+```
+
+---
+
+## 13. v0.5.9 Backend 目录扩展
+
+**文件**: `srt/lora/backend/`
+
+v0.5.9 对 backend 目录进行了重构，将后端注册逻辑独立为 `lora_registry.py`：
+
+| 文件 | 说明 |
+|------|------|
+| `base_backend.py` | `BaseLoRABackend` 抽象基类 |
+| `triton_backend.py` | Triton SGEMM 后端 (默认) |
+| `chunked_backend.py` | Chunked SGMV 后端 |
+| `torch_backend.py` | 纯 PyTorch fallback |
+| `ascend_backend.py` | 华为 NPU 后端 |
+| `lora_registry.py` | 后端注册表 + 工厂函数 (v0.5.9 重构) |
+
+`lora_registry.py` 的装饰器注册模式使得添加新后端只需一个 `@register_lora_backend("name")` 装饰器，无需修改任何已有代码。
+
+---
+
+## 14. v0.5.9 管理组件更新
+
+### 14.1 eviction_policy.py 重构
+
+**文件**: `srt/lora/eviction_policy.py`
+
+v0.5.9 将驱逐策略从 `mem_pool.py` 中独立为单独模块，采用策略模式：
+
+```python
+class EvictionPolicy(ABC):
+    @abstractmethod
+    def mark_used(self, uid: Optional[str]) -> None: ...
+    @abstractmethod
+    def select_victim(self, candidates: Set[Optional[str]]) -> Optional[str]: ...
+    @abstractmethod
+    def remove(self, uid: Optional[str]) -> None: ...
+
+class LRUEvictionPolicy(EvictionPolicy):
+    """基于 OrderedDict 的 LRU，追踪 access_order + 统计 eviction_count"""
+
+class FIFOEvictionPolicy(EvictionPolicy):
+    """基于 OrderedDict 的 FIFO，仅追踪 insertion_order"""
+
+def get_eviction_policy(policy_name: str) -> EvictionPolicy:
+    """工厂函数: 'lru' → LRUEvictionPolicy, 'fifo' → FIFOEvictionPolicy"""
+```
+
+两种策略都处理了 `None` uid（基础模型）作为驱逐候选的边界情况。
+
+### 14.2 lora_manager.py 更新
+
+- 新增 `enable_lora_overlap_loading` 属性，控制重叠加载
+- 新增 `validate_lora_batch()` 方法，验证 LoRA ID 集合是否可调度（考虑 pinned adapter 占用）
+- 新增 `fetch_new_loras()` 方法，供 `LoRAOverlapLoader` 调用
+- `load_lora_weights()` 中新增 `pin_weights_in_cpu()` 调用（重叠加载模式下）
+
+### 14.3 lora_registry.py 更新
+
+`LoRARef` 新增 `__post_init__` 验证和 `__str__` 格式化方法，增强了数据完整性检查。

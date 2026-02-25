@@ -1,14 +1,14 @@
 # SGLang 调度系统详解
 
-> **默认场景**: Qwen/Qwen3-VL-235B-A22B-Thinking 多模态模型
+> **默认场景**: Qwen3.5 混合架构模型（Full Attention + Linear Attention/GatedDeltaNet + MoE + MTP）
 >
-> **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存
+> **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存 + EPLB + MTP + 线性注意力
 >
 > 调度官方Blog: https://lmsys.org/blog/2024-12-04-sglang-v0-4/ 
 
 ## 1. Scheduler 概览
 
-**文件**: `srt/managers/scheduler.py:234`
+**文件**: `srt/managers/scheduler.py:253`
 
 Scheduler 是 SGLang 的核心调度器，运行在独立的子进程中，负责：
 - 接收 tokenized 请求
@@ -27,9 +27,10 @@ class Scheduler(
     SchedulerDisaggregationDecodeMixin, # PD 分离 - Decode 端
     SchedulerDisaggregationPrefillMixin,# PD 分离 - Prefill 端
     SchedulerMultiplexMixin,            # PD 复用
-    SchedulerRuntimeCheckerMixin,       # 运行时检查
+    SchedulerRuntimeCheckerMixin,       # 运行时检查 (v0.5.9 新增)
     SchedulerPPMixin,                   # Pipeline Parallel
     SchedulerDPAttnMixin,               # DP Attention
+    SchedulerDllmMixin,                 # dLLM 支持 (v0.5.9 新增)
 ):
 ```
 
@@ -110,7 +111,7 @@ flowchart LR
 
 ### 2.2 四阶段模型
 
-**文件**: `scheduler.py:1099`
+**文件**: `scheduler.py:1135`
 
 `event_loop_overlap` 的每次迭代可分为四个阶段：
 
@@ -125,8 +126,8 @@ flowchart LR
 
 在 `forward_stream` 上的 GPU 操作开始前，都有一个显式同步点 `forward_stream.wait_stream(default_stream)`，确保 `default_stream` 上的 CPU 工作已完成：
 
-- **同步点 A** (`scheduler.py:2209`): Compute 开始前，等待 Pre Schedule 完成
-- **同步点 B** (`scheduler.py:2312`): Sample 开始前，等待 Post Schedule 完成
+- **同步点 A** (`scheduler.py:2310`): Compute 开始前，等待 Pre Schedule 完成
+- **同步点 B** (`scheduler.py:2415`): Sample 开始前，等待 Post Schedule 完成
 
 这两个同步点决定了精确的 overlap 关系。以下用 ASCII 时序图展示**连续三次迭代**的 CPU/GPU 重叠：
 
@@ -197,7 +198,7 @@ CUDA Stream 本质上是一个**提交给 GPU 的操作序列**（命令队列�
 SGLang 在 `init_overlap()` 中创建了三条 stream：
 
 ```python
-# scheduler.py:979-989
+# scheduler.py:1010-1020
 self.default_stream = self.device_module.current_stream()  # 默认 CUDA stream (stream 0)
 self.forward_stream = self.device_module.Stream()           # 独立 stream，用于模型前向推理
 self.copy_stream    = self.device_module.Stream()           # 独立 stream，用于异步数据拷贝
@@ -229,7 +230,7 @@ SGLang 的两个同步点 `forward_stream.wait_stream(default_stream)` 是 **GPU
 | `stream.synchronize()` | **CPU** | CPU 等该 stream 完成 | ✅ 破坏 |
 | `torch.cuda.Event` + `record/wait` | **GPU** | GPU 侧事件同步，**CPU 不等** | ❌ 不破坏 |
 
-具体地，`scheduler.py:2209` 的 `self.forward_stream.wait_stream(self.default_stream)` 执行时：
+具体地，`scheduler.py:2310` 的 `self.forward_stream.wait_stream(self.default_stream)` 执行时：
 1. **CPU 执行这行后立刻返回**（只是在 forward_stream 的命令队列里插入了一个"等待 default_stream"的屏障）
 2. **GPU 的 forward_stream** 会等到 default_stream 上的操作完成后，才开始执行 `forward_batch_generation` 的 kernel
 
@@ -365,7 +366,7 @@ sequenceDiagram
 ### 2.7 result_queue 机制
 
 ```python
-# scheduler.py:1101
+# scheduler.py:1137
 self.result_queue: Deque[Tuple[ScheduleBatch, BatchResult]] = deque()
 
 # 延迟处理: 当前批次的结果放入队列，下一轮循环处理
@@ -403,7 +404,7 @@ Round N:
 使用**负数索引**作为占位符，表示"这个 token ID 将来会由第 X 个请求的采样结果填充"：
 
 ```python
-# scheduler.py:2225 - 在 overlap 模式下
+# scheduler.py:2330 - 在 overlap 模式下
 future_indices_or_next_token_ids = -future_indices.indices
 # 例如: tensor([-1, -2, -3, -4]) 而不是实际的 token IDs
 ```
@@ -540,7 +541,7 @@ flowchart TD
 
     T1 --> Handle["handle_generate_request()"]
     Handle --> H1["创建 Req 对象"]
-    H1 --> H2["处理多模态输入 (Qwen3-VL)"]
+    H1 --> H2["处理多模态输入 (Qwen3.5)"]
     H2 --> H3["验证输入长度"]
     H3 --> H4["_add_request_to_queue()"]
 
@@ -555,7 +556,7 @@ flowchart TD
 
 ### 3.2 handle_generate_request 详解
 
-**文件**: `scheduler.py:1409`
+**文件**: `scheduler.py:1510`
 
 ```python
 def handle_generate_request(self, recv_req: TokenizedGenerateReqInput):
@@ -569,7 +570,7 @@ def handle_generate_request(self, recv_req: TokenizedGenerateReqInput):
         disagg_mode=self.disaggregation_mode,
     )
 
-    # 2. 处理多模态输入 (Qwen3-VL)
+    # 2. 处理多模态输入 (Qwen3.5)
     if recv_req.mm_inputs is not None:
         image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
         # 扩展图像 token
@@ -613,7 +614,7 @@ def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
 
 ### 4.1 get_next_batch_to_run
 
-**文件**: `scheduler.py:1778`
+**文件**: `scheduler.py:1875`
 
 这是调度的统一入口，决定下一个要运行的batch。
 
@@ -643,7 +644,7 @@ flowchart TD
 
 ### 4.2 get_new_batch_prefill
 
-**文件**: `scheduler.py:1861`
+**文件**: `scheduler.py:1960`
 
 从 waiting_queue 创建 prefill batch
 
@@ -698,7 +699,7 @@ def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
 
 ### 4.3 update_running_batch
 
-**文件**: `scheduler.py:2073`
+**文件**: `scheduler.py:2170`
 
 更新正在 decode 的批次。
 
@@ -792,7 +793,7 @@ def calc_priority(self, waiting_queue: List[Req]) -> bool:
 
 ## 7. run_batch 执行流程
 
-**文件**: `scheduler.py:2162`
+**文件**: `scheduler.py:2260`
 
 ```mermaid
 flowchart TD
@@ -843,7 +844,7 @@ flowchart LR
 ### 8.2 Prefill 端队列
 
 ```python
-# scheduler.py:943
+# scheduler.py:975
 self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(...)
 self.disagg_prefill_inflight_queue: List[Req] = []  # 正在传输 KV 的请求
 ```
@@ -851,7 +852,7 @@ self.disagg_prefill_inflight_queue: List[Req] = []  # 正在传输 KV 的请求
 ### 8.3 Decode 端队列
 
 ```python
-# scheduler.py:890
+# scheduler.py:920
 self.disagg_decode_transfer_queue = DecodeTransferQueue(...)  # 等待 KV 传输
 self.disagg_decode_prealloc_queue = DecodePreallocQueue(...)  # 预分配 KV
 ```
@@ -860,7 +861,7 @@ self.disagg_decode_prealloc_queue = DecodePreallocQueue(...)  # 预分配 KV
 
 > **完整配置参数表**: 见 **§19**
 
-**文件**: `scheduler.py:2073` - `update_running_batch()`
+**文件**: `scheduler.py:2170` - `update_running_batch()`
 
 当 decode 阶段 KV Cache 不足时，会触发 retraction (请求回退)。
 
@@ -889,7 +890,7 @@ flowchart TD
 
 ### 9.3 new_token_ratio 动态调整
 
-**文件**: `scheduler.py:803-815, 2141-2144`
+**文件**: `scheduler.py:835-847, 2240-2243`
 
 #### 核心作用
 
@@ -1122,7 +1123,7 @@ adder = PrefillAdder(
 
 ## 12. Grammar Queue 机制
 
-**文件**: `scheduler.py:2347`
+**文件**: `scheduler.py:2450`
 
 用于异步初始化 grammar (如 JSON Schema)。
 
@@ -1177,7 +1178,7 @@ self.preempt_list.extend(preemptible_reqs)
 
 ## 14. LoRA 批次管理
 
-**文件**: `scheduler.py:1932`
+**文件**: `scheduler.py:2030`
 
 ### 14.1 LoRA Slot 检查
 
@@ -1198,7 +1199,7 @@ for req in self.waiting_queue:
 
 ## 15. Embedding 请求处理
 
-**文件**: `scheduler.py:1711`
+**文件**: `scheduler.py:1810`
 
 Embedding 请求与 generation 请求的区别：
 
@@ -1308,7 +1309,7 @@ logger.error(f"Grammar accept_token failed for req {req.rid}")
 
 ## 20. is_disable_overlap_for_batch 条件
 
-**文件**: `scheduler.py:1152-1174`
+**文件**: `scheduler.py:1190-1212`
 
 ```python
 def is_disable_overlap_for_batch(self, batch: ScheduleBatch) -> bool:
@@ -1510,7 +1511,7 @@ def check_finished(self, new_accepted_len: int = 1):
 
 ## 23. launch_batch_sample_if_needed
 
-**文件**: `scheduler.py:2303-2317`
+**文件**: `scheduler.py:2405-2420`
 
 ```python
 def launch_batch_sample_if_needed(self, batch_result: GenerationBatchResult):
@@ -1531,7 +1532,7 @@ def launch_batch_sample_if_needed(self, batch_result: GenerationBatchResult):
 
 ## 24. _prefetch_kvcache
 
-**文件**: `scheduler.py:1598-1619`
+**文件**: `scheduler.py:1700-1720`
 
 ```python
 def _prefetch_kvcache(self, req: Req):
@@ -1662,7 +1663,44 @@ for mb_id in range(pp_loop_size):
 
 有专门的 `event_loop_pp_disagg_prefill()` 和 `event_loop_pp_disagg_decode()` 处理 KV 传输共识，支持 PP + PD 分离的组合部署。
 
-## 28. 下一步
+## 28. PrefillDelayer (v0.5.9 新增)
+
+**文件**: `srt/managers/prefill_delayer.py` (256行)
+
+在 DP Attention 场景下，多个 DP worker 的 prefill 时机需要全局协商。PrefillDelayer 通过状态机机制实现延迟协商：
+
+### 28.1 核心机制
+
+1. **状态机**: 每个 DP worker 维护一个状态（IDLE → WAITING → READY → RUNNING），通过 ZMQ 广播状态变化
+2. **全局协商**: 所有 DP worker 必须同时进入 READY 状态才能开始 prefill，避免负载不均
+3. **水位线强制允许**: 当 waiting_queue 长度超过阈值时，即使未完成协商也强制允许 prefill，防止饥饿
+
+### 28.2 与调度策略的协作
+
+PrefillDelayer 在 `get_new_batch_prefill()` 之前被调用，决定是否允许本轮创建 prefill 批次。如果 PrefillDelayer 返回 False，则跳过 prefill，直接进入 decode 路径。
+
+## 29. SchedulerRecvSkipper (v0.5.9 新增)
+
+**文件**: `srt/managers/scheduler_recv_skipper.py` (38行)
+
+基于 ForwardMode 的加权计数器，决定是否跳过 `recv_requests()` 调用。在高负载 decode 场景下，频繁的 recv 会增加 CPU 开销，SchedulerRecvSkipper 通过计数器机制减少不必要的 recv 调用。
+
+## 30. SchedulerRuntimeCheckerMixin (v0.5.9 新增)
+
+**文件**: `srt/managers/scheduler_runtime_checker_mixin.py` (364行)
+
+运行时检查 mixin，提供：
+- **Token 使用率监控**: 定期检查 KV Cache 的 token 使用率
+- **Mamba Token 信息**: 对于混合架构模型（如 Qwen3.5），监控 Mamba/线性注意力层的 token 状态
+- **Watchdog**: 检测调度器是否卡死，超时后触发告警
+
+## 31. SchedulerInputBlocker (v0.5.9 新增)
+
+**文件**: `srt/managers/scheduler_input_blocker.py` (106行)
+
+输入阻塞逻辑，在特定条件下阻止新请求进入 waiting_queue。用于流量控制和过载保护。
+
+## 32. 下一步
 
 - **04**: 调度策略深入 (DFS-weight、In-batch prefix caching)
 - **05**: Chunked Prefill 分块预填充
