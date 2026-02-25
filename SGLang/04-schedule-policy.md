@@ -41,7 +41,7 @@ flowchart TB
 
 ## 2. SchedulePolicy 类
 
-**文件**: `schedule_policy.py:80`
+**文件**: `schedule_policy.py:93`
 
 ### 2.1 初始化
 
@@ -245,7 +245,7 @@ flowchart TB
 
 ## 6. PrefillAdder 详解
 
-**文件**: `schedule_policy.py:316`
+**文件**: `schedule_policy.py:372`
 
 PrefillAdder 负责从 waiting_queue 选择请求构建 prefill 批次。
 
@@ -331,7 +331,7 @@ flowchart TB
 
 ### 6.4 _lock_node 与 Hierarchical Cache
 
-#### `_lock_node` (schedule_policy.py:473)
+#### `_lock_node` (schedule_policy.py:619)
 
 `_lock_node` 是一个 **context manager**，用于在 `add_one_req` 期间锁定 RadixCache 节点，防止被缓存驱逐策略淘汰：
 
@@ -339,11 +339,19 @@ flowchart TB
 @contextmanager
 def _lock_node(self, last_node: TreeNode):
     try:
-        self.tree_cache.inc_lock_ref(last_node)  # lock_ref += 1
+        if self.tree_cache.supports_swa() and self.tree_cache.is_tree_cache():
+            swa_uuid_for_lock = self.tree_cache.inc_lock_ref(last_node)
+        else:
+            self.tree_cache.inc_lock_ref(last_node)  # lock_ref += 1
         yield None
     finally:
-        self.tree_cache.dec_lock_ref(last_node)   # lock_ref -= 1
+        if self.tree_cache.supports_swa() and self.tree_cache.is_tree_cache():
+            self.tree_cache.dec_lock_ref(last_node, swa_uuid_for_lock)
+        else:
+            self.tree_cache.dec_lock_ref(last_node)   # lock_ref -= 1
 ```
+
+> **SWA 分支说明**: SWA (Sliding Window Attention) 模型（如 Llama4）的 RadixCache 需要通过 `swa_uuid_for_lock` 维护正确的 lock/unlock 配对，确保 SWA 层和 Full Attention 层的缓存节点能被独立管理。非 SWA 模型（包括 Qwen3.5）走 else 分支，直接操作 `lock_ref` 计数。
 
 **为什么需要锁**: `add_one_req` 分两步检查预算（锁前粗检查 + 锁内精确检查），获取锁后 `rem_total_tokens` 可能已改变（因为 `inc_lock_ref` 会将节点标记为不可驱逐），需要重新检查。
 
@@ -419,7 +427,7 @@ if truncation_align_size is not None:
 
 ## 8. 优先级抢占 (Priority Preemption)
 
-**文件**: `schedule_policy.py:668`
+**文件**: `schedule_policy.py:829`
 
 ### 8.1 preempt_to_schedule 流程
 
@@ -517,16 +525,20 @@ total_tokens = req.extend_input_len + min(
 | 优先处理长输出 | LOF | 避免长请求饥饿 |
 | 禁用缓存 | FCFS | CacheAware 无意义 |
 
-## 13. PrefillDelayer 与调度策略的协作 (v0.5.9 新增)
+## 13. PrefillDelayer 与调度策略的协作
 
-在 DP Attention 场景下，`PrefillDelayer`（`srt/managers/prefill_delayer.py`，256行）在 `get_new_batch_prefill()` 之前介入，通过全局协商机制决定是否允许本轮 prefill。
+在 DP Attention 场景下，`PrefillDelayer`（`srt/managers/prefill_delayer.py`）通过 `PrefillDelayerSinglePassExecutor` 包装后传入 `PrefillAdder`，在 `add_one_req()` 内部进行协商（`schedule_policy.py` L769-774），决定是否允许本轮 prefill。
+
+`SinglePassExecutor` 保证每个 forward pass 只执行一次分布式协商（`all_gather`），即使 `add_one_req` 被 waiting_queue 中的多个请求反复调用。首次调用 `negotiate_should_allow_prefill()` 时执行实际协商并缓存结果，后续调用直接返回缓存值。
 
 ### SWA 模型的调度策略差异
 
-Qwen3.5 包含 SWA (Sliding Window Attention) 层，调度策略需要考虑：
+Llama4、Step3p5 等模型包含 SWA (Sliding Window Attention) 层，调度策略需要考虑：
 - SWA 层的 KV Cache 只保留窗口内的 token，内存分配策略不同
 - `is_hybrid_swa` 标志影响 `alloc_for_extend()` 和 `alloc_for_decode()` 的分配逻辑
 - PrefillAdder 在计算可用内存时需要区分 full attention 层和 SWA 层的内存需求
+
+> **注意**: Qwen3.5 的混合架构是 Full Attention + Linear Attention (GatedDeltaNet)，不使用 SWA。SWA 混合架构适用于 Llama4、Step3p5、GptOss、MiMoV2 等模型。
 
 ## 14. 下一步
 

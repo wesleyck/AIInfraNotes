@@ -171,12 +171,17 @@ class AttentionBackend(ABC):
         """每次 forward 前初始化元数据"""
         pass
 
-    def forward(self, q, k, v, layer, forward_batch, save_kv_cache=True):
-        """主入口，根据 forward_mode 分发到具体方法"""
-        if forward_batch.forward_mode.is_decode():
-            return self.forward_decode(...)
+    # ---- 主入口: 四路分发 (base_attn_backend.py:79-121) ----
+    def forward(self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs):
+        """根据 forward_mode 分发到具体方法"""
+        if forward_batch.forward_mode.is_idle():
+            return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)  # 空 tensor
+        elif forward_batch.forward_mode.is_decode():
+            return self.forward_decode(q, k, v, layer, forward_batch, ...)
+        elif forward_batch.forward_mode.is_mixed() and is_npu():
+            return self.forward_mixed(q, k, v, layer, forward_batch, ...)  # NPU 专用
         else:
-            return self.forward_extend(...)
+            return self.forward_extend(q, k, v, layer, forward_batch, ...)
 
     @abstractmethod
     def forward_decode(self, q, k, v, layer, forward_batch, save_kv_cache=True):
@@ -188,11 +193,31 @@ class AttentionBackend(ABC):
         """Extend/Prefill 阶段 (多 token 处理)"""
         pass
 
-    # CUDA Graph 支持
+    def forward_mixed(self, q, k, v, layer, forward_batch, save_kv_cache=True):
+        """Mixed 模式 (NPU 专用, 混合 decode+extend)"""
+        raise NotImplementedError()
+
+    # ---- CUDA Graph 支持 ----
     def init_cuda_graph_state(self, max_bs, max_num_tokens): ...
     def init_forward_metadata_capture_cuda_graph(...): ...
     def init_forward_metadata_replay_cuda_graph(...): ...
     def get_cuda_graph_seq_len_fill_value(self): ...
+
+    # ---- 投机解码支持 (base_attn_backend.py:60-77) ----
+    def get_verify_buffers_to_fill_after_draft(self):
+        """返回 verify 阶段需要在 draft 后填充的 buffer (tree mask, positions)"""
+        return [None, None]
+
+    def update_verify_buffers_to_fill_after_draft(self, spec_info, cuda_graph_bs):
+        """更新 verify buffer (重新计算依赖 tree mask 和 positions 的元数据)"""
+        raise NotImplementedError()
+
+    # ---- 其他可选方法 ----
+    def support_triton(self): return True  # 是否支持 Triton kernel
+
+    def get_indexer_metadata(self, layer_id, forward_batch):
+        """获取 NSA indexer 元数据, None 表示不支持 (base_attn_backend.py:163-169)"""
+        return None
 ```
 
 ## 3. 后端注册机制
@@ -444,6 +469,7 @@ FlashInfer 是 SGLang 默认的 Attention 后端，由 [flashinfer-ai](https://g
 if (
     "Qwen2ForCausalLM" in model_runner.model_config.hf_config.architectures
     or "Qwen3ForCausalLM" in model_runner.model_config.hf_config.architectures
+    or "MiMoForCausalLM" in model_runner.model_config.hf_config.architectures
     or "Qwen3VLForConditionalGeneration" in ...
     or "Qwen3VLMoeForConditionalGeneration" in ...
 ):
@@ -451,7 +477,7 @@ if (
 ```
 
 > [!NOTE]
-> Qwen3 系列模型（包括 Qwen3.5 235B）由于其 attention head 配置和序列长度，需要更大的 FlashInfer workspace buffer。SGLang 自动检测并设置为 512MB。
+> Qwen3 系列模型（包括 Qwen3.5-397B-A17B）由于其 attention head 配置和序列长度，需要更大的 FlashInfer workspace buffer。SGLang 自动检测并设置为 512MB。
 
 ### 5.2 核心架构
 
@@ -752,19 +778,27 @@ Paged (分页存储, page_size=1):
 #### 5.9.3 代码中的选择逻辑
 
 ```python
-# flashinfer_backend.py init_forward_metadata()
+# flashinfer_backend.py init_forward_metadata() (简化, 实际逻辑在 L468-498)
 if forward_batch.forward_mode.is_decode():
     # Decode 总是使用 Paged
     self.forward_metadata = DecodeMetadata(decode_wrappers=...)
 
 elif forward_batch.forward_mode.is_extend():
-    extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
-    
-    use_ragged = (
-        extend_no_prefix and              # 条件 1: 无前缀命中 (所有 KV 都是新计算的)
-        not is_in_piecewise_cuda_graph()   # 条件 2: 不在 Piecewise CUDA Graph 中
-    )
+    # use_ragged 的决策路径 (flashinfer_backend.py:471-483):
+    if self.is_multimodal or self.multi_item_scoring_delimiter is not None:
+        # 多模态/多项评分: 强制 Paged (ragged 不支持特殊参数)
+        use_ragged = False
+        extend_no_prefix = False
+    else:
+        # 通用路径:
+        use_ragged = not self.enable_deterministic  # 确定性模式禁用 ragged
+        extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
 
+    # use_ragged 传入 IndicesUpdater, 由其在 call_begin_forward() 中决定
+    # 实际使用 ragged wrapper 还是 paged wrapper
+    self.indices_updater_prefill.update(
+        ..., use_ragged=use_ragged, ...
+    )
     self.forward_metadata = PrefillMetadata(
         prefill_wrappers=...,
         use_ragged=use_ragged,
@@ -772,7 +806,12 @@ elif forward_batch.forward_mode.is_extend():
     )
 ```
 
-> **为什么 Piecewise CUDA Graph 中不能用 Ragged？** CUDA Graph 要求所有 kernel 的输入 buffer 地址在捕获时固定。Ragged wrapper 直接使用当前 forward 的 `k`, `v` tensor（每次 forward 可能不同地址），而 Paged wrapper 使用预分配的 KVCache buffer（地址固定）+ `kv_indices`（可更新的 GPU tensor，地址固定但内容可变）。因此在 CUDA Graph 模式下只能使用 Paged wrapper。
+> **use_ragged 被禁用的三种情况**:
+> 1. **多模态模型** (`is_multimodal`): Ragged wrapper 不支持多模态所需的特殊参数
+> 2. **多项评分** (`multi_item_scoring_delimiter`): 需要 Paged wrapper 的自定义 mask 控制
+> 3. **确定性推理** (`enable_deterministic`): Ragged wrapper 的计算路径不保证确定性
+>
+> 注意：之前文档中提到的 "不在 Piecewise CUDA Graph 中" 条件实际上不在 `init_forward_metadata()` 中判断，而是由 `RadixAttention.forward()` 在 piecewise 上下文中直接走 `torch.ops.sglang.unified_attention_with_output` 路径，绕过了 Backend 的 `forward()` 方法。
 
 ---
 
@@ -797,10 +836,14 @@ elif forward_batch.forward_mode.is_extend():
 
 | 后端 | 返回值 | 原因 |
 |------|-------|------|
-| FlashInfer | **1** | kernel 内部有 `seq_len > 0` 检查 |
-| Triton | 0 | 可以处理 seq_len=0 |
-| FlashAttention | 0 | 可以处理 seq_len=0 |
-| MLA 后端 | 1 | 继承自 FlashInfer |
+| FlashInfer | **1** | kernel 内部有 `seq_len > 0` 检查 (`flashinfer_backend.py:745-746`) |
+| Triton | **1** | 与 FlashInfer 保持一致 (`triton_backend.py:783`) |
+| FlashAttention | **1** | 与 FlashInfer 保持一致 (`flashattention_backend.py:2192`) |
+| FlashMLA | **1** | 继承自 FlashInfer (`flashmla_backend.py:343-344`) |
+| CUTLASS MLA | **1** | 继承自 FlashInfer (`cutlass_mla_backend.py:223-224`) |
+| NSA | **1** | 继承自 FlashInfer (`nsa_backend.py:2017-2019`) |
+
+> **所有后端统一返回 1**。这是因为 CUDA Graph 捕获时 padding 请求的 `seq_len` 必须 > 0，否则某些 kernel 会跳过计算导致 CUDA Graph 捕获不完整。
 
 ```python
 # cuda_graph_runner.py 使用此值填充 padding 请求
@@ -842,14 +885,27 @@ class FlashAttentionBackend(AttentionBackend):
 
 @dataclass
 class FlashAttentionMetadata:
-    query_start_loc: torch.Tensor      # [bs+1], query 累积位置
-    max_query_len: int
-    seq_lens_int32: torch.Tensor       # [bs], 序列长度
-    page_table: torch.Tensor           # [bs, max_pages], 页表
-    max_seq_len_k: int
+    # 基础字段 (flashattention_backend.py:39-86)
+    cache_seqlens_int32: torch.Tensor  # [bs], KV 序列长度
+    max_seq_len_q: int = 1             # query 最大序列长度
+    max_seq_len_k: int = 0             # key 最大序列长度
+    cu_seqlens_q: torch.Tensor = None  # [bs+1], query 累积序列长度
+    cu_seqlens_k: torch.Tensor = None  # [bs+1], key 累积序列长度
+    window_size: tuple = (-1, -1)      # 滑动窗口大小 (Gemma 等模型)
+    page_table: torch.Tensor = None    # [bs, max_pages], KV Cache 页表
+    swa_page_table: torch.Tensor = None  # SWA 专用页表
+
+    # Encoder 相关字段 (encoder-decoder 模型)
+    encoder_cu_seqlens_k: torch.Tensor = None
+    encoder_max_seq_len_k: int = 0
+    encoder_lens_int32: torch.Tensor = None
+    encoder_page_table: torch.Tensor = None
 
     # Local Attention 支持 (chunked prefill)
     local_attn_metadata: Optional[LocalAttentionMetadata] = None
+
+    # 投机解码 SWA topk>1 支持
+    swa_spec_metadata: Optional[FlashAttentionMetadata] = None
 ```
 
 ### 7.2 Local Attention (Chunked Prefill)
@@ -926,10 +982,13 @@ Triton 后端是 SGLang 自己用 [Triton](https://triton-lang.org/) 语言实�
 
 ```
 sglang/srt/layers/attention/triton_ops/
-├── decode_attention.py      # Decode kernel (decode_attention_fwd)
-├── extend_attention.py      # Extend kernel (extend_attention_fwd, extend_attention_fwd_unified)
-├── prefill_attention.py     # Prefill kernel (context_attention_fwd)
-└── merge_state.py           # Log-Sum-Exp 合并 (merge_state)
+├── decode_attention.py           # Decode kernel (decode_attention_fwd)
+├── extend_attention.py           # Extend kernel (extend_attention_fwd, extend_attention_fwd_unified)
+├── prefill_attention.py          # Prefill kernel (context_attention_fwd)
+├── merge_state.py                # Log-Sum-Exp 合并 (merge_state)
+├── double_sparsity_attention.py  # Double Sparsity Attention kernel
+├── rocm_mla_decode_rope.py       # AMD ROCm MLA Decode RoPE kernel
+└── trtllm_fp8_kv_kernel.py       # TRT-LLM FP8 KV Cache kernel
 ```
 
 ### 8.2 核心架构
@@ -937,12 +996,21 @@ sglang/srt/layers/attention/triton_ops/
 ```python
 class TritonAttnBackend(AttentionBackend):
     def __init__(self, model_runner, skip_prefill=False):
-        # KV split 优化参数
-        self.num_kv_splits = get_int_env_var("SGLANG_TRITON_ATTENTION_NUM_KV_SPLITS", 8)
-        self.split_tile_size = get_int_env_var("SGLANG_TRITON_ATTENTION_SPLIT_TILE_SIZE", None)
-        
-        # 确定性推理模式
-        self.enable_deterministic = model_runner.server_args.triton_attention_reduce_in_fp32
+        # KV split 优化参数 (triton_backend.py:108-111)
+        self.static_kv_splits = get_bool_env_var(
+            "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"  # 布尔值: 是否使用静态 KV 分片
+        )
+        self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits  # 默认 8
+
+        # 确定性推理模式 (triton_backend.py:119-121)
+        self.enable_deterministic = model_runner.server_args.enable_deterministic_inference
+
+        # 确定性模式下的特殊配置 (triton_backend.py:124-130)
+        if self.enable_deterministic:
+            self.split_tile_size = get_int_env_var(
+                "SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE", 256  # 确定性模式默认 256
+            )
+            self.static_kv_splits = False  # 确定性模式禁用 static splits
 
         # Split attention 输出 buffer
         self.attn_logits = None  # [bs, num_splits, heads, head_dim]
@@ -959,6 +1027,11 @@ class ForwardMetadata:
     qo_indptr: torch.Tensor          # Query 累积指针
     custom_mask: torch.Tensor        # 自定义 mask (投机解码用)
     mask_indptr: torch.Tensor        # mask 累积指针
+    # Sliding Window 支持 (triton_backend.py:48-52)
+    window_kv_indptr: torch.Tensor   # 窗口内 KV 累积指针
+    window_kv_indices: torch.Tensor  # 窗口内 KV 实际位置
+    window_num_kv_splits: torch.Tensor  # 窗口内 KV 分片数
+    window_kv_offsets: torch.Tensor  # 窗口内 KV 偏移量
 ```
 
 ### 8.3 Split Attention (num_kv_splits) 机制详解
@@ -1029,7 +1102,11 @@ def decode_attention_fwd(q, k_cache, v_cache, o, kv_indptr, kv_indices, num_kv_s
 当需要**确定性输出**（如测试、对比）时，启用确定性模式：
 
 ```bash
-# 启动时指定
+# 启动时指定 (通用参数，影响所有后端)
+python -m sglang.launch_server ... \
+    --enable-deterministic-inference
+
+# Triton 后端还可单独配置 FP32 reduce (仅影响 Triton)
 python -m sglang.launch_server ... \
     --attention-backend triton \
     --triton-attention-reduce-in-fp32
@@ -1037,10 +1114,10 @@ python -m sglang.launch_server ... \
 
 **确定性模式的变化**:
 
-| 配置项 | 正常模式 | 确定性模式 |
+| 配置项 | 正常模式 | 确定性模式 (`--enable-deterministic-inference`) |
 |--------|---------|-----------|
-| Split 策略 | 动态 (根据 seq_len) | 固定 |
-| Reduce 精度 | FP16/BF16 | FP32 |
+| Split 策略 | 动态 (根据 seq_len) | 固定 tile size (默认 256, 可通过 `SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE` 调整) |
+| static_kv_splits | 可启用 | 强制禁用 |
 | Kernel 版本 | 2-stage | 1-stage unified |
 | 性能 | 最优 | 略慢 (10-20%) |
 
@@ -1127,53 +1204,61 @@ def forward_extend(self, q, k, v, layer, forward_batch, save_kv_cache=True):
 
 ```mermaid
 flowchart TB
-    Start["后端选择"] --> Platform{"平台检测"}
+    Start["后端选择<br/>(server_args.py)"] --> SPEC{"特殊模型?"}
 
-    Platform -->|"NVIDIA SM100+"| TRTLLM["trtllm_mha"]
-    Platform -->|"NVIDIA SM90"| FA3["fa3"]
-    Platform -->|"NVIDIA SM80+"| NVIDIA{"模型类型?"}
-    Platform -->|"AMD HIP"| AITER["aiter"]
-    Platform -->|"Intel XPU"| INTEL_XPU["intel_xpu"]
-    Platform -->|"Intel CPU"| INTEL_AMX["intel_amx"]
-    Platform -->|"华为 NPU"| ASCEND["ascend"]
-    Platform -->|其他| TRITON["triton"]
+    SPEC -->|"NSA 模型<br/>(DeepSeek 3.2)"| NSA["nsa"]
+    SPEC -->|"Llama4 / GptOss /<br/>Gemma / Gemma3n"| SPECIAL{"平台?"}
+    SPEC -->|"通用模型"| ARCH{"MLA vs MHA?"}
 
-    NVIDIA -->|"MLA 模型"| FLASHINFER_MLA["flashinfer_mla"]
-    NVIDIA -->|"NSA 模型"| NSA["nsa"]
-    NVIDIA -->|"通用"| FLASHINFER["flashinfer"]
+    SPECIAL -->|"SM100+"| TRTLLM_S["trtllm_mha"]
+    SPECIAL -->|"SM90"| FA3_S["fa3"]
+    SPECIAL -->|"AMD HIP"| AITER_S["aiter"]
+    SPECIAL -->|"Intel XPU"| INTEL_S["intel_xpu"]
+    SPECIAL -->|"其他"| TRITON_S["triton"]
 
-    style FLASHINFER fill:#90EE90
+    ARCH -->|"MHA 架构"| MHA{"平台?"}
+    ARCH -->|"MLA 架构"| MLA{"平台?"}
+
+    MHA -->|"Hopper (SM90)<br/>+ CUDA 12.3"| FA3["fa3"]
+    MHA -->|"SM100+"| TRTLLM["trtllm_mha"]
+    MHA -->|"AMD HIP"| AITER["aiter"]
+    MHA -->|"其他 NVIDIA"| FI["flashinfer<br/>(或 triton fallback)"]
+
+    MLA -->|"Hopper (SM90)<br/>+ CUDA 12.3"| FA3_MLA["fa3"]
+    MLA -->|"SM100+"| FI_MLA["flashinfer"]
+    MLA -->|"AMD HIP"| AITER_MLA["aiter / triton<br/>(取决于 head_num)"]
+    MLA -->|"其他"| TRITON_MLA["triton"]
+
+    style FI fill:#90EE90
     style FA3 fill:#87CEEB
-    style TRITON fill:#FFB6C1
+    style TRITON_S fill:#FFB6C1
 ```
 
-**详细路由图**:
+**详细路由规则** (参考 `server_args.py:1795-1833`):
 
-```mermaid
-flowchart TD
-    subgraph platform["平台检测"]
-        P1["NVIDIA SM100+ -> trtllm_mha"]
-        P2["NVIDIA SM90 -> fa3"]
-        P3["AMD HIP -> aiter"]
-        P4["Intel XPU -> intel_xpu"]
-        P5["Intel CPU -> intel_amx"]
-        P6["华为 NPU -> ascend"]
-        P7["其他 -> triton"]
-    end
+```
+1. 特殊模型优先匹配 (按 model_arch 分支):
+   • NSA 模型 (DeepSeek 3.2 等)     → nsa
+   • Llama4 / GptOss / Gemma / Gemma3n → 按平台: SM100+ → trtllm_mha, SM90 → fa3, HIP → aiter, 其他 → triton
+   • Intel CPU                        → intel_amx
+   • 华为 NPU                         → ascend
 
-    subgraph model["模型特化"]
-        M1["MLA 模型 (DeepSeek-V2/3) -> flashinfer_mla / trtllm_mla / flashmla"]
-        M2["NSA 模型 -> nsa"]
-        M3["Llama4/Falcon-H -> fa3 / triton (不支持 flashinfer)"]
-        M4["Encoder-Decoder -> flashinfer (不支持 triton)"]
-        M5["通用 -> flashinfer"]
-    end
+2. 通用模型 (MHA 架构):
+   • Hopper + CUDA 12.3               → fa3 (flashinfer 0.6.1 性能回退, 临时方案)
+   • SM100+ (无投机/topk=1)           → trtllm_mha
+   • AMD HIP                          → aiter
+   • 其他 NVIDIA                      → flashinfer (不可用时 fallback triton)
 
-    subgraph override["命令行覆盖"]
-        O1["--attention-backend backend_name"]
-    end
+3. 通用模型 (MLA 架构):
+   • Hopper + CUDA 12.3               → fa3
+   • SM100+                           → flashinfer
+   • AMD HIP                          → aiter (仅 head_num=16/128) / triton
+   • 其他                             → triton
 
-    platform --> model --> override
+4. 命令行覆盖 (最高优先级):
+   --attention-backend <name>
+   --prefill-attention-backend <name>  (Prefill 专用)
+   --decode-attention-backend <name>   (Decode 专用)
 ```
 
 ### 9.2 相关配置参数
@@ -1644,9 +1729,9 @@ flowchart LR
 
 ---
 
-## 16. 线性注意力后端 (v0.5.9 新增)
+## 16. 线性注意力后端
 
-Qwen3.5 的 GatedDeltaNet 层使用线性注意力，v0.5.9 新增了专门的后端支持。
+Qwen3.5 的 GatedDeltaNet 层使用线性注意力，SGLang 提供了专门的后端支持。
 
 ### linear/ 子目录
 
@@ -1658,13 +1743,13 @@ Qwen3.5 的 GatedDeltaNet 层使用线性注意力，v0.5.9 新增了专门的�
 
 ### FLA (Flash Linear Attention)
 
-**文件**: `srt/layers/attention/fla/` (18个文件)
+**文件**: `srt/layers/attention/fla/` (16 个文件)
 
 Flash Linear Attention 子系统，包含 chunk 操作、fused recurrent、KDA 等 Triton kernel 实现。为 Qwen3.5 的线性注意力层提供高性能计算支持。
 
-## 17. 新增 Attention 后端 (v0.5.9)
+## 17. 其他 Attention 后端
 
-v0.5.9 新增了大量 attention 后端，后端总数翻倍：
+SGLang 提供了大量 attention 后端：
 
 ### 标准 Attention 后端
 
@@ -1698,11 +1783,11 @@ v0.5.9 新增了大量 attention 后端，后端总数翻倍：
 | LightningAttentionBackend | Lightning Attention |
 | HybridLinearAttnBackend | 混合线性注意力包装器 |
 
-## 18. 注册后端总览 (v0.5.9)
+## 18. 注册后端总览
 
 **文件**: `srt/layers/attention/attention_registry.py`
 
-v0.5.9 注册了 17 个后端：
+共注册了 17 个后端：
 
 | 注册名 | 后端类 | 说明 |
 |--------|--------|------|

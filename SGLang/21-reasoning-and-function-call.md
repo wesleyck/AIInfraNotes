@@ -48,33 +48,54 @@ flowchart TD
 
 ```python
 ReasoningParser.DetectorMap = {
-    "deepseek-r1":          DeepSeekR1Detector,    # force_reasoning=True (始终假定在思考)
+    "deepseek-r1":          DeepSeekR1Detector,    # force_reasoning=True (detector 默认值)
     "deepseek-v3":          Qwen3Detector,
     "glm45":                Qwen3Detector,
-    "gpt-oss":              GptOssDetector,        # 使用 HarmonyParser
+    "gpt-oss":              GptOssDetector,        # force_reasoning=True (ReasoningParser 层覆盖)，使用 HarmonyParser
     "kimi":                 KimiDetector,          # Unicode 标记符
     "kimi_k2":              Qwen3Detector,         # v0.5.9: 改为 Qwen3Detector (原 DeepSeekR1Detector)
     "qwen3":                Qwen3Detector,
-    "qwen3-thinking":       Qwen3Detector,         # force_reasoning=True (强制覆盖)
-    "minimax":              Qwen3Detector,          # force_reasoning=True (强制覆盖)
+    "qwen3-thinking":       Qwen3Detector,         # force_reasoning=True (ReasoningParser 层覆盖)
+    "minimax":              Qwen3Detector,          # force_reasoning=True (ReasoningParser 层覆盖)
     "minimax-append-think": MiniMaxAppendThinkDetector,
-    "step3":                DeepSeekR1Detector,
-    "step3p5":              DeepSeekR1Detector,     # v0.5.9 新增
+    "step3":                DeepSeekR1Detector,    # force_reasoning=True (detector 默认值)
+    "step3p5":              DeepSeekR1Detector,    # force_reasoning=True (detector 默认值), v0.5.9 新增
     "nano_v3":              NanoV3Detector,
     "interns1":             Qwen3Detector,
 }
+# 注: force_reasoning 来源有两种:
+# 1. Detector 默认值: DeepSeekR1Detector.__init__ 中硬编码 force_reasoning=True
+# 2. ReasoningParser 层覆盖: __init__ 中对 {"qwen3-thinking", "gpt-oss", "minimax"}
+#    强制设置 force_reasoning=True，覆盖 detector 的默认值
 ```
 
 ### 2.3 BaseReasoningFormatDetector 基类
 
 ```python
 class BaseReasoningFormatDetector:
-    def __init__(self, think_start_token, think_end_token, force_reasoning, stream_reasoning):
+    def __init__(self, think_start_token, think_end_token, force_reasoning, stream_reasoning,
+                 continue_final_message=False, previous_content=""):
         self.think_start_token = think_start_token    # 如 "<think>"
         self.think_end_token = think_end_token        # 如 "</think>"
         self._in_reasoning = force_reasoning          # 初始状态
         self.stream_reasoning = stream_reasoning      # 是否流式输出推理内容
         self._buffer = ""                             # 流式缓冲区
+        self.stripped_think_start = False              # 确保 <think> 只被剥离一次
+
+        # continue_final_message 支持: 续写助手消息时推断初始 reasoning 状态
+        self.continue_final_message = continue_final_message
+        if self.continue_final_message:
+            self.previous_content = previous_content  # 之前的助手消息内容
+            self.previous_count = len(previous_content)
+        else:
+            self.previous_content = ""
+            self.previous_count = 0
+
+        # 根据 previous_content 推断初始 reasoning 状态
+        if self.think_start_token in self.previous_content:
+            self._in_reasoning = True                 # 之前有 <think> → 仍在思考
+        if self.think_end_token in self.previous_content:
+            self._in_reasoning = False                # 之前有 </think> → 已结束思考
 
     def detect_and_parse(self, text) -> StreamingParseResult:
         """一次性解析: 完整文本 → reasoning_text + normal_text"""
@@ -92,8 +113,8 @@ flowchart TD
     A["new_text 到达"] --> B["_buffer += new_text"]
     B --> C{"buffer 是 start/end<br/>token 前缀?"}
     C -->|Yes| D["继续缓冲 (返回空)"]
-    C -->|No| E{"包含 think_start_token?"}
-    E -->|Yes| F["剥离标记, _in_reasoning = True"]
+    C -->|No| E{"!stripped_think_start 且<br/>包含 think_start_token?"}
+    E -->|Yes| F["剥离标记, _in_reasoning = True<br/>stripped_think_start = True<br/>(确保只剥离一次)"]
     E -->|No| G{"_in_reasoning 且<br/>包含 think_end_token?"}
     G -->|Yes| H["切分: reasoning_text | normal_text<br/>_in_reasoning = False<br/>清空 _buffer"]
     G -->|No| I{"_in_reasoning 且<br/>stream_reasoning?"}
@@ -103,9 +124,14 @@ flowchart TD
     K -->|No| M["!_in_reasoning<br/>输出 normal_text<br/>清空 _buffer"]
 ```
 
-### 2.5 StreamingParseResult
+### 2.5 StreamingParseResult (推理解析)
+
+**文件**: `srt/parser/reasoning_parser.py`
+
+> **注意**: 此类与 `srt/function_call/core_types.py` 中的同名类是**两个不同的类**。推理解析版本是普通类，包含 `normal_text` + `reasoning_text`；函数调用版本是 Pydantic `BaseModel`，包含 `normal_text` + `calls`。
 
 ```python
+# srt/parser/reasoning_parser.py — 推理解析用
 class StreamingParseResult:
     normal_text: str = ""       # 非推理内容 (会传给用户/函数调用解析)
     reasoning_text: str = ""    # 推理内容 (thinking 部分)
@@ -126,7 +152,8 @@ class StreamingParseResult:
 class MiniMaxAppendThinkDetector(BaseReasoningFormatDetector):
     def __init__(self, stream_reasoning=True, force_reasoning=False):
         super().__init__("<think>", "</think>", force_reasoning=force_reasoning, ...)
-        self.is_first_chunk = False       # 追踪是否为首次调用
+        self.is_first_chunk = False       # 命名反直觉: False 表示"还没处理过第一块"
+                                          # 首次调用时设为 True，之后不再追加 <think>
 
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
         if not self.is_first_chunk:
@@ -180,6 +207,8 @@ flowchart TD
 ### 3.2 核心数据类型
 
 **文件**: `srt/function_call/core_types.py`
+
+> **注意**: 此处的 `StreamingParseResult` 是 Pydantic `BaseModel`，与 `srt/parser/reasoning_parser.py` 中的同名普通类不同（见 Section 2.5）。
 
 ```python
 class ToolCallItem(BaseModel):
@@ -385,7 +414,10 @@ async def _process_tool_call_stream(self, index, delta, parser_dict, content, re
     # 1. 延迟初始化 parser (每个 choice index 一个)
     if index not in parser_dict:
         if request.tool_choice == "required":
-            parser_dict[index] = JsonArrayParser()         # 直接 JSON 解析
+            parser_dict[index] = JsonArrayParser()         # 直接 JSON 数组解析
+            # JsonArrayParser (function_call/json_array_parser.py):
+            # 简单的 JSON 数组解析器，用于 tool_choice="required" 场景，
+            # 直接解析 JSON 数组格式的工具调用，不依赖模型特定的格式检测
         else:
             parser_dict[index] = FunctionCallParser(tools, tool_call_parser)
 
@@ -530,11 +562,11 @@ response = client.chat.completions.create(
 )
 ```
 
-## 8. v0.5.9 函数调用检测器大幅扩展
+## 8. 函数调用检测器扩展
 
 ### 8.1 ToolCallParserEnum 完整注册表
 
-v0.5.9 将函数调用检测器从约 10 个扩展到 **22 个**，覆盖了主流推理模型的工具调用格式。
+函数调用检测器从约 10 个扩展到 **22 个注册名**（含别名如 qwen=qwen25, glm=glm45），映射到约 **20 个独立 detector 类**，覆盖了主流推理模型的工具调用格式。
 
 **文件**: `srt/function_call/function_call_parser.py`
 
@@ -595,7 +627,7 @@ class StructureInfo:
 
 ### 8.3 supports_structural_tag 分布
 
-v0.5.9 中不支持 structural_tag 的 detector 增多：
+目前不支持 structural_tag 的 detector 增多：
 
 | 不支持 structural_tag 的 Detector | 原因 |
 |----------------------------------|------|

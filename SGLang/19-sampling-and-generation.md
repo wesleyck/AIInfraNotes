@@ -46,7 +46,7 @@ class SamplingParams:
     # ========== 惩罚机制 ==========
     frequency_penalty: float = 0.0  # 频率惩罚 [-2, 2]，按出现次数累加
     presence_penalty: float = 0.0   # 存在惩罚 [-2, 2]，按是否出现
-    repetition_penalty: float = 1.0 # 乘法惩罚 [0, 2] (在模型内部应用)
+    repetition_penalty: float = 1.0 # 乘法惩罚 [0, 2] (参数已定义但 penaltylib 中无对应实现，保留用于兼容 HF generation config)
 
     # ========== 生成约束 ==========
     min_new_tokens: int = 0        # 最小输出长度
@@ -134,10 +134,15 @@ class SamplingBatchInfo:
     has_custom_logit_processor: bool  # 是否有自定义 logit processor
     custom_params: Optional[List[Optional[Dict[str, Any]]]]  # 每个请求的自定义参数列表
     custom_logit_processor: Optional[Dict]
-    logit_bias: Optional[torch.Tensor]  # [batch_size, vocab_size]
+
+    # ========== 确定性采样 ==========
+    sampling_seed: Optional[torch.Tensor] = None  # [batch_size], int64, 配合 enable_deterministic_inference 使用
 
     # ========== 设备 ==========
     device: str = "cuda"              # 设备类型 ("cuda", "npu" 等)
+
+    # ========== Logit 偏置 ==========
+    logit_bias: Optional[torch.Tensor] = None  # [batch_size, vocab_size]
 ```
 
 ### 3.2 创建流程
@@ -161,7 +166,8 @@ def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
     )
 
     # 4. 设置优化标记
-    is_all_greedy = all(top_k == 1 for top_k in top_ks)
+    is_all_greedy = all(r.sampling_params.top_k <= 1 for r in reqs)
+    # top_k=0 和 top_k=1 都等价于贪婪采样
 ```
 
 ### 3.3 apply_logits_bias
@@ -170,15 +176,22 @@ def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
 
 ```python
 def apply_logits_bias(self, logits: torch.Tensor):
-    # 1. 累积惩罚 (overlap 模式)
+    # 1. 累积惩罚 (overlap 模式预计算)
     if self.acc_linear_penalties is not None:
         logits.add_(self.acc_linear_penalties)
 
-    # 2. Grammar 词表掩码 (将非法 token 设为 -inf)
+    # 2. 直接应用惩罚 (non-overlap 模式)
+    if self.penalizer_orchestrator and self.penalizer_orchestrator.is_required:
+        self.penalizer_orchestrator.apply(logits)
+    # 注意: Step 1 和 Step 2 互斥 —— overlap 模式在 update_penalties() 中预计算
+    # acc_linear_penalties 并在此处一次性加上; non-overlap 模式则在此处直接调用
+    # orchestrator.apply() 实时计算并应用惩罚
+
+    # 3. Grammar 词表掩码 (将非法 token 设为 -inf)
     if self.vocab_mask is not None:
         self.apply_mask_func(logits, self.vocab_mask)
 
-    # 3. 用户指定的 logit_bias
+    # 4. 用户指定的 logit_bias
     if self.logit_bias is not None:
         logits.add_(self.logit_bias)
 ```
@@ -334,16 +347,24 @@ class LogitsProcessorOutput:
 
 ### 6.1 完整流程
 
+> **调用关系**: `apply_logits_bias()` 在 `Sampler.forward()` 之前由 ModelRunner 调用（见 Section 3.3），完成惩罚/Grammar/Bias 的 logit 修改后，logits 才传入 Sampler。
+
 ```mermaid
 flowchart TD
     subgraph SamplerForward["Sampler.forward() 流程"]
         S1["Step 1: 预处理<br/>- 应用 custom_logit_processor<br/>- 检测并处理 NaN, 替换为 -1e5"]
         S1 --> S2{"Step 2: is_all_greedy?"}
         S2 -->|Yes| S2Y["torch.argmax logits, -1<br/>快速路径"]
-        S2 -->|No| S3["Step 3: 温度缩放<br/>logits /= temperatures"]
-        S3 --> S4["Step 4: Softmax<br/>probs = torch.softmax logits, dim=-1"]
-        S4 --> S5["Step 5: 概率过滤 + 采样"]
-        S5 --> S6["Step 6: TP 同步<br/>if SYNC_TOKEN_IDS_ACROSS_TP or grammars:<br/>all_reduce token_ids, op=MIN"]
+        S2 -->|No| S2B{"RL on-policy 且<br/>deterministic 且<br/>simple_sampling?"}
+        S2B -->|Yes| S2C["RL on-policy 路径<br/>log_softmax → _sample_from_logprobs()<br/>(Gumbel Trick 确定性采样)"]
+        S2B -->|No| S2D{"Ascend 后端?"}
+        S2D -->|Yes| S2E["Ascend 路径<br/>_forward_ascend_backend()<br/>温度缩放 → _sample_from_logits()"]
+        S2D -->|No| S3["标准路径: 温度缩放<br/>logits /= temperatures"]
+        S3 --> S4["Softmax<br/>probs = torch.softmax logits, dim=-1"]
+        S4 --> S5["概率过滤 + 采样<br/>_sample_from_probs()"]
+        S2C --> S6["TP 同步<br/>if SYNC_TOKEN_IDS_ACROSS_TP or grammars:<br/>all_reduce token_ids, op=MIN"]
+        S2E --> S6
+        S5 --> S6
         S2Y --> Result["return batch_next_token_ids"]
         S6 --> Result
     end
@@ -397,9 +418,9 @@ def create_sampler(backend: Optional[str] = None) -> Sampler:
 |------|----------|------|
 | `flashinfer` | sgl-kernel (`top_k_top_p_sampling_from_probs`) | GPU rejection sampling，最高性能 |
 | `pytorch` | `torch.multinomial` | 纯 PyTorch 实现，通用 fallback |
-| `ascend` | `torch_npu.npu_top_k_top_p` | 华为 NPU 专用，跳过 softmax 前置 |
+| `ascend` | `torch_npu.npu_top_k_top_p` | 华为 NPU 专用，独立采样路径 |
 
-> **Ascend 后端特殊点**: Ascend 后端在 `forward()` 中跳过 `torch.softmax`（因为 NPU 的采样接口内部做 softmax），仅在需要 return_logprob 且 `!SGLANG_RETURN_ORIGINAL_LOGPROB` 时才计算 softmax。
+> **Ascend 后端特殊点**: Ascend 后端走独立的 `_forward_ascend_backend()` 路径，而非标准的 softmax → `_sample_from_probs()` 流程。该路径先做温度缩放 (`logits /= temperatures`)，然后调用 `_sample_from_logits()` 直接从 logits 采样（NPU 融合 kernel 内部处理 softmax）。仅在需要 `return_logprob` 且未设置 `SGLANG_RETURN_ORIGINAL_LOGPROB` 时才额外计算 `log_softmax`。
 
 ### 6.3 Top-K / Top-P / Min-P 过滤算法
 
@@ -415,17 +436,22 @@ def create_sampler(backend: Optional[str] = None) -> Sampler:
 
 ### 6.4 确定性采样
 
-通过 Gumbel Trick 实现可复现的采样：
+通过 Gumbel Trick + MurmurHash3 实现可复现的采样：
 
 ```python
-# 用 seed + position 生成确定性噪声
-step_seed = (seed * 19349663) ^ (position * 73856093)
-uniform = hash_to_uniform(step_seed)
-gumbel_noise = -log(-log(uniform))
+# srt/layers/utils/hash.py — Triton 实现的 MurmurHash3 32-bit
+# 输入: (seed, position, col_index) 三元组，每个 vocab token 有独立哈希值
+hash_val = murmur_hash32(seed, positions, col_indices)
 
-# argmax(log_probs + gumbel_noise) 等价于 multinomial 采样
+# 哈希值转均匀分布 [0, 1)
+uniform = hash_val.float() / (2**32)
+
+# Gumbel Trick: argmax(log_probs + gumbel_noise) 等价于 multinomial 采样
+gumbel_noise = -log(-log(uniform))
 token = argmax(log(probs) + gumbel_noise)
 ```
+
+> **注意**: Section 11.1 详述了从旧版简单哈希到 MurmurHash3 的演进。
 
 ### 6.5 TP 同步条件
 
@@ -492,14 +518,19 @@ class Glm4MoeThinkingBudgetLogitProcessor(ThinkingBudgetLogitProcessor):
 
 ### 7.3 序列化
 
-通过 dill + hex 编码实现跨进程传输：
+通过 dill + hex + JSON 编码实现跨进程传输：
 
 ```python
-# 序列化
-json_str = MyProcessor.to_str()  # dill dump → hex encode → JSON
+# 序列化: dill.dumps(cls).hex() → json.dumps({"callable": hex_str})
+json_str = MyProcessor.to_str()
+# 内部: json.dumps({"callable": dill.dumps(cls).hex()})
 
-# 反序列化 (带缓存)
+# 反序列化 (带 @lru_cache): orjson.loads → bytes.fromhex → dill.loads
 processor = CustomLogitProcessor.from_str(json_str)
+# 内部: _cache_from_str(json_str)()
+#   → orjson.loads(json_str) 得到 {"callable": hex_str}
+#   → dill.loads(bytes.fromhex(hex_str)) 得到 class
+#   → class() 实例化
 ```
 
 ## 8. sgl-kernel 采样算子
@@ -641,11 +672,11 @@ flowchart TD
     Sampler --> Update["penalizer_orchestrator.cumulate_output_tokens<br/>cumulated_frequency_penalties 0,42 += 0.5<br/>下轮 token 42 惩罚 +0.5"]
 ```
 
-## 11. v0.5.9 更新
+## 11. 采样更新
 
 ### 11.1 确定性采样哈希函数改进
 
-v0.5.9 将确定性采样的哈希函数从简单的线性组合升级为 **MurmurHash3** 算法，显著改善了哈希质量和采样的均匀性。
+确定性采样的哈希函数从简单的线性组合升级为 **MurmurHash3** 算法，显著改善了哈希质量和采样的均匀性。
 
 **文件**: `srt/layers/utils/hash.py`
 
@@ -675,7 +706,7 @@ def murmur_hash32(seed, positions, col_indices):
 
 **文件**: `srt/sampling/custom_logit_processor.py`
 
-v0.5.9 新增了多个内置 `ThinkingBudgetLogitProcessor` 子类，覆盖更多推理模型：
+新增了多个内置 `ThinkingBudgetLogitProcessor` 子类，覆盖更多推理模型：
 
 | 处理器 | 模型 | THINKING_START_TOKEN_ID | THINKING_END_TOKEN_ID |
 |--------|------|------------------------|----------------------|

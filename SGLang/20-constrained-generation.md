@@ -82,10 +82,24 @@ flowchart TB
 
 ```python
 class BaseGrammarObject:
+    def __init__(self):
+        self._finished = False           # 内部完成标记
+        self.grammar_stats = None        # GrammarStats 实例 (性能追踪)
+        self.current_token = None        # 当前 token
+
+    @property
+    def finished(self):                  # 外部访问接口
+        return self._finished
+
+    @finished.setter
+    def finished(self, finished):
+        self._finished = finished
+
     # ========== 状态推进 ==========
     def accept_token(self, token: int)         # 接受 token, 推进 FSM
     def rollback(self, k: int)                 # 回滚 k 步 (投机解码)
-    def is_terminated(self) -> bool            # 是否无法继续
+    def is_terminated(self) -> bool            # 是否无法继续 (默认 False)
+    def maybe_init_reasoning(self, reasoning: bool)  # 初始化 reasoning 状态 (基类空实现)
 
     # ========== 词表掩码 ==========
     def allocate_vocab_mask(vocab_size, batch_size, device)  # 分配掩码张量
@@ -95,6 +109,9 @@ class BaseGrammarObject:
 
     # ========== 跳跃优化 ==========
     def try_jump_forward(tokenizer)            # 跳过可预测序列
+
+    # ========== 复制 ==========
+    def copy(self) -> BaseGrammarObject        # 默认返回 self，子类覆盖
 ```
 
 ## 4. 词表掩码格式
@@ -133,40 +150,69 @@ Grammar 编译可能耗时较长，SGLang 使用 `grammar_queue` 异步处理：
 
 ```mermaid
 flowchart TD
-    A["请求到达 (json_schema=...)"] --> B["handle_generate_request()"]
+    A["请求到达 (json_schema=...)"] --> B["process_req_with_grammar()"]
     B --> C["key = (json, schema_string)"]
     C --> D["backend.get_cached_or_future_value(key)"]
     D --> E{cache_hit?}
 
-    E -- "cache hit" --> F["req.grammar = compiled_grammar"]
+    E -- "cache hit" --> F["req.grammar = compiled_grammar.copy()<br/>maybe_init_reasoning()"]
     F --> G["waiting_queue"]
 
-    E -- "cache miss" --> H["req.grammar = Future grammar"]
+    E -- "cache miss" --> H["req.grammar = Future"]
     H --> I["grammar_queue"]
     I --> J["ThreadPoolExecutor 异步编译"]
 
-    K["每轮事件循环"] --> L["move_ready_req_from_grammar_queue_to_waiting_queue()"]
-    L --> M["future.result timeout=0.03 非阻塞检查"]
+    K["每轮事件循环"] --> L["get_ready_grammar_requests()"]
+    L --> M["轮询: future.done() 检查<br/>间隔 SGLANG_GRAMMAR_POLL_INTERVAL/10"]
     M --> N{"编译完成?"}
-    N -- "完成" --> O["缓存结果 -> 移入 waiting_queue"]
-    N -- "超时 300s" --> P["abort 请求"]
+    N -- "完成" --> O["grammar.result() 取结果<br/>set_cache(key, grammar.copy())<br/>返回 ready_reqs"]
+    N -- "超过 MAX_POLL_ITERATIONS" --> P["cancel future, abort 请求"]
 ```
 
-### 5.2 关键配置
+### 5.2 分布式同步
+
+多 rank 场景下（DP/TP），各 rank 独立轮询 grammar 编译状态，通过 `all_gather_object` 同步结果：
+
+```python
+# grammar_manager.py:151-163
+if self.grammar_sync_size > 1:
+    all_gather_output = [None] * self.grammar_sync_size
+    torch.distributed.all_gather_object(
+        all_gather_output,
+        (ready_req_idxs, failed_req_idxs),
+        group=self.grammar_sync_group,
+    )
+    # ready 取交集: 所有 rank 都完成才算 ready
+    synced_ready_req_idxs = set.intersection(*[x[0] for x in all_gather_output])
+    # failed 取并集: 任一 rank 超时则全部标记失败
+    synced_failed_req_idxs = set.union(*[x[1] for x in all_gather_output])
+```
+
+### 5.3 关键配置
 
 ```bash
-SGLANG_GRAMMAR_TIMEOUT=300        # 编译超时 (秒)
---grammar-backend xgrammar        # 后端选择
---constrained-json-whitespace-pattern   # JSON 空白正则
+SGLANG_GRAMMAR_POLL_INTERVAL=0.005          # 每轮轮询间隔 (秒, 默认 5ms)
+SGLANG_GRAMMAR_MAX_POLL_ITERATIONS=10000    # 最大轮询次数 (超过则 abort)
+# 实际超时 ≈ MAX_POLL_ITERATIONS × max(POLL_INTERVAL, GPU forward 延迟)
+--grammar-backend xgrammar                  # 后端选择
+--constrained-json-whitespace-pattern       # JSON 空白正则
+--constrained-json-disable-any-whitespace   # 禁用 any_whitespace (XGrammar/LLGuidance)
 ```
 
 ### 5.3 编译缓存
 
 ```python
 # BaseGrammarBackend 内置缓存
-cache: Dict[Tuple[str, str], CacheEntry]
+cache: Dict[Tuple[str, str], BaseGrammarObject]
 # key = ("json", schema_string) 或 ("regex", pattern) 等
-# value = 编译好的 GrammarObject (会 copy() 后存入)
+
+# 存入: 编译完成后存入 grammar 的 copy
+self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
+
+# 取出: 从缓存取出后再 copy() 一份，确保每个请求独立状态
+value = self.cache.get(key)
+copied_value = value.copy()
+copied_value.maybe_init_reasoning(require_reasoning)
 ```
 
 ## 6. 采样集成
@@ -182,7 +228,9 @@ def update_regex_vocab_mask(self):
 
     # 2. 每个请求填充合法 token
     for i, grammar in enumerate(self.grammars):
-        if grammar and not grammar.finished:
+        if grammar and not grammar.finished and not grammar.is_terminated():
+            # finished: 正常完成 (grammar 接受了终止状态)
+            # is_terminated(): 异常终止 (grammar 无法继续推进)
             grammar.fill_vocab_mask(self.vocab_mask, i)
 
     # 3. 移到 GPU
@@ -342,9 +390,26 @@ def create_grammar_backend(server_args, tokenizer, vocab_size, eos_token_ids):
     if name in GRAMMAR_BACKEND_REGISTRY:
         return GRAMMAR_BACKEND_REGISTRY[name](server_args, tokenizer, vocab_size, eos_token_ids)
     # 2. 内置后端
-    if name == "xgrammar": ...
-    elif name == "outlines": ...
-    elif name == "llguidance": ...
+    if name == "xgrammar":
+        try:
+            grammar_backend = XGrammarGrammarBackend(
+                tokenizer, vocab_size=vocab_size,
+                model_eos_token_ids=list(eos_token_ids),
+                any_whitespace=not server_args.constrained_json_disable_any_whitespace,
+            )
+        except TokenizerNotSupportedError as e:
+            # XGrammar 不支持该 tokenizer → 降级为 none
+            logger.warning(f"Grammar backend disabled: {e}")
+            server_args.grammar_backend = "none"
+            return None
+    elif name == "outlines":
+        grammar_backend = OutlinesGrammarBackend(
+            tokenizer, whitespace_pattern=server_args.constrained_json_whitespace_pattern)
+    elif name == "llguidance":
+        grammar_backend = GuidanceBackend(
+            tokenizer=tokenizer,
+            any_whitespace=not server_args.constrained_json_disable_any_whitespace,
+            whitespace_pattern=server_args.constrained_json_whitespace_pattern)
     # 3. Reasoning 包装
     if server_args.reasoning_parser and hasattr(tokenizer, "think_end_id"):
         grammar_backend = ReasonerGrammarBackend(grammar_backend, tokenizer.think_end_id)
@@ -362,11 +427,11 @@ grammar.rollback(num_rejected_tokens)
 # MAX_ROLLBACK_TOKENS = 200
 ```
 
-## 13. Reasoner Grammar Backend（v0.5.9 新增章节）
+## 13. Reasoner Grammar Backend
+
+> 详细实现见 Section 7。本节仅保留架构图供快速参考。
 
 **文件**: `srt/constrained/reasoner_grammar_backend.py`
-
-Reasoner Grammar Backend 是专为推理模型（Thinking 模型）设计的 Grammar 后端包装器。它解决了一个核心问题：在 `<think>...</think>` 思考阶段，模型应自由生成，不受 grammar 约束；只有 thinking 结束后，才激活约束生成。
 
 ### 13.1 架构
 
@@ -379,46 +444,10 @@ flowchart TD
     E --> F["包装原始 GrammarObject"]
 ```
 
-`ReasonerGrammarBackend` 不是独立的 grammar 实现，而是一个**装饰器/包装器**，委托给内层的真实后端（如 XGrammar）。它在 `create_grammar_backend()` 中自动启用：
-
-```python
-# base_grammar_backend.py
-if server_args.reasoning_parser and hasattr(tokenizer, "think_end_id"):
-    grammar_backend = ReasonerGrammarBackend(grammar_backend, tokenizer.think_end_id)
-```
-
-### 13.2 ReasonerGrammarObject 状态机
-
-```python
-class ReasonerGrammarObject(BaseGrammarObject):
-    def __init__(self, grammar: BaseGrammarObject, think_end_id: int):
-        self.grammar = grammar           # 内层 grammar 对象
-        self.think_end_id = think_end_id
-        self.tokens_after_think_end = -1
-        # -1: thinking 阶段 (不约束)
-        #  0: 刚检测到 think_end_id
-        # >0: thinking 结束后的 token 计数
-```
-
-核心方法：
-
-- `accept_token(token)`: 先条件性委托给内层 grammar（仅 `tokens_after_think_end >= 0` 时），再调用 `transfer_state(token)` 更新状态
-- `fill_vocab_mask(vocab_mask, idx)`: thinking 阶段不填充掩码（全部允许），结束后委托给内层 grammar
-- `maybe_init_reasoning(reasoning)`: 根据请求是否启用 reasoning 设置初始状态（`-1` 或 `0`）
-- `rollback(k)`: 支持投机解码回滚，同时回滚内层 grammar 和自身状态
-
-### 13.3 与 Scheduler 的集成
-
-Scheduler 初始化时注入 `think_end_id`：
-
-```python
-# scheduler.py
-if self.server_args.reasoning_parser and self.tokenizer:
-    reasoning_parser = ReasoningParser(model_type=self.server_args.reasoning_parser, ...)
-    self.tokenizer.think_end_id = self.tokenizer.encode(
-        reasoning_parser.detector.think_end_token, add_special_tokens=False
-    )[0]
-```
+核心要点（详见 Section 7）：
+- `ReasonerGrammarBackend` 是装饰器/包装器，委托给内层真实后端
+- `ReasonerGrammarObject` 通过 `tokens_after_think_end` 计数器管理 thinking/约束 两阶段
+- `accept_token()` 先条件性委托再 `transfer_state()`，保证 `think_end_token` 不传给内层 grammar
 
 ## 14. 下一步
 

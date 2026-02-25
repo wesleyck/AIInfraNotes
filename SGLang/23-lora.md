@@ -438,6 +438,11 @@ flowchart LR
 - **MergedColumnParallelLinearWithLoRA**: 使用 `run_gate_up_lora` 处理 gate+up 两个投影，A 权重形状 `[max_loras, 2*r, input_dim]`
 - **VocabParallelEmbeddingWithLoRA**: 处理 embedding 查找 + 额外 token 嵌入
 
+**已知限制**:
+
+- **TP > 1 不支持 Embedding LoRA**: `VocabParallelEmbeddingWithLoRA.slice_lora_a_weights()` 在 `tp_rank > 1` 时直接抛出 `NotImplementedError`，因此 Embedding 层的 LoRA 仅支持单卡部署
+- **不支持额外 token**: `extra_token_embedding()` 方法未实现（抛出 `NotImplementedError`），`validate_new_adapter()` 会拒绝 `lora_added_tokens_size > 0` 的 adapter。这意味着当前不支持在 LoRA 微调中添加新词表 token 的场景
+
 ---
 
 ## 7. Backend 实现
@@ -468,7 +473,7 @@ flowchart LR
 
 完整的后端注册表（`lora/backend/lora_registry.py`）：
 
-v0.5.9 将后端注册改为 **装饰器模式**，通过 `@register_lora_backend(name)` 注册工厂函数：
+后端注册改为 **装饰器模式**，通过 `@register_lora_backend(name)` 注册工厂函数：
 
 ```python
 # lora/backend/lora_registry.py
@@ -522,6 +527,29 @@ LoRA 的核心计算是 **Segment GEMM** (分段矩阵乘法)：批内不同请�
 ```
 
 这与标准 GEMM 的区别在于每个序列可能使用不同的权重矩阵。Triton 和 Chunked 后端通过自定义内核高效实现了这一操作。
+
+### 7.3 LoRABatchInfo
+
+**文件**: `srt/lora/utils.py:12`
+
+`LoRABatchInfo` 是后端执行 Segment GEMM 时的批次描述结构，由 `prepare_lora_batch` 构建：
+
+```python
+@dataclass
+class LoRABatchInfo:
+    use_cuda_graph: bool              # 是否使用 CUDA Graph
+    bs: int                           # 批大小
+    num_segments: int                 # 段数（Triton 后端等于 bs）
+    seg_indptr: torch.Tensor          # 每段的起止指针 (num_segments + 1,)
+    weight_indices: torch.Tensor      # 每段使用的 LoRA 权重索引 (num_segments,)
+    lora_ranks: torch.Tensor          # 各 LoRA adapter 的 rank (lora_num,)
+    scalings: torch.Tensor            # 各 LoRA adapter 的 scaling (lora_num,)
+    max_len: Optional[int]            # 当前批次最大段长度
+    seg_lens: Optional[torch.Tensor]  # 各段长度 (num_segments,)
+    permutation: Optional[torch.Tensor]  # token 重排序索引 (num_tokens,)
+```
+
+`seg_indptr` 和 `seg_lens` 描述了 packed 序列中每个请求的 token 范围，`weight_indices` 将每个请求映射到 GPU 内存池中对应的 LoRA 权重 slot。`permutation` 用于 Chunked 后端按 LoRA adapter 分组重排 token，提升 GEMM 效率。
 
 ---
 
@@ -578,6 +606,11 @@ req = Req(
 
 ```python
 def validate_new_adapter(self, lora_config: LoRAConfig, lora_ref: LoRARef):
+    # 步骤 0: 额外 token 检查 (当前不支持添加词表 token 的 adapter)
+    if lora_config.lora_added_tokens_size > 0:
+        raise ValueError("LoRA serving currently doesn't support adapters "
+                        "that add tokens to the vocabulary")
+
     # 步骤 1: 名称去重
     for existing_lora_ref in self.lora_refs.values():
         if lora_ref.lora_name == existing_lora_ref.lora_name:
@@ -606,10 +639,11 @@ def validate_new_adapter(self, lora_config: LoRAConfig, lora_ref: LoRARef):
 
 | 步骤 | 检查内容 | 失败行为 |
 |------|---------|---------|
-| 1a. 名称去重 | adapter 名称是否已存在于 registry | `raise ValueError` (拒绝加载) |
-| 1b. 路径重复提醒 | 同路径不同名 | `logger.warning` (允许加载但警告) |
-| 2. 内存兼容性 | rank 和 target_modules 是否匹配 `memory_pool.can_support()` | `raise ValueError` (拒绝加载) |
-| 3. pinned 上限 | pinned 数量是否达到 `max_loras_per_batch - 1` | `raise ValueError` (防止饥饿) |
+| 0. 额外 token | `lora_added_tokens_size > 0`（添加词表 token） | `raise ValueError`（当前不支持） |
+| 1a. 名称去重 | adapter 名称是否已存在于 registry | `raise ValueError`（拒绝加载） |
+| 1b. 路径重复提醒 | 同路径不同名 | `logger.warning`（允许加载但警告） |
+| 2. 内存兼容性 | rank 和 target_modules 是否匹配 `memory_pool.can_support()` | `raise ValueError`（拒绝加载） |
+| 3. pinned 上限 | pinned 数量是否达到 `max_loras_per_batch - 1` | `raise ValueError`（防止饥饿） |
 
 步骤 3 的 `-1` 设计确保至少保留 1 个 slot 给 unpinned adapter 或 base model（`None` uid），避免所有 slot 都被 pinned adapter 占满导致其他请求无法调度。
 
@@ -739,7 +773,7 @@ sequenceDiagram
 
 ---
 
-## 12. LoRA Overlap Loader（v0.5.9 新增）
+## 12. LoRA Overlap Loader
 
 **文件**: `srt/lora/lora_overlap_loader.py`
 
@@ -811,11 +845,11 @@ if self.enable_lora_overlap_loading:
 
 ---
 
-## 13. v0.5.9 Backend 目录扩展
+## 13. Backend 目录扩展
 
 **文件**: `srt/lora/backend/`
 
-v0.5.9 对 backend 目录进行了重构，将后端注册逻辑独立为 `lora_registry.py`：
+backend 目录经过重构，将后端注册逻辑独立为 `lora_registry.py`：
 
 | 文件 | 说明 |
 |------|------|
@@ -824,19 +858,19 @@ v0.5.9 对 backend 目录进行了重构，将后端注册逻辑独立为 `lora_
 | `chunked_backend.py` | Chunked SGMV 后端 |
 | `torch_backend.py` | 纯 PyTorch fallback |
 | `ascend_backend.py` | 华为 NPU 后端 |
-| `lora_registry.py` | 后端注册表 + 工厂函数 (v0.5.9 重构) |
+| `lora_registry.py` | 后端注册表 + 工厂函数 |
 
 `lora_registry.py` 的装饰器注册模式使得添加新后端只需一个 `@register_lora_backend("name")` 装饰器，无需修改任何已有代码。
 
 ---
 
-## 14. v0.5.9 管理组件更新
+## 14. 管理组件更新
 
 ### 14.1 eviction_policy.py 重构
 
 **文件**: `srt/lora/eviction_policy.py`
 
-v0.5.9 将驱逐策略从 `mem_pool.py` 中独立为单独模块，采用策略模式：
+驱逐策略从 `mem_pool.py` 中独立为单独模块，采用策略模式：
 
 ```python
 class EvictionPolicy(ABC):
@@ -865,6 +899,7 @@ def get_eviction_policy(policy_name: str) -> EvictionPolicy:
 - 新增 `validate_lora_batch()` 方法，验证 LoRA ID 集合是否可调度（考虑 pinned adapter 占用）
 - 新增 `fetch_new_loras()` 方法，供 `LoRAOverlapLoader` 调用
 - `load_lora_weights()` 中新增 `pin_weights_in_cpu()` 调用（重叠加载模式下）
+- 新增 `load_lora_adapter_from_tensors()` 方法，支持从内存中的张量字典直接加载 LoRA adapter，无需从磁盘读取。接口签名：`load_lora_adapter_from_tensors(lora_ref, tensors: Dict[str, Tensor], config_dict: Dict, added_tokens_config=None)`。内部调用 `LoRAConfig.from_dict()` 解析配置，然后走与磁盘加载相同的 `validate_new_adapter` 验证流程
 
 ### 14.3 lora_registry.py 更新
 

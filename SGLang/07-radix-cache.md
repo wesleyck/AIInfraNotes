@@ -44,7 +44,7 @@ flowchart TD
     Base --> RC["RadixCache - 标准 Radix Tree 缓存"]
     Base --> SWA["SWARadixCache - Sliding Window Attention 变体"]
     Base --> Mamba["MambaRadixCache - Mamba-Hybrid 模型变体"]
-    Base --> Hi["HiRadixCache - Hierarchical 分层缓存"]
+    RC --> Hi["HiRadixCache - 继承自 RadixCache"]
     Base --> Chunk["ChunkCache - 简化版, 禁用 radix_cache 时使用"]
     Base --> Cpp["RadixCacheCpp - C++ 优化实现, 实验性"]
 ```
@@ -55,9 +55,11 @@ flowchart TD
 
 ```python
 class RadixKey:
-    def __init__(self, token_ids: List[int], extra_key: Optional[str] = None):
+    def __init__(self, token_ids: List[int], extra_key: Optional[str] = None,
+                 is_bigram: bool = False):
         self.token_ids = token_ids  # Token ID 序列
         self.extra_key = extra_key  # 额外键 (LoRA ID, cache_salt 等)
+        self.is_bigram = is_bigram  # 是否为 EAGLE bigram key
 ```
 
 **用途**:
@@ -170,19 +172,28 @@ graph TD
 **最长前缀匹配**
 
 ```python
-def match_prefix(self, key: RadixKey, **kwargs) -> MatchResult:
+def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
     """
     查找 key 在 Radix Tree 中的最长公共前缀
 
+    参数:
+        params.key: RadixKey - token_ids + extra_key
+        params.cow_mamba: bool - Mamba Copy-On-Write (MambaRadixCache 专用)
+        params.req: Req - 请求对象 (MambaRadixCache 专用)
+
     匹配逻辑:
-    - 底层使用 **Token ID 逐个比较** (`_key_match_page_size1`) 或按页比较 (`_key_match_paged`)。
-    - `extra_key` (如 LoRA ID) 通过 `get_child_key_fn` 影响子节点查找路径，实现了逻辑上的命名空间隔离，不同 `extra_key` 的请求不会匹配到彼此的节点。
+    - 内部先调用 maybe_bigram_convert() 处理 EAGLE bigram 转换
+    - 底层使用 **Token ID 逐个比较** (`_key_match_page_size1`) 或按页比较 (`_key_match_paged`)
+    - `extra_key` (如 LoRA ID) 通过 `get_child_key_fn` 影响子节点查找路径，
+      实现逻辑上的命名空间隔离，不同 `extra_key` 的请求不会匹配到彼此的节点
 
     返回:
         MatchResult(
             device_indices: 匹配到的 KV 索引
             last_device_node: 匹配终止的节点
             last_host_node: (HiCache) Host 端匹配节点
+            host_hit_length: Host 端命中长度 (HiCache)
+            mamba_branching_seqlen: Mamba 分支点 (MambaRadixCache)
         )
     """
 ```
@@ -228,11 +239,17 @@ flowchart TD
 **插入新序列**
 
 ```python
-def insert(self, key: RadixKey, value=None, priority: int = 0):
+def insert(self, params: InsertParams) -> InsertResult:
     """
     插入 token 序列及其 KV 索引到树中
 
-    返回: 已存在的前缀长度 (用于释放重复的 KV 索引)
+    参数:
+        params.key: RadixKey - token_ids + extra_key
+        params.value: torch.Tensor - KV 索引
+        params.priority: int - 优先级
+        params.chunked: bool - 是否为 chunked prefill 中间插入
+
+    返回: InsertResult(prefix_len=已存在的前缀长度, mamba_exist=...)
     """
 ```
 
@@ -300,24 +317,34 @@ flowchart TD
 ```python
 def inc_lock_ref(self, node: TreeNode):
     """锁定从 node 到 root 的整个路径"""
+    delta = 0
     while node != self.root_node:
         if node.lock_ref == 0:
             # 从 evictable 转为 protected
             self.evictable_size_ -= len(node.key)
             self.protected_size_ += len(node.key)
+            delta -= len(node.key)
         node.lock_ref += 1
+        self._update_leaf_status(node)  # 维护 evictable_leaves set
         node = node.parent
+    return delta
 
 def dec_lock_ref(self, node: TreeNode):
     """解锁路径"""
+    delta = 0
     while node != self.root_node:
         if node.lock_ref == 1:
             # 从 protected 转为 evictable
             self.evictable_size_ += len(node.key)
             self.protected_size_ -= len(node.key)
+            delta += len(node.key)
         node.lock_ref -= 1
+        self._update_leaf_status(node)  # 维护 evictable_leaves set
         node = node.parent
+    return delta
 ```
+
+> **`_update_leaf_status(node)`**: 每次 lock_ref 变化后都调用，判断节点是否应加入/移出 `evictable_leaves` set。判断逻辑：节点未被驱逐 (`not evicted`) 且 `lock_ref == 0` 且所有子节点都已被驱逐时，才是 evictable leaf。
 
 ## 5. 逐出策略
 
@@ -335,25 +362,30 @@ def dec_lock_ref(self, node: TreeNode):
 ### 5.1 evict() 流程
 
 ```python
-def evict(self, num_tokens: int):
-    leaves = self._collect_leaves()  # 收集所有叶子节点
+def evict(self, params: EvictParams) -> EvictResult:
+    num_tokens = params.num_tokens
+    leaves = list(self.evictable_leaves)  # 使用维护好的 evictable_leaves set
     eviction_heap = [
-        (eviction_strategy.get_priority(node), node)
-        for node in leaves if node.lock_ref == 0
+        (self.eviction_strategy.get_priority(node), node) for node in leaves
     ]
     heapq.heapify(eviction_heap)
 
     num_evicted = 0
-    while num_evicted < num_tokens and eviction_heap:
-        priority, node = heapq.heappop(eviction_heap)
-        self.token_to_kv_pool_allocator.free(node.value)  # 释放 KV
-        self._delete_leaf(node)                           # 删除节点
-        num_evicted += len(node.value)
+    while num_evicted < num_tokens and len(eviction_heap):
+        _priority, x = heapq.heappop(eviction_heap)
+        self.token_to_kv_pool_allocator.free(x.value)  # 释放 KV
+        num_evicted += len(x.value)
+        self._delete_leaf(x)                            # 删除节点
 
         # 如果父节点变成叶子且未被锁定，可能成为下一个逐出候选
-        if len(node.parent.children) == 0 and node.parent.lock_ref == 0:
-            heapq.heappush(eviction_heap, (get_priority(node.parent), node.parent))
+        if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
+            new_priority = self.eviction_strategy.get_priority(x.parent)
+            heapq.heappush(eviction_heap, (new_priority, x.parent))
+
+    return EvictResult(num_tokens_evicted=num_evicted)
 ```
+
+> **关键区别**: 实际实现使用 `self.evictable_leaves` (一个 `set`) 而非 `_collect_leaves()` 遍历。`evictable_leaves` 由 `_update_leaf_status()` 实时维护，避免每次 evict 都遍历整棵树。
 
 ## 6. 请求生命周期中的缓存操作
 
@@ -361,21 +393,23 @@ def evict(self, num_tokens: int):
 
 **作用**: 请求生命周期结束时调用，完成两件事：
 1. **固化 KV Cache**：将该请求的 token 序列和对应的 KV slot 索引插入 Radix Tree，使**下一轮具有相同前缀的请求**可以直接命中并复用这些 KV 数据。
-2. **释放资源**：解锁节点（`dec_lock_ref` → `lock_ref` 降为 0 → 节点变为**可驱逐**状态），释放请求槽位（`req_to_token_pool.free`）。被固化到 Tree 的 KV slot **不会立即 free**，而是留在 Tree 中等待后续请求复用或 LRU 驱逐时才释放。
+2. **释放资源**：释放与树中已有节点重复的 KV 索引、释放 page 对齐截断的 unaligned tail、解锁节点（`dec_lock_ref` → `lock_ref` 降为 0 → 节点变为**可驱逐**状态）。被固化到 Tree 的 KV slot **不会立即 free**，而是留在 Tree 中等待后续请求复用或 LRU 驱逐时才释放。`req_to_token_pool.free(req_pool_idx)` 由 Scheduler 在外部调用，不在此方法内。
 
 **关键动作**:
 
 ```mermaid
 flowchart TD
     S1["1: pop_committed_kv_cache<br/>获取已提交的 KV 长度"]
-    S2["2: 构建 RadixKey - token_ids, extra_key"]
-    S3["3: insert radix_key, kv_indices, priority<br/>返回: new_prefix_len - 已存在的前缀长度"]
+    S2["2: 构建 RadixKey<br/>token_ids, extra_key, page_align"]
+    S3["3: insert(InsertParams(key, value, priority))<br/>返回: InsertResult(prefix_len=已存在前缀长度)"]
     S4["4: free kv_indices[cache_protected_len : new_prefix_len]<br/>释放与树中已有节点重复的 KV"]
-    S5["5: req_to_token_pool.free req_pool_idx<br/>释放请求槽位"]
-    S6["6: dec_lock_ref req.last_node<br/>解锁之前持有的节点"]
+    S5["5: free kv_indices[len(keys):]<br/>释放 page_align 截断的 unaligned tail"]
+    S6["6: dec_lock_ref(req.last_node)<br/>解锁之前持有的节点"]
 
     S1 --> S2 --> S3 --> S4 --> S5 --> S6
 ```
+
+> **注意**: `req_to_token_pool.free(req_pool_idx)` 不在 `cache_finished_req` 内部执行，而是由 Scheduler 在外部调用。Step 5 释放的是 page 对齐后多余的 KV 索引（unaligned tail）。
 
 ### 6.2 cache_unfinished_req
 
@@ -447,15 +481,26 @@ def convert_to_bigram_key(token_ids: List[int]) -> List[int]:
 ## 10. Scheduler 集成
 
 ```python
-# scheduler.py 中的选择逻辑
-if self.is_hybrid_ssm:
-    self.tree_cache = MambaRadixCache(params)
-elif self.is_hybrid_swa:
-    self.tree_cache = SWARadixCache(params, sliding_window_size)
-elif enable_hierarchical_cache:
-    self.tree_cache = HiRadixCache(params, server_args)
+# scheduler.py 中的选择逻辑 (按优先级从高到低)
+if disable_radix_cache and chunked_prefill:
+    # 禁用 radix cache 时使用简化版
+    if self.is_hybrid_swa:
+        self.tree_cache = SWAChunkCache(params)
+    else:
+        self.tree_cache = ChunkCache(params)
 else:
-    self.tree_cache = RadixCache(params)
+    if SGLANG_EXPERIMENTAL_CPP_RADIX_TREE:
+        self.tree_cache = RadixCacheCpp(params, server_args)  # C++ 实验性实现
+    elif self.enable_hierarchical_cache:
+        self.tree_cache = HiRadixCache(params, server_args)   # 层级缓存 (继承 RadixCache)
+    elif self.is_hybrid_swa:
+        self.tree_cache = SWARadixCache(params)               # SWA 混合架构
+    elif self.is_hybrid_ssm:
+        self.tree_cache = MambaRadixCache(params)             # Mamba 混合架构
+    elif server_args.enable_lmcache:
+        self.tree_cache = LMCRadixCache(params, ...)          # LMCache 集成
+    else:
+        self.tree_cache = RadixCache(params)                  # 默认
 ```
 
 ## 11. 配置参数
@@ -901,7 +946,7 @@ flowchart TD
 
 **Tombstone 存在的根本原因**:
 
-Mamba 状态 (SSM state) 是**不可分割**的，只在 Chunk 边界 (FLA_CHUNK_SIZE=64) 有意义。当节点在中间位置被分裂 (Split) 时，新的中间节点无法拥有有意义的 Mamba 状态，因此置为 `None`（即 tombstone）。但 KV Cache 是 per-token 的，分裂后依然有效。
+Mamba 状态 (SSM state) 是**不可分割**的，只在 Chunk 边界 (`mamba_cache_chunk_size`，可配置) 有意义。当节点在中间位置被分裂 (Split) 时，新的中间节点无法拥有有意义的 Mamba 状态，因此置为 `None`（即 tombstone）。但 KV Cache 是 per-token 的，分裂后依然有效。
 
 **KV Cache 与 Mamba State 的独立性**:
 
@@ -915,22 +960,34 @@ Mamba 状态 (SSM state) 是**不可分割**的，只在 Chunk 边界 (FLA_CHUNK
 
 ### 13.4 cow_mamba (Copy-On-Write) 机制
 
-```python
-def match_prefix(self, key: RadixKey, cow_mamba: bool = False, req=None):
-    """
-    cow_mamba=True 时，将匹配节点的 Mamba 状态复制到请求的本地空间
-    """
-    value, last_node, mamba_branching_seqlen = self._match_prefix_helper(key)
+cow_mamba 逻辑位于 `_match_post_processor()` 方法中（不在 `match_prefix` 本体），通过 `MatchPrefixParams` 传入参数：
 
+```python
+def _match_post_processor(self, params: MatchPrefixParams,
+                          value, last_node, best_value_len) -> MatchResult:
+    cow_mamba = params.cow_mamba
+    req = params.req
+
+    # ... LRU 更新、mamba_branching_seqlen 计算 ...
+
+    # Copy mamba state to req local space if cow is true
     if cow_mamba and last_node.mamba_value is not None:
-        # 分配请求私有的 Mamba 状态槽
         if req.mamba_pool_idx is None:
             dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
+            # 分配失败时: 锁定 last_node 防止被驱逐, 触发 evict, 再重试
+            if dst_index is None:
+                self.inc_lock_ref(last_node)
+                self.evict(EvictParams(num_tokens=0, mamba_num=1))
+                dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
+                self.dec_lock_ref(last_node)
+            src_index = last_node.mamba_value
+            self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
             req.mamba_pool_idx = dst_index[0]
-
-        # 复制节点状态到请求私有空间
-        src_index = last_node.mamba_value
-        self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
+        else:
+            # 已有 mamba_pool_idx, 直接覆盖
+            src_index = last_node.mamba_value
+            dst_index = req.mamba_pool_idx.unsqueeze(0)
+            self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
 ```
 
 **为什么需要 Copy-On-Write?**
@@ -957,11 +1014,22 @@ flowchart TD
 ### 13.5 mamba_branching_seqlen
 
 ```python
-# _match_prefix_helper 返回值
-return value[:best_value_len], best_last_node, mamba_branching_seqlen
+# _match_prefix_helper 返回值 (注意: 返回完整 value list, 不做截断)
+return value, best_last_node, best_value_len
+# value: List[torch.Tensor] - 所有匹配节点的 KV 索引列表 (未截断)
+# best_last_node: TreeNode - 最深的有 mamba_value 的节点
+# best_value_len: int - best_last_node 对应的 value 列表长度
 
-# mamba_branching_seqlen 含义:
-# 在匹配过程中，最后一个有 mamba_value 的节点之后的 FLA_CHUNK_SIZE 对齐位置
+# mamba_branching_seqlen 在 _match_post_processor 中计算:
+if len(value) > best_value_len:
+    mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size  # 可配置
+    total_matched = sum(len(v) for v in value)
+    mamba_cache_chunk_aligned_seqlen = (
+        total_matched // mamba_cache_chunk_size
+    ) * mamba_cache_chunk_size
+    mamba_branching_seqlen = (
+        mamba_cache_chunk_aligned_seqlen if mamba_cache_chunk_aligned_seqlen > 0 else None
+    )
 ```
 
 **作用**: 告诉调度器从哪个位置开始需要重新计算 Mamba 状态
@@ -971,7 +1039,7 @@ flowchart LR
     subgraph MatchResult["匹配结果"]
         MR1["KV hit = 1000 tokens"]
         MR2["mamba_value 只在 token 800 处有效<br/>800 之后是 tombstone"]
-        MR3["mamba_branching_seqlen = 800<br/>FLA_CHUNK_SIZE=64 对齐"]
+        MR3["mamba_branching_seqlen = 800<br/>mamba_cache_chunk_size 对齐 (可配置)"]
     end
 
     subgraph SchedulerAction["调度器处理"]
@@ -986,8 +1054,8 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    subgraph Constraint1["约束 1: Mamba 状态必须在 FLA_CHUNK_SIZE 边界保存"]
-        C1["原因: Mamba 内部使用 chunk-based 算法<br/>FLA = Flash Linear Attention<br/>状态只在 chunk 边界是完整的"]
+    subgraph Constraint1["约束 1: Mamba 状态必须在 mamba_cache_chunk_size 边界保存"]
+        C1["原因: Mamba 内部使用 chunk-based 算法<br/>FLA = Flash Linear Attention<br/>状态只在 chunk 边界是完整的<br/>chunk 大小通过 mamba_cache_chunk_size 配置"]
     end
 
     subgraph Constraint2["约束 2: cache_unfinished_req 只缓存到 mamba_last_track_seqlen"]
@@ -1013,16 +1081,23 @@ flowchart TD
 self.full_lru_list = LRUList(mamba=False)   # 管理 KV Cache
 self.mamba_lru_list = LRUList(mamba=True)   # 管理 Mamba 状态
 
-def evict_mamba(self, num_slots: int):
+def evict_mamba(self, mamba_num: int) -> int:
     """只逐出 Mamba 状态，保留 KV Cache"""
-    node = self.mamba_lru_list.get_lru_no_lock()
-    while num_evicted < num_slots and node:
-        self.req_to_token_pool.mamba_pool.free(node.mamba_value)
-        node.mamba_value = None  # 变成 tombstone
-        self.mamba_lru_list.remove_node(node)
-        # 节点保留在 full_lru_list 中 (KV 仍可用)
-        num_evicted += 1
-        node = self.mamba_lru_list.get_lru_no_lock()
+    x = self.mamba_lru_list.get_lru_no_lock()
+    mamba_num_evicted = 0
+    while mamba_num_evicted < mamba_num and self.mamba_lru_list.in_list(x):
+        if len(x.children) > 0:
+            # 情况 1: 内部节点 → tombstone (保留节点结构)
+            self.req_to_token_pool.mamba_pool.free(x.mamba_value)
+            mamba_num_evicted += len(x.mamba_value)
+            x_next = self.mamba_lru_list.get_prev_no_lock(x)
+            self.mamba_lru_list.remove_node(x)
+            self._tombstone_internal_node(x)  # mamba_value=None, 节点保留
+        else:
+            # 情况 2: 叶子节点 → 完全删除 (释放 KV + Mamba)
+            _, mamba_evicted_delta, _, x_next = self._evict_leaf_node(x, True)
+            mamba_num_evicted += mamba_evicted_delta
+        x = x_next
 
 def evict(self, num_tokens: int):
     """逐出 KV Cache (同时会释放 Mamba 状态)"""
@@ -1031,16 +1106,18 @@ def evict(self, num_tokens: int):
 ```
 
 **逐出优先级**:
-1. 先逐出 Mamba 状态 (创建 tombstone)
-2. 如果 KV 内存不足，再逐出完整节点
+1. 先逐出 Mamba 状态：内部节点变为 tombstone（保留 KV），叶子节点完全删除
+2. 如果 KV 内存不足，再通过 `evict_full` 逐出完整节点
 
 ---
 
-## 14. SWA RadixCache (v0.5.9 新增)
+## 14. SWA RadixCache
 
 **文件**: `srt/mem_cache/swa_radix_cache.py` (1188行)
 
-管理 Full Attention 和 SWA 两种 attention 层的缓存。Qwen3.5 等混合架构模型需要同时维护两套缓存树。
+管理 Full Attention 和 SWA 两种 attention 层的缓存。Llama4、Step3p5 等 SWA 混合架构模型需要同时维护两套缓存树。
+
+> **注意**: Qwen3.5 的混合架构是 Full Attention + Linear Attention (GatedDeltaNet)，不使用 SWA。SWA 混合架构适用于 Llama4、Step3p5、GptOss、MiMoV2 等模型。
 
 ### 核心类
 
@@ -1050,11 +1127,11 @@ def evict(self, num_tokens: int):
 | `LRUList` | L118 | LRU 逐出列表 |
 | `SWARadixCache(BasePrefixCache)` | L339 | SWA Radix 缓存主类 |
 
-## 15. BasePrefixCache 接口重构 (v0.5.9)
+## 15. BasePrefixCache 接口重构
 
 **文件**: `srt/mem_cache/base_prefix_cache.py`
 
-v0.5.9 引入了结构化参数类，统一了各 RadixCache 子类的接口：
+SGLang 引入了结构化参数类，统一了各 RadixCache 子类的接口：
 
 | 参数类 | 说明 |
 |--------|------|
@@ -1065,11 +1142,11 @@ v0.5.9 引入了结构化参数类，统一了各 RadixCache 子类的接口：
 | `EvictResult` (L82) | 逐出结果：num_tokens_evicted、swa_num_tokens_evicted、mamba_num_evicted |
 | `MatchResult` (L91) | 匹配结果：device/host 索引、命中长度、mamba 分支信息 |
 
-## 16. 存储后端更新 (v0.5.9)
+## 16. 存储后端更新
 
 **文件**: `srt/mem_cache/storage/`
 
-v0.5.9 新增了多个外部存储后端：
+SGLang 支持多个外部存储后端：
 
 | 后端 | 目录 | 说明 |
 |------|------|------|
@@ -1080,7 +1157,7 @@ v0.5.9 新增了多个外部存储后端：
 | LMCache | `lmcache/` | LMCache 集成 |
 | Mooncake | `mooncake_store/` | Mooncake 分布式存储 |
 
-## 17. Mamba RadixCache (v0.5.9 更新)
+## 17. Mamba RadixCache
 
 **文件**: `srt/mem_cache/mamba_radix_cache.py` (1232行)
 

@@ -7,9 +7,9 @@
 ## 1. ModelRunner 概览
 
 **核心文件**:
-- `srt/model_executor/model_runner.py` - 模型执行器 (2454 行)
-- `srt/model_executor/cuda_graph_runner.py` - CUDA Graph 管理 (948 行)
-- `srt/model_executor/forward_batch_info.py` - ForwardBatch 定义 (1293 行)
+- `srt/model_executor/model_runner.py` - 模型执行器 (2688 行)
+- `srt/model_executor/cuda_graph_runner.py` - CUDA Graph 管理 (962 行)
+- `srt/model_executor/forward_batch_info.py` - ForwardBatch 定义 (1098 行)
 
 ### 1.1 职责分工
 
@@ -39,7 +39,7 @@ flowchart LR
 
 ### 1.2 TpModelWorker - Scheduler 与 ModelRunner 之间的桥梁
 
-**核心文件**: `srt/managers/tp_worker.py:205`
+**核心文件**: `srt/managers/tp_worker.py:206`
 
 `TpModelWorker` 是运行在 GPU 进程中的工作者类，负责连接 Scheduler 和 ModelRunner。
 
@@ -115,9 +115,9 @@ class ForwardMode(IntEnum):
 ```python
 # 常用判断
 forward_mode.is_decode()           # DECODE
-forward_mode.is_extend()           # EXTEND, DRAFT_EXTEND
-forward_mode.is_prefill()          # EXTEND, MIXED, DRAFT_EXTEND
-forward_mode.is_cuda_graph()       # DECODE, TARGET_VERIFY, DLLM_EXTEND
+forward_mode.is_extend()           # EXTEND, MIXED, DRAFT_EXTEND, TARGET_VERIFY, SPLIT_PREFILL, DLLM_EXTEND (+ DRAFT_EXTEND_V2 可选)
+forward_mode.is_prefill()          # 等价于 is_extend()，是其别名
+forward_mode.is_cuda_graph()       # DECODE, TARGET_VERIFY, IDLE, DLLM_EXTEND
 forward_mode.is_split_prefill()    # SPLIT_PREFILL
 ```
 
@@ -125,8 +125,10 @@ forward_mode.is_split_prefill()    # SPLIT_PREFILL
 
 ```python
 @dataclass
-class ForwardBatch:
+class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     """存储 forward pass 的所有输入"""
+    # 继承 ForwardBatchDeepSeekMHAMixin，提供 DeepSeek MHA/MLA 专用字段
+    # （latent KV、absorbed QK 等，定义在 forward_batch_deepseek_mha_mixin.py）
 
     # 基本信息
     forward_mode: ForwardMode
@@ -181,31 +183,69 @@ def forward(
     forward_batch: ForwardBatch,
     skip_attn_backend_init: bool = False,
     pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    reinit_attn_backend: bool = False,      # PDMux split prefill 重新初始化
+    split_forward_count: int = 1,           # PDMux 每次执行几层
 ) -> ModelRunnerOutput:
 ```
 
-**执行流程**:
+**`ModelRunnerOutput` 数据类** (`model_runner.py:271-275`):
+
+```python
+@dataclass
+class ModelRunnerOutput:
+    logits_output: Union[LogitsProcessorOutput, PPProxyTensors]
+    can_run_graph: bool                                          # 是否使用了 CUDA Graph
+    expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None  # EPLB 指标
+```
+
+**执行流程 — 两层架构**:
+
+`forward()` 是外层包装，负责 EPLB（Expert Load Balancing）记录与容错；`_forward_raw()` 是内层实际分发。
 
 ```mermaid
 flowchart TB
-    Start["forward(forward_batch)"] --> GraphCheck{"可以使用<br/>CUDA Graph?"}
+    Start["forward(forward_batch)"] --> PassId["forward_pass_id += 1"]
+    PassId --> EPLB["进入 expert_distribution_recorder 上下文"]
+    EPLB --> Raw["_forward_raw() — 实际模式分发"]
+    Raw --> ElasticCheck{"ElasticEP<br/>状态变化?"}
+    ElasticCheck -->|Yes| Rebalance["EPLB rebalance +<br/>重新 _forward_raw()"]
+    ElasticCheck -->|No| Metrics["附加 expert_distribution_metrics"]
+    Rebalance --> Metrics
+    Metrics --> Capturer["get_global_experts_capturer()<br/>.on_forward_end()"]
+    Capturer --> EPLBEnd["eplb_manager<br/>.on_forward_pass_end()"]
+    EPLBEnd --> Return["返回 ModelRunnerOutput"]
 
-    GraphCheck -->|Yes| Replay["graph_runner.replay()"]
-    GraphCheck -->|No| ModeCheck{"forward_mode?"}
+    style EPLB fill:#FFE4B5
+    style Raw fill:#87CEEB
+    style Return fill:#90EE90
+```
+
+**`_forward_raw()` 内部分发** (`model_runner.py:2443-2516`):
+
+```mermaid
+flowchart TB
+    Start["_forward_raw()"] --> GraphCheck{"is_cuda_graph() &&<br/>graph_runner.can_run()?"}
+
+    GraphCheck -->|Yes| Replay["graph_runner.replay()<br/>→ 立即返回"]
+    GraphCheck -->|No| MLPSync["prepare_mlp_sync_batch()<br/>或 prepare_attn_tp_scatter_input()"]
+
+    MLPSync --> ModeCheck{"forward_mode?"}
 
     ModeCheck -->|DECODE| Decode["forward_decode()"]
-    ModeCheck -->|EXTEND| Extend["forward_extend()"]
     ModeCheck -->|SPLIT_PREFILL| Split["forward_split_prefill()"]
+    ModeCheck -->|EXTEND| Extend["forward_extend()<br/>→ (ret, can_run_graph)"]
     ModeCheck -->|IDLE| Idle["forward_idle()"]
 
-    Decode --> Output["ModelRunnerOutput<br/>(logits_output)"]
-    Extend --> Output
-    Split --> Output
-    Idle --> Output
-    Replay --> Output
+    Decode --> PostSync["post_forward_mlp_sync_batch()<br/>(如果需要)"]
+    Split --> PostSync
+    Extend --> PostSync
+    Idle --> PostSync
+    PostSync --> Output["ModelRunnerOutput<br/>(logits_output, can_run_graph)"]
+    Replay --> Output2["ModelRunnerOutput<br/>(logits_output, can_run_graph=True)"]
 
     style Replay fill:#90EE90
     style Output fill:#87CEEB
+    style Output2 fill:#87CEEB
 ```
 
 ### 4.2 forward_decode
@@ -215,16 +255,28 @@ def forward_decode(
     self,
     forward_batch: ForwardBatch,
     skip_attn_backend_init: bool = False,
-) -> LogitsProcessorOutput:
+    pp_proxy_tensors=None,
+) -> Union[LogitsProcessorOutput, PPProxyTensors]:
     if not skip_attn_backend_init:
-        self.attn_backend.init_forward_metadata(forward_batch)
+        # PDMux 分支: 使用独立的 decode_attn_backend
+        if self.server_args.enable_pdmux:
+            self.decode_attn_backend.init_forward_metadata(forward_batch)
+            forward_batch.attn_backend = self.decode_attn_backend
+        else:
+            self.attn_backend.init_forward_metadata(forward_batch)
 
+    kwargs = {}
+    if self.support_pp:
+        kwargs["pp_proxy_tensors"] = pp_proxy_tensors
     return self.model.forward(
         forward_batch.input_ids,
         forward_batch.positions,
         forward_batch,
+        **kwargs,
     )
 ```
+
+> **PDMux 分支说明**: 当启用 PDMux 时，decode 路径使用 `decode_attn_backend`（通过 `update_decode_attn_backend(stream_idx)` 按 stream 切换），与 prefill 使用的 `attn_backend` 分离，使两者可以在不同 CUDA Stream 上并行执行。
 
 ### 4.3 forward_extend
 
@@ -233,19 +285,34 @@ def forward_extend(
     self,
     forward_batch: ForwardBatch,
     skip_attn_backend_init: bool = False,
-) -> LogitsProcessorOutput:
+    pp_proxy_tensors=None,
+) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput], bool]:
+    # 返回值: (logits_output, can_run_graph)
+    # can_run_graph 表示是否使用了 Piecewise CUDA Graph
+
+    kwargs = {}
+    if self.support_pp:
+        kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+    if forward_batch.input_embeds is not None:
+        kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16()
+
     # 尝试 Piecewise CUDA Graph (长序列优化)
-    if self.piecewise_cuda_graph_runner and piecewise_runner.can_run(forward_batch):
-        return self.piecewise_cuda_graph_runner.replay(forward_batch)
+    can_run_graph = (
+        self.piecewise_cuda_graph_runner is not None
+        and self.piecewise_cuda_graph_runner.can_run(forward_batch)
+    )
+    if can_run_graph:
+        return (self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs), can_run_graph)
 
     if not skip_attn_backend_init:
         self.attn_backend.init_forward_metadata(forward_batch)
 
-    return self.model.forward(
+    return (self.model.forward(
         forward_batch.input_ids,
         forward_batch.positions,
         forward_batch,
-    )
+        **kwargs,
+    ), can_run_graph)
 ```
 
 ### 4.4 forward_idle
@@ -257,18 +324,27 @@ def forward_extend(
 **如果没有 forward_idle 会怎样？** DP Attention 中所有 rank 必须同步参与 AllReduce。如果一个 rank 没有请求就跳过 forward，其他 rank 会在 AllReduce 处永远等待 → **NCCL 死锁**。
 
 ```python
-def forward_idle(self, forward_batch: ForwardBatch):
-    # 关键: 不初始化 attn_backend metadata
-    # 因为没有实际请求，attention 元数据无意义
-    # 但仍然运行模型 forward 以参与 NCCL 通信
+def forward_idle(self, forward_batch: ForwardBatch, pp_proxy_tensors=None):
+    # DP Attention 场景: IDLE 批次可能被 padding (batch_size > 0) 以参与 MLP sync
+    # 此时必须初始化 attn metadata，否则 stale metadata 导致 batch_size 不匹配
+    # (例如 NSA Indexer 会因 metadata 中的旧 batch_size 而报错)
+    if forward_batch.batch_size > 0:
+        self.attn_backend.init_forward_metadata(forward_batch)
+
+    kwargs = {}
+    if self.support_pp:
+        kwargs["pp_proxy_tensors"] = pp_proxy_tensors
     return self.model.forward(
-        forward_batch.input_ids,     # 空的 input_ids (0 tokens)
-        forward_batch.positions,     # 空的 positions
+        forward_batch.input_ids,
+        forward_batch.positions,
         forward_batch,
+        **kwargs,
     )
 ```
 
-**输入**：`input_ids` 为空张量（0 个 token），`batch_size=0`。模型内部的 NCCL AllReduce 仍然会被调用（即使数据为空），确保所有 rank 同步。
+**两种情况**：
+- **标准场景**: `batch_size=0`，`input_ids` 为空张量，不初始化 attn metadata。模型内部的 NCCL AllReduce 仍然会被调用（即使数据为空），确保所有 rank 同步。
+- **DP Attention MLP sync 场景**: `batch_size > 0`（IDLE 批次被 padding），**会**初始化 attn metadata 并执行实际计算，以维持跨 DP rank 的 MLP 同步。
 
 ### 4.5 forward_split_prefill
 
@@ -595,15 +671,24 @@ Stream 1:    [Attention_B] [     MoE_B     ] [MLP_B]
 ### 6.1 get_batch_sizes_to_capture
 
 ```python
-def get_batch_sizes_to_capture(model_runner):
+def get_batch_sizes_to_capture(model_runner, num_tokens_per_bs=1):
     # 默认捕获列表 (2 的幂次 + 中间值)
     capture_bs = server_args.cuda_graph_bs
     # 例: [1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256]
 
-    # 添加最大 running requests
+    # 添加最大 running requests (当默认列表最大值超出时)
     capture_bs += [model_runner.req_to_token_pool.size]
 
-    # 过滤超出范围的值
+    # mul_base 对齐过滤 — 确保 bs * num_tokens_per_bs 是 mul_base 的倍数
+    mul_base = 1
+    if server_args.enable_two_batch_overlap:   # TBO 需要对半拆分
+        mul_base *= 2
+    if require_gathered_buffer(server_args):    # Attention TP 需要对齐
+        mul_base *= get_attention_tp_size()
+    if mul_base % get_attention_cp_size() != 0:  # CP 对齐
+        mul_base *= get_attention_cp_size()
+
+    capture_bs = [bs for bs in capture_bs if bs * num_tokens_per_bs % mul_base == 0]
     capture_bs = [bs for bs in capture_bs if bs <= req_to_token_pool.size]
 
     return sorted(set(capture_bs))
@@ -749,6 +834,10 @@ def forward_split_prefill(
     reinit_attn_backend: bool = False,
     forward_count: int = 1,  # 本次执行几层
 ) -> LogitsProcessorOutput:
+    # 首次 split 或显式要求时初始化 attn metadata
+    if forward_batch.split_index == 0 or reinit_attn_backend:
+        self.attn_backend.init_forward_metadata(forward_batch)
+
     # 执行 [split_index, next_split_index) 层
     next_split_index = min(
         forward_batch.split_index + forward_count,
@@ -796,8 +885,11 @@ flowchart TD
 def forward_split_prefill(
     self,
     forward_batch: ForwardBatch,
-    forward_count: int = 1,  # 控制每次执行几层
+    reinit_attn_backend: bool = False,  # 是否强制重新初始化 attn metadata
+    forward_count: int = 1,             # 控制每次执行几层
 ) -> LogitsProcessorOutput:
+    if forward_batch.split_index == 0 or reinit_attn_backend:
+        self.attn_backend.init_forward_metadata(forward_batch)
     next_split_index = min(
         forward_batch.split_index + forward_count,
         self.model_config.num_hidden_layers,
@@ -912,7 +1004,7 @@ for bs in self.capture_bs:
 ```
 
 **开启条件**:
-- `forward_mode.is_cuda_graph()` → True (DECODE, TARGET_VERIFY, DLLM_EXTEND)
+- `forward_mode.is_cuda_graph()` → True (DECODE, TARGET_VERIFY, IDLE, DLLM_EXTEND)
 - `batch_size <= max_bs` (在捕获范围内)
 - 非 mixed batch (encoder-decoder 场景)
 - capture_hidden_mode 匹配
@@ -1068,7 +1160,7 @@ export SGLANG_VIT_ENABLE_CUDA_GRAPH=1
 ```mermaid
 flowchart TD
     subgraph DecodeCG["Decode CUDA Graph"]
-        DE["开启条件"] --> DE1["forward_mode in<br/>DECODE, TARGET_VERIFY, DLLM_EXTEND"]
+        DE["开启条件"] --> DE1["forward_mode in<br/>DECODE, TARGET_VERIFY, IDLE, DLLM_EXTEND"]
         DE --> DE2["batch_size <= max_bs"]
         DE --> DE3["graph_runner.can_run() = True"]
         DD["关闭条件"] --> DD1["--disable-cuda-graph"]
@@ -1254,25 +1346,38 @@ def init_piecewise_cuda_graphs(self):
 
 ## 11. 初始化流程
 
+实际上 `__init__()` 只保存参数并初始化分布式环境，真正的编排在 `initialize(min_per_gpu_memory)` 方法中 (`model_runner.py:447-629`)。
+
 ```mermaid
 flowchart TD
-    Init["ModelRunner.__init__()"] --> D1
+    Init["ModelRunner.__init__()"] --> S1["保存 model_config, server_args,<br/>gpu_id, tp_rank 等参数"]
+    S1 --> S2["init_torch_distributed()<br/>初始化 TP/PP 进程组 (NCCL)"]
+    S2 --> S3["调用 initialize(min_per_gpu_memory)"]
 
-    D1["1.init_torch_distributed()<br/>初始化 TP/PP 进程组 (NCCL)"]
-    D1 --> D2["2.load_model()<br/>加载模型权重到 GPU"]
-    D2 --> D3["3.init_memory_pool()<br/>创建 ReqToTokenPool + KVCache + Allocator"]
-    D3 --> D4["4.init_attention_backend()<br/>选择 FlashInfer/Triton/FA2"]
-    D4 --> D5["5.init_device_graphs()<br/>捕获 Decode CUDA Graph"]
-    D5 --> D6["6.init_piecewise_cuda_graphs()<br/>捕获 Piecewise CUDA Graph (如启用)"]
+    S3 --> I1["1. create_sampler()<br/>创建采样器"]
+    I1 --> I2["2. load_model()<br/>加载模型权重到 GPU"]
+    I2 --> I3["3. apply_torchao_config<br/>TorchAO 量化 (如启用)"]
+    I3 --> I4["4. init_lora_manager()<br/>LoRA 适配 (如启用)"]
+    I4 --> I5["5. configure_kv_cache_dtype()<br/>推断 KV Cache 数据类型"]
+    I5 --> I6["6. init_memory_pool()<br/>创建 ReqToTokenPool +<br/>KVCache + Allocator"]
+    I6 --> I7["7. init_attention_backend()<br/>选择 FlashInfer/Triton/FA2"]
+    I7 --> I8["8. kernel_warmup()<br/>预热 kernel"]
+    I8 --> I9["9. init_device_graphs()<br/>捕获 Decode CUDA Graph"]
+    I9 --> I10["10. init_piecewise_cuda_graphs()<br/>捕获 Piecewise CUDA Graph (如启用)"]
 
-    D1 -.->|"需要 TP 组"| D2
-    D2 -.->|"模型结构决定"| D3
-    D3 -.->|"内存池引用传入 ForwardBatch"| D4
-    D4 -.->|"attn_backend 用于 Graph capture"| D5
-    D5 -.->|"Piecewise 独立于 Decode Graph"| D6
+    S2 -.->|"需要 TP 组"| I2
+    I2 -.->|"模型结构决定"| I6
+    I6 -.->|"内存池引用传入 ForwardBatch"| I7
+    I7 -.->|"attn_backend 用于 Graph capture"| I9
+    I9 -.->|"Piecewise 独立于 Decode Graph"| I10
+
+    style Init fill:#FFE4B5
+    style S3 fill:#87CEEB
 ```
 
-> **依赖链**：TP 组 → 模型权重 → 内存池 → Attention 后端 → CUDA Graph。每一步都依赖前一步的结果。
+> **依赖链**：TP 组 → 模型权重 → KV Cache dtype → 内存池 → Attention 后端 → CUDA Graph。每一步都依赖前一步的结果。
+>
+> **注意**: `initialize()` 还包含 EPLB 初始化 (`EPLBManager`)、Double Sparsity 配置、routed experts capturer 等步骤，上图仅展示主要流程。
 
 ## 12. 内存管理
 
@@ -1505,27 +1610,33 @@ python -m sglang.launch_server ... --disable-cuda-graph
 | 概念 | 要点 | 关键代码位置 |
 |------|------|-------------|
 | **三层数据结构** | ScheduleBatch → ModelWorkerBatch → ForwardBatch 的转换与设计原因 | `forward_batch_info.py:init_new()` |
-| **ForwardMode** | EXTEND/DECODE/MIXED/SPLIT_PREFILL 的区别与使用场景 | `forward_batch_info.py:70-180` |
+| **ForwardMode** | EXTEND/DECODE/MIXED/SPLIT_PREFILL 的区别与使用场景 | `forward_batch_info.py:74-186` |
 | **CUDA Graph 原理** | 解决 kernel launch 开销，固定地址约束 | `cuda_graph_runner.py` |
 | **GraphInputBuffers** | 预分配固定地址 buffer，replay 时 copy 数据 | `input_buffers.py` |
-| **can_run() 判断** | 5 个条件决定是否使用 CUDA Graph | `cuda_graph_runner.py:373-437` |
-| **torch.compile + CUDA Graph** | 先 compile 优化 kernel，再 capture 录制 | `cuda_graph_runner.py:140-170` |
+| **can_run() 判断** | 5 个条件决定是否使用 CUDA Graph | `cuda_graph_runner.py:385-450` |
+| **torch.compile + CUDA Graph** | 先 compile 优化 kernel，再 capture 录制 | `cuda_graph_runner.py:141-171` |
 
 ### 关键执行路径
 
 ```
-ModelRunner.forward()
-├── forward_mode.is_cuda_graph() && can_run()?
-│   ├── Yes → cuda_graph_runner.replay()
-│   │         ├── bisect_left 选择合适的 bs
-│   │         ├── buffers.populate_from_forward_batch()
-│   │         └── graph.replay()
-│   └── No → 根据 forward_mode 分发
-│            ├── DECODE → forward_decode()
-│            ├── EXTEND → forward_extend()
-│            ├── SPLIT_PREFILL → forward_split_prefill()
-│            └── IDLE → forward_idle()
-└── sample() → next_token_ids
+ModelRunner.forward()                          ← 外层: EPLB 包装
+├── forward_pass_id += 1
+├── expert_distribution_recorder 上下文
+├── _forward_raw()                             ← 内层: 实际模式分发
+│   ├── is_cuda_graph() && graph_runner.can_run()?
+│   │   ├── Yes → graph_runner.replay()
+│   │   │         ├── bisect_left 选择合适的 bs
+│   │   │         ├── buffers.populate_from_forward_batch()
+│   │   │         └── graph.replay()
+│   │   └── No → prepare_mlp_sync / attn_tp_scatter
+│   │            ├── DECODE → forward_decode()
+│   │            ├── SPLIT_PREFILL → forward_split_prefill()
+│   │            ├── EXTEND → forward_extend() → (ret, can_run_graph)
+│   │            └── IDLE → forward_idle()
+│   └── → ModelRunnerOutput(logits_output, can_run_graph)
+├── ElasticEP 状态变化? → EPLB rebalance + 重新 _forward_raw()
+├── 附加 expert_distribution_metrics
+└── → ModelRunnerOutput
 ```
 
 ### 常见问题排查
@@ -1547,13 +1658,13 @@ ModelRunner.forward()
 | 调试/开发 | `--disable-cuda-graph` |
 | 低延迟优先 | 开启 PDMux (`--enable-pdmux`) |
 
-## 17. Batch Overlap 集成 (v0.5.9 新增)
+## 17. Batch Overlap 集成
 
 ModelRunner 在 `forward()` 方法中与 `batch_overlap/` 模块协作，支持 SBO/TBO 两种重叠模式。
 
 **文件**: `srt/model_executor/model_runner.py` (2688行)
 
-### 关键方法 (v0.5.9 行号)
+### 关键方法
 
 | 方法 | 行号 | 说明 |
 |------|------|------|
@@ -1568,16 +1679,45 @@ ModelRunner 在 `forward()` 方法中与 `batch_overlap/` 模块协作，支持 
 
 > **详细分析**: 见 **24-batch-overlap.md**
 
-## 18. KV Cache Mixin (v0.5.9 新增)
+## 18. KV Cache Mixin
 
-**文件**: `srt/model_executor/model_runner_kv_cache_mixin.py`
+**文件**: `srt/model_executor/model_runner_kv_cache_mixin.py` (747 行)
 
-KV Cache 管理逻辑从 model_runner.py 抽取到独立 mixin，包括：
-- KV Cache 的初始化和配置
-- 内存池的创建和管理
-- CUDA Graph 中 KV Cache 的处理
+KV Cache 管理逻辑从 model_runner.py 抽取到独立 mixin (`ModelRunnerKVCacheMixin`)，`ModelRunner` 通过继承获得这些方法。
 
-## 19. 其他新增模块 (v0.5.9)
+**关键方法**:
+
+| 方法 | 行号 | 职责 |
+|------|------|------|
+| `get_cell_size_per_token()` | L47 | 计算每 token KV cache 字节数（支持 MLA/MHA/SWA/FP4/NSA） |
+| `profile_max_num_token()` | L116 | 探测 GPU 可容纳的最大 token 数（基于可用显存和 cell_size） |
+| `handle_max_mamba_cache()` | L151 | 为 Mamba/线性注意力模型预留中间状态内存 |
+| `calculate_mla_kv_cache_dim()` | L212 | MLA 模型 KV cache 维度计算（含 NSA FP8 量化布局） |
+| `set_num_tokens_hybrid_swa()` | L251 | 混合 SWA 模型的 full/swa token 数分配 |
+| `init_memory_pool()` | L339-747 | 核心内存池初始化（ReqToTokenPool + KVPool + Allocator） |
+
+**与 Qwen3.5 的关联**: `get_cell_size_per_token()` 中的 `is_hybrid_swa` 分支处理 Qwen3.5 的混合注意力层（Full Attention + SWA），分别计算 full 层和 swa 层的 per-token 开销并加总。`init_memory_pool()` 根据模型类型选择不同的 KVPool 实现（MLA → `MLATokenToKVPool`，混合 → 双池架构）。
+
+### 18.1 混合模型检测属性
+
+ModelRunner 通过一组 `@property` 方法检测当前模型的混合架构类型，这些属性决定 attention backend wrapper 的选择，是理解 Qwen3.5 执行路径的关键。
+
+| 属性 | 行号 | 检测目标 | 匹配的 Config 类型 |
+|------|------|---------|-------------------|
+| `qwen3_next_config` | L1564 | Qwen3Next 配置 | `Qwen3NextConfig` |
+| `hybrid_gdn_config` | L1578 | GatedDeltaNet 混合模型 | `Qwen3NextConfig`, `Qwen3_5Config`, `Qwen3_5MoeConfig`, `JetNemotronConfig`, `JetVLMConfig` |
+| `mamba2_config` | L1592 | Mamba2 混合模型 | `FalconH1Config`, `NemotronHConfig`, `Lfm2Config` 等 |
+| `kimi_linear_config` | L1628 | Kimi 线性注意力 | `KimiLinearConfig` |
+| `mambaish_config` | L1635 | **统一检测**所有混合线性注意力模型 | 上述四者的 OR 组合 |
+
+**`mambaish_config` 的作用链**:
+1. `profile_max_num_token()` 中用于确定 KV cache 层数（只计算 full attention 层）
+2. `init_memory_pool()` 中用于选择 Mamba 状态池
+3. `init_attention_backend()` 中用于选择 `HybridLinearAttnBackend` wrapper
+
+**Qwen3.5 路径**: `hybrid_gdn_config` 返回 `Qwen3_5Config` → `mambaish_config` 非 None → 使用 `HybridLinearAttnBackend`（包装 FlashInfer/Triton 后端 + GatedDeltaNet 后端）。
+
+## 19. 其他模块
 
 | 文件 | 说明 |
 |------|------|

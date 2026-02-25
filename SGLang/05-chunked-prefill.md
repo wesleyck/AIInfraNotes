@@ -44,7 +44,7 @@ flowchart LR
 | `--enable-mixed-chunk` | bool | False | 允许 Prefill + Decode 混合批次 |
 | `--enable-dynamic-chunking` | bool | False | PP 模式下动态调整 chunk 大小 |
 | `--max-prefill-tokens` | int | 16384 | 单批次最大 prefill token 数 |
-| `--prefill-max-requests` | Optional[int] | None | 限制 prefill 批次最大请求数（`server_args.py` L1302） |
+| `--prefill-max-requests` | Optional[int] | None | 限制 prefill 批次最大请求数（`server_args.py` L3170） |
 
 ### 2.1 启用方式
 
@@ -64,32 +64,29 @@ python -m sglang.launch_server \
 ## 3. 初始化流程
 
 ```python
-# scheduler.py L742-769
+# scheduler.py L762-785
 def init_chunked_prefill(self):
     # 从 server_args 读取 chunked_prefill_size
     self.chunked_prefill_size = self.server_args.chunked_prefill_size
-    
-    # 特殊情况: Diffusion LLM 使用 block_size 作为 chunk size
-    if self.dllm_config is not None:
-        self.chunked_prefill_size = self.dllm_config.block_size
-    
-    # -1 表示禁用
+
+    # <= 0 表示禁用 (-1 是常用值)
     if self.chunked_prefill_size <= 0:
         self.chunked_prefill_size = None
-    
+
     # 当前正在分块处理的请求
     self.chunked_req = None
-    
+
     # Mixed Chunk 模式: 允许 Prefill + Decode 混合
     self.is_mixed_chunk = (
         self.chunked_prefill_size is not None
         and self.server_args.enable_mixed_chunk
     )
-    
+
     # PP 动态调整 chunk size
     self.enable_dynamic_chunking = (
         self.server_args.enable_dynamic_chunking and self.pp_size > 1
     )
+    # 启用后会调用 profile_and_init_predictor() 初始化延迟预测器
 ```
 
 ## 4. 调度流程
@@ -137,7 +134,7 @@ flowchart TB
 ### 4.2 PrefillAdder 核心参数
 
 ```python
-# schedule_policy.py L317-367
+# schedule_policy.py L372-431
 class PrefillAdder:
     def __init__(
         self,
@@ -167,7 +164,7 @@ class PrefillAdder:
 > **交叉引用**：分块截断的完整流程（包括 `add_chunked_req` 续传、`truncation_align_size` 对齐、`budget_state` 预算检查等）详见 [`04-schedule-policy.md` §7 Chunked Prefill 处理](04-schedule-policy.md#7-chunked-prefill-处理)。
 
 ```python
-# schedule_policy.py L570-666
+# schedule_policy.py L719-825
 def add_one_req(self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]):
     input_tokens = self.ceil_paged_tokens(req.extend_input_len)
     
@@ -242,7 +239,7 @@ sequenceDiagram
 Chunked Prefill 引入了 `ForwardMode.MIXED` 模式。完整的 `ForwardMode` 枚举定义如下：
 
 ```python
-# forward_batch_info.py L70-96
+# forward_batch_info.py L74-100
 class ForwardMode(IntEnum):
     EXTEND = auto()           # Prefill / 序列扩展
     DECODE = auto()           # 单 token 解码
@@ -284,7 +281,7 @@ Mixed Chunk 允许将 Chunked Prefill 和 Decode 请求合并到同一批次，�
 ### 6.1 启用条件
 
 ```python
-# scheduler.py L2053-2067
+# scheduler.py L2183-2201
 # Mixed-style chunked prefill
 if (
     self.is_mixed_chunk
@@ -297,12 +294,16 @@ if (
         self.running_batch.prepare_for_decode()
         new_batch.mix_with_running(self.running_batch)
         new_batch.decoding_reqs = self.running_batch.reqs
+    # 混合后清空 running_batch（请求已合并进 new_batch，避免重复）
+    self.running_batch = ScheduleBatch(
+        reqs=[], batch_is_full=self.running_batch.batch_is_full
+    )
 ```
 
 ### 6.2 mix_with_running 实现
 
 ```python
-# schedule_batch.py L1671-1700
+# schedule_batch.py L1770-1799
 def mix_with_running(self, running_batch: "ScheduleBatch"):
     # 设置为 MIXED 模式
     self.forward_mode = ForwardMode.MIXED
@@ -321,9 +322,19 @@ def mix_with_running(self, running_batch: "ScheduleBatch"):
     self.input_ids = input_ids
     self.out_cache_loc = out_cache_loc
     
+    # For overlap scheduler, the output_ids has one step delay
+    delta = 0 if self.enable_overlap else -1
+
+    # 记录每个 decode 请求的前缀长度 (已缓存的 token 数)
+    self.prefix_lens.extend(
+        [len(r.origin_input_ids) + len(r.output_ids) + delta
+         for r in running_batch.reqs]
+    )
+
     # 更新 extend 信息
     self.extend_lens.extend([1] * running_bs)  # Decode 请求 extend_len=1
     self.extend_num_tokens += running_bs
+    self.extend_logprob_start_lens.extend([0] * running_bs)
     self.is_prefill_only = False
 ```
 
@@ -363,20 +374,26 @@ flowchart TB
 
 ### 7.1 支持的模型
 
+实际实现采用**黑名单**机制（而非白名单）：大多数多模态模型默认支持 Chunked Prefill，只有少数旧架构因 embedding 处理方式不兼容而被排除。
+
 ```python
-# model_config.py L1126-1136
+# model_config.py L1299-1311
 def is_multimodal_chunked_prefill_supported(model_architectures: List[str]):
-    """检查多模态模型是否支持 Chunked Prefill"""
-    return any(
-        arch in model_architectures
-        for arch in [
-            "Qwen2VLForConditionalGeneration",
-            "Qwen3VLForConditionalGeneration",
-            "InternVLChatModel",
-            ...
-        ]
-    )
+    """检查多模态模型是否支持 Chunked Prefill (黑名单机制)"""
+    unsupported = [
+        "Grok1VForCausalLM",
+        "Grok1AForCausalLM",
+        "LlavaLlamaForCausalLM",
+        "MllamaForConditionalGeneration",
+        "CLIPModel",
+    ]
+    if any(arch in unsupported for arch in model_architectures):
+        return False
+    else:
+        return True
 ```
+
+> **为什么用黑名单**: 随着多模态 Chunked Prefill 支持的成熟，绝大多数模型都已兼容。只有少数旧架构（如 Grok1V、LlavaLlama、Mllama）因其特殊的 embedding 拼接方式无法正确按 chunk 切分，需要显式排除。
 
 ### 7.2 核心机制: Embedding Chunk 提取
 
@@ -416,7 +433,7 @@ flowchart TB
 ### 7.3 get_embedding_chunk 函数
 
 ```python
-# mm_utils.py L379-421
+# mm_utils.py L383-425
 def get_embedding_chunk(
     embedding: torch.Tensor,          # 完整的多模态 embedding
     extend_prefix_len: int,           # 当前 chunk 的起始位置
@@ -458,7 +475,7 @@ def get_embedding_chunk(
 对于包含大量帧的视频，SGLang 提供了优化的分块处理机制：
 
 ```python
-# mm_utils.py L700-787
+# mm_utils.py L730-787
 def _get_chunked_prefill_embedding_for_chunked_items(...):
     """
     多模态 embedding 的分块计算优化。
@@ -490,20 +507,34 @@ def _get_chunked_prefill_embedding_for_chunked_items(...):
 当 embedding 长度与 input_ids 中的 placeholder 数量不匹配时：
 
 ```python
-# mm_utils.py L796-825
+# mm_utils.py L826-855
 def _adjust_embedding_length(embedding, mask, logger):
     num_mm_tokens_in_embedding = embedding.shape[0]
     num_mm_tokens_in_input_ids = mask.sum().item()
-    
-    if num_mm_tokens_in_input_ids < num_mm_tokens_in_embedding:
-        chunked_prefill_size = get_global_server_args().chunked_prefill_size
-        if chunked_prefill_size != -1:
-            logger.warning(
-                "You may want to avoid this issue by raising "
-                "`chunked_prefill_size`, or disabling chunked prefill"
+
+    if num_mm_tokens_in_input_ids != num_mm_tokens_in_embedding:
+        # ... warning log 省略 ...
+
+        if num_mm_tokens_in_input_ids < num_mm_tokens_in_embedding:
+            chunked_prefill_size = get_global_server_args().chunked_prefill_size
+            if chunked_prefill_size != -1:
+                logger.warning(
+                    "You may want to avoid this issue by raising "
+                    "`chunked_prefill_size`, or disabling chunked prefill"
+                )
+            # 2D embedding: 直接从末尾截取
+            if embedding.dim() == 2:
+                embedding = embedding[-num_mm_tokens_in_input_ids:, :]
+            else:
+                # 3D embedding (如视频帧): 按第一维截取
+                num_multimodal = num_mm_tokens_in_input_ids // embedding.shape[0]
+                embedding = embedding[-num_multimodal:, :]
+        else:
+            # input_ids 中的 placeholder 比 embedding 多 → 内部错误
+            raise RuntimeError(
+                f"Insufficient multimodal embedding length: "
+                f"{num_mm_tokens_in_input_ids=} vs {num_mm_tokens_in_embedding=}."
             )
-        # 从末尾截取需要的部分
-        embedding = embedding[-num_mm_tokens_in_input_ids:, :]
     return embedding
 ```
 
@@ -581,7 +612,7 @@ flowchart TB
 PD 分离使用 `is_chunked` 计数器跟踪分块进度：
 
 ```python
-# prefill.py L448-501
+# prefill.py L429-501
 def process_batch_result_disagg_prefill(self, batch, result):
     for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
         if req.is_chunked <= 0:
@@ -603,7 +634,7 @@ def process_batch_result_disagg_prefill(self, batch, result):
 在 PD 分离模式下，每个 chunk 完成后都可以开始 KV 传输：
 
 ```python
-# prefill.py L656-734
+# prefill.py L672-734
 def send_kv_chunk(
     self: Scheduler,
     req: Req,
@@ -683,7 +714,7 @@ sequenceDiagram
 分块请求在每个 chunk 完成后更新 RadixCache：
 
 ```python
-# prefill.py L621-654
+# prefill.py L644-670
 def process_prefill_chunk(self: Scheduler):
     if self.chunked_req:
         # 将当前 chunk 的 KV 缓存到 tree_cache
@@ -742,7 +773,7 @@ python -m sglang.launch_server \
 ### 9.1 工作原理
 
 ```python
-# scheduler_pp_mixin.py L669-701
+# scheduler_pp_mixin.py L680-710
 def predict_next_chunk_size(self: Scheduler, history_len: int) -> Optional[int]:
     """
     根据历史长度动态预测下一个 chunk 大小。
@@ -923,17 +954,21 @@ python -m sglang.launch_server \
 | PD 分离处理 | `disaggregation/prefill.py` | `process_batch_result_disagg_prefill()` |
 | PD KV 传输 | `disaggregation/prefill.py` | `send_kv_chunk()` |
 
-## 14. PrefillDelayer 与 Chunked Prefill (v0.5.9 新增)
+## 14. PrefillDelayer 与 Chunked Prefill
 
-在 DP Attention 场景下，`PrefillDelayer`（`srt/managers/prefill_delayer.py`）与 Chunked Prefill 交互：
+在 DP Attention 场景下，`PrefillDelayer`（`srt/managers/prefill_delayer.py`）通过 `PrefillDelayerSinglePassExecutor` 包装后传入 `PrefillAdder`，在 `add_one_req()` 内部检查是否允许 prefill（`schedule_policy.py` L769-774）。
 
-- PrefillDelayer 在 `get_new_batch_prefill()` 之前决定是否允许 prefill
-- 如果 PrefillDelayer 延迟了 prefill，正在进行的 chunked prefill 请求（`chunked_req`）仍会继续处理
-- 水位线机制确保 chunked prefill 不会因为 PrefillDelayer 的延迟而饥饿
+关键区别：
+- `add_one_req` 经过 PrefillDelayer 检查：新请求可能被延迟
+- `add_chunked_req` **不经过** PrefillDelayer 检查：已经在进行的 chunked prefill 必须继续完成
+
+> **为什么 chunked_req 不受 PrefillDelayer 控制**: 已分配 KV cache 的 chunked prefill 如果中途停止，会造成内存泄漏——已分配的 KV cache slots 无法释放（因为请求既没完成 prefill 也没被正常 abort）。因此 `add_chunked_req` 即使在 `rem_total_tokens <= 0` 时也会强制继续处理。
 
 ### SWA 模型的分块策略
 
-Qwen3.5 的混合架构（Full Attention + SWA 层）对分块策略有特殊影响：
+Llama4、Step3p5 等 SWA 混合架构（Full Attention + SWA 层）对分块策略有特殊影响：
 - SWA 层只需要窗口内的 KV Cache，分块时可以更激进地释放窗口外的缓存
 - `is_hybrid_swa` 标志影响 chunk 大小的计算和内存预算
+
+> **注意**: Qwen3.5 的混合架构是 Full Attention + Linear Attention (GatedDeltaNet)，不使用 SWA。SWA 混合架构适用于 Llama4、Step3p5、GptOss、MiMoV2 等模型。
 

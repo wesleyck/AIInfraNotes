@@ -2,7 +2,7 @@
 
 > **默认场景**: Qwen3.5 混合架构模型（Full Attention + Linear Attention/GatedDeltaNet + MoE + MTP）
 >
-> **核心组件**: Fused Gating, Token Alignment, Grouped GEMM, Token Dispatcher, MoE Runner
+> **核心组件**: Fused Gating, Token Alignment, Grouped GEMM, Expert Specialization
 
 ## 1. MoE 执行流程
 
@@ -28,8 +28,9 @@ topk_softmax(
     topk_weights,      # [num_tokens, topk]
     topk_ids,          # [num_tokens, topk]
     gating_output,     # [num_tokens, num_experts]
-    renormalize=True,  # 重新归一化权重
-    moe_softcapping=0.0 # Tanh softcapping
+    renormalize=False,  # 重新归一化权重
+    moe_softcapping=0.0, # Tanh softcapping
+    correction_bias=None, # [num_experts] 专家偏置修正 (float32)，用于负载均衡
 )
 ```
 
@@ -44,9 +45,9 @@ moe_fused_gate(
     num_expert_group,              # 分组数量 (如 256 专家分为 8 组)
     topk_group,                    # 组内 TopK (先选中若干组)
     topk,                          # 总共选中的专家数 (跨组合计)
-    routed_scaling_factor,         # 路由缩放因子 (routed+shared expert 融合后的归一化系数)
-    num_fused_shared_experts,      # 融合共享专家数量 (控制是否将 routed 和 shared expert 融合)
-    ...
+    num_fused_shared_experts=0,    # 融合共享专家数量 (控制是否将 routed 和 shared expert 融合)
+    routed_scaling_factor=0,       # 路由缩放因子 (routed+shared expert 融合后的归一化系数)
+    apply_routed_scaling_factor_on_output=False,  # 是否在输出端应用缩放因子
 )
 ```
 - **原理**: 先选组，再在组内选专家。
@@ -59,7 +60,7 @@ moe_fused_gate(
 
 | 函数 | 功能 | 简要说明 |
 |------|------|----------|
-| `topk_sigmoid` | 基于 sigmoid 的 TopK 路由 | 对 gating_output 做 sigmoid 后选取前 K 个专家，替代 softmax 方案 |
+| `topk_sigmoid` | 基于 sigmoid 的 TopK 路由 | 对 gating_output 做 sigmoid 后选取前 K 个专家，支持 `correction_bias` 偏置修正 |
 
 ### 2.4 Kimi K2 专用路由
 `kimi_k2_moe_fused_gate` 是为 Moonshot K2 模型优化的简化版路由，移除了复杂的分组逻辑。
@@ -73,6 +74,7 @@ moe_fused_gate(
 | `prepare_moe_input` | MoE 输入预处理 | 在路由完成后、专家计算前，准备 token 分发所需的中间数据结构（排序索引、专家偏移等） |
 | `apply_shuffle_mul_sum` | Shuffle + 乘加融合 | 将 token 位置重排（shuffle）、权重乘法和求和三步融合为一个 kernel，减少显存读写 |
 | `moe_sum` | MoE 输出求和 | 将各 TopK 专家的输出按路由权重加权求和，得到最终 token 表示 |
+| `moe_sum_reduce` | MoE 输出缩放求和 | 带 `routed_scaling_factor` 的输出聚合，用于 routed+shared expert 融合场景 |
 
 ## 3. Token 对齐 (Token Alignment)
 
@@ -105,18 +107,92 @@ moe_align_block_size(
 ```python
 # moe.py: fp8_blockwise_scaled_grouped_mm
 fp8_blockwise_scaled_grouped_mm(
-    output,
-    a_ptrs, b_ptrs,      # token 和专家的指针列表
-    a_scales_ptrs, ...   # 缩放因子指针
-    problem_sizes,       # 每个专家计算的 M, N, K 列表
-    expert_offsets,      # 专家起始位置
-    ...
+    # 输出
+    output,              # [total_tokens, N] 输出张量
+    # 指针列表 (用于 CUTLASS Grouped GEMM 的 ptr-array 模式)
+    a_ptrs,              # A 矩阵指针数组
+    b_ptrs,              # B 矩阵指针数组
+    out_ptrs,            # 输出指针数组
+    a_scales_ptrs,       # A 缩放因子指针数组
+    b_scales_ptrs,       # B 缩放因子指针数组
+    # 连续张量 (用于 offset 模式)
+    a,                   # A 矩阵连续存储
+    b,                   # B 矩阵连续存储
+    scales_a,            # A 缩放因子连续存储
+    scales_b,            # B 缩放因子连续存储
+    # 步长信息
+    stride_a,            # A 矩阵行步长
+    stride_b,            # B 矩阵行步长
+    stride_c,            # 输出矩阵行步长
+    layout_sfa,          # A 缩放因子布局
+    layout_sfb,          # B 缩放因子布局
+    # 问题描述
+    problem_sizes,       # [num_experts, 3] 每个专家的 (M, N, K)
+    expert_offsets,      # [num_experts] 专家起始偏移
+    workspace,           # 工作空间缓冲区
 )
 ```
 
 ### 4.2 Marlin MoE (W4A16)
 对于 4-bit 量化权重、16-bit 激活的模型，使用 Marlin 优化的 MoE Kernel：
-`moe_wna16_marlin_gemm`。
+
+```python
+# fused_moe.py: moe_wna16_marlin_gemm
+moe_wna16_marlin_gemm(
+    # 输入/输出
+    a,                        # [M, K] 激活输入
+    c_or_none,                # 预分配输出 (可选)
+    b_q_weight,               # 量化权重
+    b_bias_or_none,           # 偏置 (可选)
+    b_scales,                 # 权重缩放因子
+    global_scale_or_none,     # 全局缩放 (可选)
+    b_zeros_or_none,          # 零点 (可选)
+    g_idx_or_none,            # 分组索引 (可选)
+    perm_or_none,             # 排列索引 (可选)
+    workspace,                # 工作空间
+    # MoE 路由信息
+    sorted_token_ids,         # 排序后的 token ID
+    expert_ids,               # 专家 ID
+    num_tokens_post_padded,   # padding 后的 token 数
+    topk_weights,             # TopK 权重
+    # 配置参数
+    moe_block_size,           # MoE 块大小
+    top_k,                    # TopK 专家数
+    mul_topk_weights,         # 是否乘以 topk 权重
+    is_ep,                    # 是否为 Expert Parallelism
+    b_q_type_id,              # 量化类型 ID
+    size_m, size_n, size_k,   # 矩阵维度
+    is_k_full,                # K 维度是否完整
+    use_atomic_add,           # 是否使用原子加
+    use_fp32_reduce,          # 是否使用 FP32 归约
+    is_zp_float,              # 零点是否为浮点
+)
+```
+
+### 4.3 CUTLASS W4A8 MoE GEMM
+
+`cutlass_moe.py` 提供了基于 CUTLASS 的 W4A8 (INT4 权重 + FP8 激活) MoE 矩阵乘法，针对 Hopper (H100) 架构优化。
+
+```python
+# cutlass_moe.py: 准备 MoE 分组数据
+get_cutlass_w4a8_moe_mm_data(
+    topk_ids, expert_offsets,
+    problem_sizes1, problem_sizes2,
+    input_permutation, output_permutation,
+    num_experts, n, k,
+)
+
+# cutlass_moe.py: 执行 W4A8 分组矩阵乘法
+cutlass_w4a8_moe_mm(
+    d, a, b, a_scales, b_scales,
+    experts_offsets, problem_sizes,
+    a_strides, b_strides, d_strides, s_strides,
+    chunk_size=128, topk=8,
+)
+```
+
+- **`get_cutlass_w4a8_moe_mm_data`**: 根据 `topk_ids` 计算专家偏移、问题尺寸和输入/输出排列，为后续 GEMM 准备数据。
+- **`cutlass_w4a8_moe_mm`**: 执行 INT4 权重 × FP8 激活的分组矩阵乘法，要求 Hopper GPU。
 
 ## 5. SM100 (Blackwell) 专家特化
 
@@ -127,7 +203,18 @@ fp8_blockwise_scaled_grouped_mm(
 - `cutlass_fp4_group_mm`: 高性能 FP4 专家计算。
 
 ```python
-# nvfp4_blockwise_moe.cu 实现了针对 Blackwell 的块级量化
+# moe.py: cutlass_fp4_group_mm
+cutlass_fp4_group_mm(
+    a_fp4,            # [total_tokens, K//2] FP4 打包激活 (uint8)
+    b_fp4,            # [E, N, K//2] FP4 打包权重 (uint8)
+    a_blockscale,     # A 的块级缩放因子 (FP8-E4M3)
+    b_blockscale,     # B 的块级缩放因子 (FP8-E4M3)
+    alphas,           # 全局缩放因子
+    out_dtype,        # 输出数据类型
+    device,           # 设备
+    params,           # dict: ab_strides, c_strides, problem_sizes,
+                      #        expert_offsets, blockscale_offsets
+) -> torch.Tensor
 ```
 
 ## 6. 特殊算子
@@ -137,18 +224,17 @@ fp8_blockwise_scaled_grouped_mm(
 `fused_qk_norm_rope` 将这两个操作融合，减少显存读写。
 
 ### 6.2 Shuffle Rows
-在专家计算前后，经常需要对 token 进行位置重排。`shuffle_rows` (或 `shuffle_rows_tensor`) 实现了基于映射表的行重排序，是 MoE token 分发/收集的核心原语。
+在专家计算前后，经常需要对 token 进行位置重排。`shuffle_rows` 实现了基于映射表的行重排序，是 MoE token 分发/收集的核心原语。
 
-**来源**: `csrc/moe/` (如 `csrc.py` L363-388)
+**来源**: `gemm.py`
 
 ```python
-# 前向接口
-shuffle_fwd(
+# gemm.py: shuffle_rows
+shuffle_rows(
     input_tensor,         # [M, K] 输入张量
     dst2src_map,          # [M_out] 目标行 → 源行的映射索引
-    out_tensor,           # [M_out, K] 预分配输出张量
     output_tensor_shape,  # 输出形状 (M_out, K)
-) -> torch.Tensor
+) -> torch.Tensor        # 返回新分配的输出张量
 ```
 
 - **分发 (Scatter)**: 路由完成后，根据 `dst2src_map` 将各 token 从原始位置搬运到对应专家的连续区间。
@@ -163,20 +249,19 @@ Expert Specialization 是一种优化策略，将特定专家绑定到特定的 
 
 | 函数 | 功能 | 说明 |
 |------|------|------|
-| `es_fp8_blockwise_scaled_grouped_mm_quest` | 量化 FP8 block-scaled grouped GEMM (Quest 变体) | 结合 Quest 量化策略的 FP8 块级缩放分组矩阵乘法，针对 Expert Specialization 场景优化 |
-| `es_asm_fp8_blockwise_scaled_grouped_mm` | ASM 汇编版 FP8 grouped GEMM | 手写 PTX/SASS 汇编实现，在特定 SM 架构上获得极致性能 |
-| `es_fp8_blockwise_scaled_grouped_mm` | 标准 FP8 grouped GEMM | Expert Specialization 场景下的标准 FP8 块级缩放分组矩阵乘法 |
-| `es_fp16_blockscale_grouped_mm_op` | FP16 block-scale grouped GEMM | 约 SM90 级别的 FP16 块级缩放分组矩阵乘法，适用于不需要 FP8 量化的场景 |
+| `es_fp8_blockwise_scaled_grouped_mm` | FP8 grouped GEMM | Expert Specialization 场景下的 FP8 块级缩放分组矩阵乘法 |
+| `es_sm100_mxfp8_blockscaled_grouped_mm` | SM100 MXFP8 grouped GEMM | Blackwell 架构的 MXFP8 块级缩放分组矩阵乘法，使用 `sfa`/`sfb` 缩放因子 |
+| `es_sm100_mxfp8_blockscaled_grouped_quant` | SM100 MXFP8 grouped 量化 | Blackwell 架构的 MXFP8 块级缩放分组量化，将输入量化为 MXFP8 格式 |
 
 ### 7.2 与通用 MoE Grouped GEMM 的区别
 
 - **通用 Grouped GEMM** (如 `fp8_blockwise_scaled_grouped_mm`): 所有专家在同一 GPU 上执行，通过 `expert_offsets` 区分不同专家的计算边界。
 - **ES Grouped GEMM**: 每个 GPU 只负责部分专家的计算，输入已按专家预分配，`dst2src_map` 用于 token 重映射。通信量更小，适合大规模部署。
 
-### 7.3 精度选择
+### 7.3 精度与架构选择
 
-- **FP8 (quest/asm/标准)**: 适用于 SM89/SM90 架构，三种实现提供不同的性能-灵活性权衡。ASM 版本性能最高但可移植性最低。
-- **FP16**: 适用于对精度敏感或不支持 FP8 的场景。
+- **FP8** (`es_fp8_blockwise_scaled_grouped_mm`): 适用于 SM89/SM90 架构，标准 FP8 块级缩放实现。
+- **MXFP8** (`es_sm100_mxfp8_blockscaled_grouped_mm/quant`): 适用于 SM100 (Blackwell) 架构，利用 MXFP8 格式获得更高吞吐。
 
 ## 8. 调试与性能建议
 

@@ -114,19 +114,34 @@ sgl_per_token_group_quant_8bit(
     input, output_q, output_s,
     group_size,                    # 量化分组大小 (如 128)
     eps,                           # 数值稳定性 epsilon
-    fq_size,                       # 量化格式位宽
-    fq_max,                        # 量化格式最大值
-    scale_offset,                  # 缩放因子偏移
+    fp8_min,                       # FP8 格式最小值 (如 -448.0)
+    fp8_max,                       # FP8 格式最大值 (如 448.0)
+    scale_ue8m0: bool = False,     # 是否使用 UE8M0 缩放格式 (Blackwell MXFP8)
     fuse_silu_and_mul=False,       # 融合 SiLU + Mul: 将量化与 SiLU 激活函数合并为一个 kernel
     masked_m=None,                 # 掩码行数: 指定有效行数，跳过 padding 行以节省计算
-    enable_v2=False,               # V2 内核开关: 启用 SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2 优化路径
+    enable_v2: Optional[bool] = None,  # V2 内核开关: None 时读取环境变量 SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2
 )
 ```
 
 **参数说明**:
-- **`fuse_silu_and_mul`**: 在 MoE 的 Gate/Up 投影后，通常需要先做 SiLU 激活再与 Up 分支相乘。启用此选项可将量化与 SiLU+Mul 融合为一个 kernel，减少一次显存读写往返。
-- **`masked_m`**: 在 Grouped GEMM 场景中，不同专家收到的 token 数不同，padding 行无需参与量化计算。通过 `masked_m` 指定实际有效行数，跳过 padding 以提高效率。
-- **`enable_v2`**: 对应 `sgl_per_token_group_quant_fp8` 的优化路径 (`SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2`)，在特定硬件上使用更高效的 warp-level reduction 策略。
+- **`fp8_min` / `fp8_max`**: FP8 格式的取值范围边界，用于 clip 操作。E4M3 格式通常为 (-448.0, 448.0)。
+- **`scale_ue8m0`**: 是否使用 UE8M0 (unsigned E8M0) 格式存储缩放因子，这是 Blackwell MXFP8 所需的缩放格式。
+- **`fuse_silu_and_mul`**: 在 MoE 的 Gate/Up 投影后，通常需要先做 SiLU 激活再与 Up 分支相乘。启用此选项可将量化与 SiLU+Mul 融合为一个 kernel，减少一次显存读写往返。仅 v2 支持。
+- **`masked_m`**: 在 Grouped GEMM 场景中，不同专家收到的 token 数不同，padding 行无需参与量化计算。通过 `masked_m` 指定实际有效行数，跳过 padding 以提高效率。仅 v2 支持。
+- **`enable_v2`**: 默认为 `None`，此时读取环境变量 `SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2` 决定是否启用优化路径。v2 使用更高效的 warp-level reduction 策略，且支持 `fuse_silu_and_mul` 和 `masked_m`。
+
+### 6.3 FP8/INT8 GEMM 算子
+
+```python
+# gemm.py — FP8/INT8 矩阵乘法
+int8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None)
+fp8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None)
+fp8_blockwise_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype)
+```
+
+- **`int8_scaled_mm`**: INT8 矩阵乘法，支持 per-tensor scale 和可选 bias。
+- **`fp8_scaled_mm`**: FP8 per-tensor 缩放矩阵乘法，支持可选 bias。
+- **`fp8_blockwise_scaled_mm`**: FP8 blockwise 缩放矩阵乘法，每个块独立缩放，精度更高。
 
 ## 7. 权重量化 (W4A16)
 
@@ -136,13 +151,27 @@ sgl_per_token_group_quant_8bit(
 Marlin 是针对 4-bit 量化权重的高性能 GEMM 实现，支持 GPTQ 和 AWQ 格式。
 
 ```python
-# gemm.py: gptq_marlin_gemm
-# 支持高效的重排 (repack) 和洗牌 (shuffle) 逻辑
+# gemm.py: gptq_marlin_gemm — 高性能 4-bit GEMM
+gptq_marlin_gemm(a, c, b_q_weight, b_scales, global_scale, b_zeros,
+                 g_idx, perm, workspace, b_q_type, size_m, size_n, size_k, ...)
+
+# marlin.py: 权重重排 (repack) 函数
 gptq_marlin_repack(b_q_weight, perm, size_k, size_n, num_bits)
+awq_marlin_repack(b_q_weight, size_k, size_n, num_bits)
+awq_marlin_moe_repack(b_q_weight, perm, size_k, size_n, num_bits)  # MoE 专用
 ```
 
 ### 7.2 AWQ 反量化
 `awq_dequantize` 将 4-bit 权重转换回 FP16/BF16 进行计算，适用于通用后端。
+
+### 7.3 非 Marlin GPTQ
+除了 Marlin 优化路径，`sgl-kernel` 还保留了原始 GPTQ kernel：
+
+```python
+# gemm.py
+gptq_gemm(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_g_idx, use_shuffle, bit)
+gptq_shuffle(q_weight, q_perm, bit)  # 权重重排序 (in-place)
+```
 
 ## 8. SM100 (Blackwell) 原生 FP4
 
@@ -173,7 +202,7 @@ scaled_fp4_grouped_quant(
 
 ```python
 # gemm.py
-silu_mul_scaled_fp4_grouped_quant_fused(
+silu_and_mul_scaled_fp4_grouped_quant(
     input,                # [M, K] Gate+Up 投影输出
     input_global_scale,   # 全局缩放因子
     mask,                 # 掩码
@@ -195,8 +224,8 @@ scaled_fp4_experts_quant(
 - **用途**: 按 MoE packed 输入格式执行 FP4 专家量化，直接处理经 `moe_align_block_size` 排列后的 token 布局。
 
 ### 8.3 计算算子
-- `cutlass_scaled_fp4_mm`: 标准矩阵乘算法。
-- `cutlass_fp4_group_mm`: 针对 MoE 场景的组内矩阵乘。
+- `cutlass_scaled_fp4_mm` (`gemm.py`): 标准矩阵乘算法。
+- `cutlass_fp4_group_mm` (`moe.py`): 针对 MoE 场景的 FP4 Blockscaled Group GEMM，详见 17-moe-kernels Section 5.1。
 
 ## 9. DeepSeek-V3 专用 GEMM
 
@@ -207,12 +236,12 @@ DeepSeek-V3 模型由于其独特的 MLA (Multi-head Latent Attention) + MoE 架
 ```python
 # 批量 FP8 矩阵乘法 (DeepSeek-V3 专用)
 bmm_fp8(
-    input,        # [B, M, K] 批量输入
-    A_s_scale,    # A 矩阵的静态缩放因子
-    B_s_scale,    # B 矩阵的静态缩放因子
-    B_scale,      # B 矩阵的动态缩放因子
+    A,            # [B, M, K] 批量输入 A
+    B,            # [B, K, N] 批量输入 B
+    A_scale,      # A 矩阵的缩放因子
+    B_scale,      # B 矩阵的缩放因子
     dtype,        # 输出数据类型
-    out,          # 预分配输出张量
+    out=None,     # 预分配输出张量 (可选)
 ) -> torch.Tensor
 ```
 - **用途**: DeepSeek-V3 的 MLA 注意力中，需要对多个 latent head 执行批量矩阵乘法。`bmm_fp8` 在 FP8 精度下高效执行此操作。
@@ -220,9 +249,9 @@ bmm_fp8(
 ```python
 # DeepSeek-V3 融合 A 矩阵 GEMM
 dsv3_fused_a_gemm(
-    hidden_states,    # [N, D] 隐藏状态
-    router_weights,   # 路由权重
-    out_dtype,        # 输出数据类型
+    mat_a,            # [N, K] 输入矩阵 A
+    mat_b,            # [K, M] 输入矩阵 B
+    output=None,      # 预分配输出张量 (可选)
 ) -> torch.Tensor
 ```
 - **用途**: 将 DeepSeek-V3 中 MoE 层的 A 矩阵投影与路由权重乘法融合为一个 kernel，减少 kernel launch 开销。
@@ -251,9 +280,10 @@ QServe 是一种 W4A8 (4-bit 权重, 8-bit 激活) 的推理算法，`sgl-kernel
 **文件**: `csrc/quantization/gguf/`
 
 ```python
-# gguf.py
-ggml_dequantize(weight, quant_type, M, N, dtype) # 执行权重反量化 (dequantize): 将 GGUF 格式的低精度权重还原为 FP16/BF16
-ggml_mul_mat_a8(weight, x, quant_type, row)     # A8 表示 8-bit 激活加速
+# quantization/gguf.py
+ggml_dequantize(weight, quant_type, M, N, dtype)    # 反量化: 将 GGUF 低精度权重还原为 FP16/BF16
+ggml_mul_mat_a8(weight, x, quant_type, row)          # 8-bit 激活矩阵乘 (批量)
+ggml_mul_mat_vec_a8(weight, x, quant_type, row)      # 8-bit 激活向量乘 (单 token decode)
 ```
 
 - **兼容模式**: 支持多种 GGUF 量化类型（Q4_K, Q5_K, Q8_0 等）。
@@ -273,7 +303,7 @@ ggml_mul_mat_a8(weight, x, quant_type, row)     # A8 表示 8-bit 激活加速
 |----------|----------|----------|----------|------|
 | **FP8** | 8 | 8 | SM90/89 | 性能最佳，精度损失几乎为零 |
 | **Marlin** | 16 | 4 | SM80+ | 显存占用减半，适合带宽瓶颈模型 |
-| **NVFP4** | 4 | 4 | SM100 | Blackwell 终极加速 |
+| **NVFP4** | 8 (FP8) | 4 (FP4) | SM100 | Blackwell W4A8 混合精度加速 |
 | **QServe** | 8 | 4 | All | 优秀的吞吐量平衡 |
 | **GGUF** | 16/8 | 混合 | All | 离线量化生态，多平台兼容 |
 

@@ -64,18 +64,16 @@ graph TB
 ```mermaid
 flowchart LR
     subgraph FA3["FlashAttention 3"]
-        SM80["SM80: A100"]
-        SM86["SM86: A*0/L40"]
-        SM89["SM89: 4090/L40s"]
-        SM90["SM90a: H100"]
+        SM8x["SM8x 家族: A100, A*0,<br/>L20, L40, L40s, 4090"]
+        SM9x["SM9x 家族: H100, H200"]
     end
-    
+
     subgraph FA4["FlashAttention 4 (实验性)"]
         SM90a["SM90a: H100"]
         SM100["SM100: Blackwell"]
     end
-    
-    Note["需要 CUDA >= 12.3"]
+
+    Note["需要 CUDA >= 12.3<br/>按 compute capability 主版本号<br/>8 或 9 判断 FA3 支持"]
 ```
 
 ### 2.2 核心 API
@@ -83,18 +81,42 @@ flowchart LR
 ```python
 # flash_attn.py: flash_attn_with_kvcache
 def flash_attn_with_kvcache(
+    # 基础输入
     q,                    # (batch, seqlen_q, nheads, headdim)
     k_cache,              # (batch, seqlen_cache, nheads_k, headdim) or paged
     v_cache,              # (batch, seqlen_cache, nheads_k, headdim_v)
-    k=None,               # 增量 KV 更新
-    v=None,
-    page_table=None,      # Paged KV Cache
-    cache_seqlens=None,   # 当前序列长度
+    k=None, v=None,       # 增量 KV 更新 (FA4 不支持)
+    qv=None,              # (batch, seqlen, nheads, headdim_v) 可选
+    # RoPE 参数 (FA4 不支持)
+    rotary_cos=None,      # (seqlen_ro, rotary_dim/2)
+    rotary_sin=None,
+    rotary_interleaved=True,
+    rotary_seqlens=None,
+    # 序列与分页
+    cache_seqlens=None,   # (batch,) 当前序列长度
+    cache_batch_idx=None, # (batch,) KV cache 索引
+    cache_leftpad=None,   # (batch,) 左 padding 偏移
+    page_table=None,      # (batch, max_blocks) Paged KV Cache
+    cu_seqlens_q=None,    # varlen 模式
+    cu_seqlens_k_new=None,
+    max_seqlen_q=None,
+    # FP8 反量化因子 (FA4 不支持)
+    q_descale=None, k_descale=None, v_descale=None,
+    # Attention 配置
     softmax_scale=None,
     causal=False,
     window_size=(-1, -1), # 滑动窗口
-    softcap=0.0,          # Softcap 激活阈值
+    attention_chunk=None,
+    softcap=0.0,
+    # 调度与性能
+    scheduler_metadata=None,  # FA3 调度元数据
+    num_splits=0,         # Split-KV 分割数 (0=自动)
+    pack_gqa=None,        # GQA 打包优化
+    sm_margin=0,          # SM 预留 (用于通信重叠)
     return_softmax_lse=False,
+    sinks=None,           # Learnable sink tokens
+    score_mod=None,       # 自定义 score 修改函数
+    aux_tensors=None,     # score_mod 辅助张量
     ver=3,                # FA 版本: 3 或 4
 ):
     """
@@ -102,6 +124,8 @@ def flash_attn_with_kvcache(
     - 支持 paged KV cache (page_table)
     - 支持 GQA/MQA (nheads_k < nheads)
     - 支持 滑动窗口注意力
+    - 支持 RoPE 融合 (仅 FA3)
+    - 支持 FP8 descale (仅 FA3)
     """
 ```
 
@@ -177,6 +201,7 @@ flowchart LR
 ### 3.2 Kernel 实现
 
 **文件**: `csrc/attention/cutlass_mla_kernel.cu`
+**要求**: CUDA >= 12.4 (编译时检查，低版本会直接报错)
 
 ```cpp
 // MLA SM100 配置
@@ -242,6 +267,8 @@ workspace_size = cutlass_mla_get_workspace_size(
 
 FlashMLA 是一个**独立维护的项目** (非 FlashInfer 的一部分)，专门针对 MLA 架构的 decode 优化。与 Section 3 的 CUTLASS MLA (SM100 Blackwell 专用) 不同，FlashMLA 运行在 SM90 (H100) 上。
 
+> **要求**: CUDA Driver >= 12.4 (加载 flashmla_ops 扩展时检查)
+
 **文件**: `python/sgl_kernel/flash_mla.py` + `csrc/flashmla_extension.cc`
 
 ```python
@@ -286,6 +313,7 @@ out, max_logits, lse = sgl_kernel.flash_mla_sparse_fwd(
 |------|------------------------|---------------|
 | 硬件 | SM100 (Blackwell) | SM90 (Hopper) |
 | 来源 | sgl-kernel 内嵌 CUTLASS 实现 | 独立 FlashMLA 项目 |
+| KV Cache 格式 | `kv_c_and_k_pe_cache` (K+V 共享压缩缓存, d_latent+d_rope) | `k_cache` (MLA 中 K 和 V 共享同一压缩缓存，无独立 `v_cache`) |
 | 接口 | `cutlass_mla_decode(out, q_nope, q_pe, kv_cache, ...)` | `flash_mla_with_kvcache(q, k_cache, block_table, ...)` |
 | FP8 支持 | FP8_E4M3 输入 | FP8 KV Cache |
 | 稀疏支持 | 无 | 支持 (`indices` 参数 + `flash_mla_sparse_fwd`) |
@@ -358,6 +386,9 @@ __global__ void merge_attn_states_kernel(
     // 计算 scaling factors
     float p_lse = prefix_lse[...];
     float s_lse = suffix_lse[...];
+    // 处理 infinity: 当某个 chunk 无有效 token 时 LSE 可能为 inf
+    p_lse = std::isinf(p_lse) ? -std::numeric_limits<float>::infinity() : p_lse;
+    s_lse = std::isinf(s_lse) ? -std::numeric_limits<float>::infinity() : s_lse;
     const float max_lse = fmaxf(p_lse, s_lse);
     const float p_se = expf(p_lse - max_lse);
     const float s_se = expf(s_lse - max_lse);
@@ -372,12 +403,18 @@ __global__ void merge_attn_states_kernel(
 ### 4.4 API
 
 ```python
-# merge_state: flashinfer 风格 API
-merge_state(v_a, s_a, v_b, s_b, v_merged, s_merged)
+# attention.py: merge_state (v1) — 基于 Triton 实现
+merge_state(v_a, s_a, v_b, s_b, v_merged=None, s_merged=None)
 
-# merge_state_v2: 优化版本
-merge_state_v2(v_a, s_a, v_b, s_b, v_merged, s_merged)
+# attention.py: merge_state_v2 — 基于自定义 CUDA kernel (merge_attn_states.cu)
+merge_state_v2(v_a, s_a, v_b, s_b, v_merged=None, s_merged=None)
+```
 
+**v1 vs v2 区别**:
+- v1 基于 Triton，兼容性更广 (支持 FP8、非 CUDA 设备)
+- v2 基于自定义 CUDA kernel，性能更高，但不支持 FP8 数据类型和非 CUDA 设备
+
+```python
 # 输入:
 #   v_a, v_b: (seq_len, num_heads, head_dim)
 #   s_a, s_b: (seq_len, num_heads)
@@ -422,13 +459,24 @@ def convert_vertical_slash_indexes(
 ) -> (block_count, block_offset, column_count, column_index):
     """
     将 vertical/slash 索引转换为 kernel 可用的块格式
-    
+
     Returns:
         block_count:  (batch, heads, num_rows) 每行的块数
         block_offset: (batch, heads, num_rows, nnz_s) 块偏移
         column_count: (batch, heads, num_rows) 每行的列数
         column_index: (batch, heads, num_rows, nnz_v) 列索引
     """
+
+# 变体: 支持不同 head 使用不同数量的索引 (head merge 优化)
+def convert_vertical_slash_indexes_mergehead(
+    q_seqlens, kv_seqlens,
+    vertical_indexes, slash_indexes,
+    vertical_indices_count,  # [N_HEADS] 每个 head 的 vertical 索引数
+    slash_indices_count,     # [N_HEADS] 每个 head 的 slash 索引数
+    context_size, block_size_M, block_size_N,
+    causal=True
+) -> (block_count, block_offset, column_count, column_index):
+    """mergehead 变体: 允许每个 head 有不同的稀疏索引数量"""
 ```
 
 ### 5.3 稀疏 Attention API
@@ -438,11 +486,16 @@ def sparse_attn_func(
     q, k, v,
     block_count, block_offset,   # Slash 模式
     column_count, column_index,  # Vertical 模式
+    dropout_p=0.0,               # Dropout 概率
     softmax_scale=None,
     causal=False,
     softcap=0.0,
     alibi_slopes=None,
+    deterministic=False,         # 确定性反向传播 (更慢但可复现)
+    return_attn_probs=False,     # 返回注意力概率 (仅测试用)
+    *,
     return_softmax_lse=False,
+    out=None,                    # 预分配输出张量
 ):
     """
     执行稀疏注意力计算
@@ -544,7 +597,7 @@ else:
 | FA4 不支持 KV 更新 | 设计限制 | 使用 FA3 |
 | 大 batch MLA hang | Split-KV bug | 设置 `num_kv_splits=1` |
 
-## 9. Wave Attention Kernel (v0.5.9 新增)
+## 9. Wave Attention Kernel
 
 Wave Attention 是一种基于 Triton 实现的 attention 后端，针对 decode/extend/prefill 三个阶段分别提供优化的 kernel。
 
@@ -566,26 +619,33 @@ Wave Attention 是一种基于 Triton 实现的 attention 后端，针对 decode
 | 硬件适配 | 自动 (Triton) | 手动优化 | 手动优化 |
 | Split-KV | 动态计算 | 固定/启发式 | 固定 |
 
-## 10. NSA Kernel 扩展 (v0.5.9 新增)
+## 10. NSA Kernel 扩展
 
-NSA (Native Sparse Attention) 在 v0.5.9 中扩展了 MTP (Multi-Token Prediction) 支持。
+NSA (Native Sparse Attention) 扩展了 MTP (Multi-Token Prediction) 支持。
 
 **文件目录**: `python/sglang/srt/layers/attention/nsa/`
 
-### 10.1 新增文件
+### 10.1 文件列表
 
 | 文件 | 功能 |
 |------|------|
+| `nsa_backend.py` | NSA 注意力后端主入口 (位于 `layers/attention/` 目录) |
 | `nsa_mtp_verification.py` | NSA 与 MTP 联合验证逻辑，确保投机解码中稀疏注意力的正确性 |
 | `nsa_backend_mtp_precompute.py` | MTP 预计算后端，在 prefill 阶段预先计算 NSA 所需的索引和元数据 |
 | `nsa_indexer.py` | NSA 索引器，负责稀疏 token 选择和索引构建 |
-| `nsa_backend.py` | NSA 注意力后端主入口 (位于 `layers/attention/` 目录) |
+| `dequant_k_cache.py` | KV Cache 反量化，将量化的 K cache 还原为高精度 |
+| `quant_k_cache.py` | KV Cache 量化，将 K cache 压缩为低精度格式 |
+| `tilelang_kernel.py` | TileLang kernel 实现 |
+| `transform_index.py` | 索引变换工具 |
+| `triton_kernel.py` | Triton kernel 实现 |
+| `index_buf_accessor.py` | 索引缓冲区访问器 |
+| `utils.py` | NSA 通用工具函数 |
 
 ### 10.2 MTP + NSA 协作
 
 在 MTP 场景下，draft model 生成多个候选 token，NSA 需要在验证阶段正确处理稀疏注意力模式。`nsa_mtp_verification.py` 负责协调两者的交互，`nsa_backend_mtp_precompute.py` 则在 prefill 阶段预计算稀疏索引以减少验证延迟。
 
-## 11. CPU FlashAttention (v0.5.9 新增)
+## 11. CPU FlashAttention
 
 **文件**: `sgl-kernel/csrc/cpu/flash_attn.cpp`
 

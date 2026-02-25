@@ -243,9 +243,9 @@ flowchart TB
 
 ## 2. ReqToTokenPool
 
-**文件**: `memory_pool.py:78`
+**文件**: `memory_pool.py:126`
 
-管理请求 ID 到 token 位置的映射，请求级别，每个slot里面是该请求上下午长度的token id 在kv中的位置
+管理请求 ID 到 token 位置的映射。每个请求占一行，行内记录该请求各 token 在 KV Cache 中的 slot 索引。
 
 ### 2.1 数据结构
 
@@ -262,11 +262,13 @@ class ReqToTokenPool:
 
 ### 2.2 核心操作
 
-| 方法 | 功能 |
-|------|------|
-| `alloc(need_size)` | 分配 N 个请求槽位 |
-| `free(free_index)` | 释放请求槽位 |
-| `write(indices, values)` | 写入 token 位置映射 |
+| 方法 | 签名 | 功能 |
+|------|------|------|
+| `alloc` | `alloc(reqs: list[Req]) -> Optional[List[int]]` | 为一批请求分配槽位。自动跳过已有 `req_pool_idx` 的 chunked prefill 请求，只为新请求分配 |
+| `free` | `free(req: Req)` | 释放单个请求的槽位，将 `req.req_pool_idx` 放回 `free_slots` 并置 None |
+| `write` | `write(indices, values)` | 写入 token 位置映射：`req_to_token[indices] = values` |
+
+> **注意**: `alloc()` 接收的是 `Req` 对象列表而非简单的数量。这是因为 chunked prefill 场景下，一个请求可能跨多个 batch 分块处理，第二次 extend 时已有 `req_pool_idx`，不需要重新分配。`alloc()` 内部通过检查 `req.req_pool_idx is not None` 来判断是否跳过。
 
 ## 3. KVCache 变体
 
@@ -274,14 +276,15 @@ class ReqToTokenPool:
 
 ```mermaid
 flowchart TB
-    KVCache["KVCache - 抽象基类"]
-    MHA["MHATokenToKVPool<br/>标准 Multi-Head Attention"]
-    MHAFP4["MHATokenToKVPoolFP4<br/>FP4 量化版本"]
-    MLA["MLATokenToKVPool<br/>Multi-head Latent Attention - DeepSeek"]
-    MLAFP4["MLATokenToKVPoolFP4<br/>FP4 量化版本"]
-    SWA["SWAKVPool<br/>Sliding Window Attention 混合池"]
-    Hybrid["HybridLinearKVPool<br/>Mamba + Attention 混合池"]
-    DS["DoubleSparseTokenToKVPool<br/>稀疏注意力池"]
+    KVCache["KVCache - 抽象基类<br/>memory_pool.py:601"]
+    MHA["MHATokenToKVPool<br/>标准 Multi-Head Attention<br/>L697"]
+    MHAFP4["MHATokenToKVPoolFP4<br/>FP4 量化版本<br/>L1040"]
+    MLA["MLATokenToKVPool<br/>Multi-head Latent Attention<br/>DeepSeek V2/V3<br/>L1377"]
+    MLAFP4["MLATokenToKVPoolFP4<br/>FP4 量化版本<br/>L1601"]
+    NSA["NSATokenToKVPool<br/>Native Sparse Attention<br/>DeepSeek V3.2<br/>L1730"]
+    SWA["SWAKVPool<br/>Sliding Window Attention 混合池<br/>swa_memory_pool.py:20"]
+    Hybrid["HybridLinearKVPool<br/>Mamba/Linear Attention + Attention 混合池<br/>L1183"]
+    DS["DoubleSparseTokenToKVPool<br/>稀疏注意力池<br/>L1886"]
 
     KVCache --> MHA
     KVCache --> MLA
@@ -290,6 +293,7 @@ flowchart TB
     KVCache --> DS
     MHA --> MHAFP4
     MLA --> MLAFP4
+    MLA --> NSA
 ```
 
 ### 3.2 MHATokenToKVPool
@@ -338,14 +342,17 @@ class MLATokenToKVPool(KVCache):
     def __init__(self, ..., kv_lora_rank, qk_rope_head_dim, ...):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
+        self.kv_cache_dim = kv_lora_rank + qk_rope_head_dim
 
-        # MLA 使用压缩的 KV 表示
-        # Shape: [size, kv_lora_rank + qk_rope_head_dim]
-        self.kv_buffer = [Å
-            torch.zeros((size + page_size, kv_lora_rank + qk_rope_head_dim), ...)
+        # MLA 使用压缩的 KV 表示，单个 fused buffer 替代分离的 K/V
+        # Shape: [size + page_size, 1, kv_lora_rank + qk_rope_head_dim]
+        self.kv_buffer = [
+            torch.zeros((size + page_size, 1, self.kv_cache_dim), dtype=store_dtype, ...)
             for _ in range(layer_num)
         ]
 ```
+
+> **为什么中间有维度 `1`？** MLA 将所有 head 的 KV 压缩到一个低秩向量中（`kv_lora_rank` 维），不再有多 head 维度。但为了与 MHA 的 `[size, head_num, head_dim]` 布局保持接口一致（某些 kernel 期望 3D 输入），保留了 `1` 作为 head 维度占位。
 
 **优势**: 通过低秩压缩大幅减少 KV 缓存内存
 
@@ -385,19 +392,25 @@ flowchart TB
 
 ```python
 class HybridLinearKVPool(KVCache):
-    def __init__(self, ..., full_attention_layer_ids, mamba_pool, ...):
-        # 仅 Full Attention 层使用 KV Cache
-        self.full_kv_pool = MHATokenToKVPool(
-            layer_num=len(full_attention_layer_ids),  # 只为 Attention 层分配
-            ...
-        )
-        # 映射: layer_id → 在 full_kv_pool 中的索引
+    def __init__(self, ..., full_attention_layer_ids, mamba_pool, use_mla=False, ...):
+        # 仅 Full Attention 层使用 KV Cache，根据 use_mla 选择子池类型
+        if not use_mla:
+            self.full_kv_pool = MHATokenToKVPool(
+                layer_num=len(full_attention_layer_ids), ...
+            )
+        else:
+            self.full_kv_pool = MLATokenToKVPool(
+                layer_num=len(full_attention_layer_ids), ...
+            )
+        # 映射: 全局 layer_id → full_kv_pool 中的局部索引
         self.full_attention_layer_id_mapping = {
             id: i for i, id in enumerate(full_attention_layer_ids)
         }
         # Mamba 层使用 SSM 状态存储 (由 HybridReqToTokenPool 管理)
-        self.mamba_pool = mamba_pool  # 来自 HybridReqToTokenPool
+        self.mamba_pool = mamba_pool  # 引用自 HybridReqToTokenPool
 ```
+
+> **`use_mla` 分支**: 如果模型同时使用 MLA 和 Linear Attention（如未来可能的 DeepSeek + Mamba 混合架构），`full_kv_pool` 会使用 `MLATokenToKVPool` 而非 `MHATokenToKVPool`，以利用 MLA 的低秩压缩减少 KV 缓存占用。
 
 **架构详解**:
 
@@ -409,7 +422,7 @@ flowchart TB
         subgraph HRTP["HybridReqToTokenPool - 继承自 ReqToTokenPool"]
             R2T["req_to_token - token 位置映射, 仅 Attention 层"]
             MP["mamba_pool: MambaPool - SSM 状态存储"]
-            R2M["req_to_mamba_index_mapping - 请求 → Mamba 状态映射"]
+            R2M["req_index_to_mamba_index_mapping - 请求 → Mamba 状态映射"]
         end
 
         subgraph HLKV["HybridLinearKVPool"]
@@ -456,8 +469,14 @@ class TreeNode:  # mamba_radix_cache.py
 class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def __init__(self, size, dtype, device, kvcache, need_sort):
         self.page_size = 1  # 无分页，每次分配单个 token
+        # free_pages: 可立即分配的空闲索引
+        # release_pages: 延迟合并的释放索引（need_sort=True 时使用，用于 PD 分离场景）
+        self.free_pages = torch.arange(1, size + 1, dtype=torch.int64, device=device)
+        self.release_pages = torch.empty((0,), dtype=torch.int64, device=device)
 
     def alloc(self, need_size: int):
+        if self.need_sort and need_size > len(self.free_pages):
+            self.merge_and_sort_free()  # 将 release_pages 合并到 free_pages 并排序
         if need_size > len(self.free_pages):
             return None
         select_index = self.free_pages[:need_size]
@@ -465,8 +484,18 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return select_index
 
     def free(self, free_index: torch.Tensor):
-        self.free_pages = torch.cat((self.free_pages, free_index))
+        if self.is_not_in_free_group:
+            if self.need_sort:
+                self.release_pages = torch.cat((self.release_pages, free_index))
+            else:
+                self.free_pages = torch.cat((self.free_pages, free_index))
+        else:
+            self.free_group.append(free_index)  # 批量释放模式，暂存
 ```
+
+> **`need_sort` 的作用**: PD 分离（disaggregated decode）场景下，Decode 端需要按顺序分配索引以匹配 Prefill 端的布局。`need_sort=True` 时，释放的索引先放入 `release_pages`，在下次 `alloc` 空间不足时才通过 `merge_and_sort_free()` 排序合并回 `free_pages`，保证分配顺序的确定性。
+>
+> **`free_group` 的作用**: `free_group_begin()` / `free_group_end()` 提供批量释放模式。在 `process_batch_result` 中，多个请求的释放操作先暂存到 `free_group`，最后一次性 `torch.cat` 合并，减少多次 `cat` 的开销。
 
 ### 4.2 PagedTokenToKVPoolAllocator
 
@@ -474,7 +503,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
 ```mermaid
 flowchart TB
-    subgraph Paged["PagedTokenToKVPoolAllocator<br/>分配粒度: page_size 如 16 tokens"]
+    subgraph Paged["PagedTokenToKVPoolAllocator<br/>分配粒度: page_size 个 token 为一页（如 NSA 模型 page_size=64）"]
         direction TB
         subgraph AllocExtend["alloc_extend"]
             AE_DESC["处理 prefill 扩展, 考虑已有 prefix"]
@@ -500,7 +529,7 @@ flowchart TB
 
 1. **部分页填充**：请求可能上次 prefill 只用了某页的一半，extend 时要先填满这半页（用 `last_loc` 定位）
 2. **跨页边界**：decode 时新增 1 个 token，如果恰好跨页边界就需要分配整页，否则直接 `last_loc+1`
-3. **批量页分配**：多个请求各需要不同数量的新页，用 Triton kernel（`allocator.py:302` / `allocator.py:382`）并行计算每个请求的需求然后一次分配
+3. **批量页分配**：多个请求各需要不同数量的新页，用 Triton kernel（`alloc_extend_kernel` `allocator.py:235` / `alloc_decode_kernel` `allocator.py:315`）并行计算每个请求的需求然后一次分配
 
 ```
 page_size=1:  alloc(7) → 拿 7 个 slot，完事
@@ -520,7 +549,7 @@ page_size=4:  extend 场景示例:
 
 > **为什么需要 Triton kernel？**
 >
-> 这不只是"Python 循环慢"的问题。**核心原因是 batch 中每个请求的分配需求都不一样**（有的缺 1 个填满旧页，有的缺 3 个；有的需要 2 个新页，有的只需 0 个）。用 Triton kernel 可以在 GPU 上**并行计算所有请求的需求量**（Part 1/2/3 各需多少 slot），然后通过 `prefix_sum` 一次性从 `free_pages` 中分配，避免逐请求串行处理。`alloc_extend` 的 Triton kernel（`allocator.py:302`）和 `alloc_decode` 的 Triton kernel（`allocator.py:382`）都是这个模式。
+> 这不只是"Python 循环慢"的问题。**核心原因是 batch 中每个请求的分配需求都不一样**（有的缺 1 个填满旧页，有的缺 3 个；有的需要 2 个新页，有的只需 0 个）。用 Triton kernel 可以在 GPU 上**并行计算所有请求的需求量**（Part 1/2/3 各需多少 slot），然后通过 `prefix_sum` 一次性从 `free_pages` 中分配，避免逐请求串行处理。`alloc_extend_kernel`（`allocator.py:235`）和 `alloc_decode_kernel`（`allocator.py:315`）都是这个模式。
 
 ### 4.3 SWATokenToKVPoolAllocator
 
@@ -528,40 +557,60 @@ page_size=4:  extend 场景示例:
 
 ```python
 class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
-    def __init__(self, size, size_swa, ...):
-        self.full_attn_allocator = TokenToKVPoolAllocator(size, ...)
-        self.swa_attn_allocator = TokenToKVPoolAllocator(size_swa, ...)
-        self.full_to_swa_index_mapping = torch.empty(size + size_swa + 1, ...)
+    def __init__(self, size, size_swa, page_size, ...):
+        # 根据 page_size 选择子分配器类型
+        if page_size == 1:
+            self.full_attn_allocator = TokenToKVPoolAllocator(size, ...)
+            self.swa_attn_allocator = TokenToKVPoolAllocator(size_swa, ...)
+        else:
+            self.full_attn_allocator = PagedTokenToKVPoolAllocator(size, page_size, ...)
+            self.swa_attn_allocator = PagedTokenToKVPoolAllocator(size_swa, page_size, ...)
+
+        # 映射表: full 索引 → swa 索引，末尾追加 -1 使 last_loc=-1 映射到 -1
+        self.full_to_swa_index_mapping = torch.cat([
+            torch.zeros(size + page_size, dtype=torch.int64, ...),
+            torch.tensor([-1], dtype=torch.int64, ...),
+        ])
 
     def alloc(self, need_size):
-        # 同时从两个池分配
+        # 同时从两个池分配（仅 page_size=1 时使用）
         alloc_full_indices = self.full_attn_allocator.alloc(need_size)
         alloc_swa_indices = self.swa_attn_allocator.alloc(need_size)
         # 建立映射
         self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
-        return alloc_full_indices
+        return alloc_full_indices  # 对外只暴露 full 索引
 ```
+
+> **为什么 mapping 末尾追加 `-1`？** `alloc_extend` 中第一个请求的 `last_loc` 初始值为 `-1`（表示没有前一个 token）。通过在 mapping 末尾放一个 `-1`，使得 `full_to_swa_index_mapping[-1] = -1`，SWA 侧也能正确处理这个边界情况。
 
 ## 5. MambaPool 与 Mamba 状态管理
 
 ### 5.1 MambaPool 数据结构
 
-**文件**: `memory_pool.py:128`
+**文件**: `memory_pool.py:186`
 
 ```python
 class MambaPool:
-    @dataclass
+    @dataclass(frozen=True, kw_only=True)
     class State:
-        conv: List[torch.Tensor]   # 卷积状态
-        temporal: torch.Tensor     # SSM 状态
+        conv: List[torch.Tensor]   # 卷积状态 [num_layers, size+1, conv_dim, conv_kernel-1]
+        temporal: torch.Tensor     # SSM 状态 [num_layers, size+1, num_heads/tp, head_dim, state_size]
 
-    def __init__(self, size, cache_params, ...):
-        # Shape: [num_mamba_layers, size + 1, conv_shape...]
-        self.mamba_cache = self.State(
-            conv=[torch.zeros((num_layers, size+1) + conv_shape) for ...],
-            temporal=torch.zeros((num_layers, size+1) + temporal_shape)
-        )
+    @dataclass(frozen=True, kw_only=True)
+    class SpeculativeState(State):  # 投机解码时额外缓存中间状态
+        intermediate_ssm: torch.Tensor
+        intermediate_conv_window: List[torch.Tensor]
+
+    def __init__(self, *, size, spec_state_size, cache_params, device, ...):
+        num_mamba_layers = len(cache_params.layers)
+        conv_state = [torch.zeros((num_mamba_layers, size+1) + conv_shape, ...) for conv_shape in conv_state_shape]
+        temporal_state = torch.zeros((num_mamba_layers, size+1) + temporal_state_shape, ...)
+        self.mamba_cache = self.State(conv=conv_state, temporal=temporal_state)
+        # 空闲索引（Tensor 而非 list，索引 0 为 dummy slot）
+        self.free_slots = torch.arange(1, size + 1, dtype=torch.int64, device=device)
 ```
+
+> **`frozen=True` 的作用**: State 是不可变 dataclass，防止意外修改字段引用（但 Tensor 内容仍可原地修改）。`kw_only=True` 强制使用关键字参数，避免子类 `SpeculativeState` 的字段顺序问题。
 
 ### 5.2 Mamba State vs KV Cache 的核心区别
 
@@ -589,12 +638,12 @@ SGLang 中 Mamba 状态的 checkpoint 保存由两个参数控制，它们的用
 | 参数 | 值 | 作用域 | 用途 |
 |------|-----|--------|------|
 | `FLA_CHUNK_SIZE` | 64 | **Prefill** | Flash Linear Attention 算法的 chunk 粒度。Prefill 时在每个 chunk 边界（64 的倍数位置）可以产生 Mamba checkpoint。这是**算法层面的最小对齐单位**。 |
-| `mamba_track_interval` | 256 (默认) | **Decode** | Decode 阶段 checkpoint 保存频率。每当 `seq_len % 256 == 0`（`schedule_batch.py:1930`）时触发 checkpoint 保存。**必须是 FLA_CHUNK_SIZE 的整数倍**（256 = 64 × 4）。 |
+| `mamba_track_interval` | 256 (默认) | **Decode** | Decode 阶段 checkpoint 保存频率。每当 `seq_len % 256 == 0`（`schedule_batch.py:2025`）时触发 checkpoint 保存。**必须是 FLA_CHUNK_SIZE 的整数倍**（256 = 64 × 4）。 |
 
 **两者的关系**：
 - `FLA_CHUNK_SIZE` 是底层算法约束，决定 checkpoint 的**最小可能间隔**
 - `mamba_track_interval` 是上层策略选择，决定 Decode 阶段**实际保存间隔**（更大间隔 = 更少 MambaPool 占用，但 prefix miss 时重算代价更大）
-- Prefill 阶段的 checkpoint 位置由 `(extend_input_len // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE` 计算（`schedule_batch.py:1638`）
+- Prefill 阶段的 checkpoint 位置由 `(extend_input_len // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE` 计算（`schedule_batch.py:1734`）
 
 **有效前缀长度** = `min(KV Cache 命中长度, 最近有效的 Mamba Checkpoint 位置)`
 - KV Cache 命中是 per-token 粒度，可以精确到任意位置
@@ -633,7 +682,7 @@ Radix Tree 节点：[tokens 0..229] → 有 KV cache indices
     - tokens 192..279 需要重新跑 Mamba 层
 ```
 
-这就是 `_match_prefix_helper`（`mamba_radix_cache.py:900`）中 `best_value_len` / `best_last_node` 的逻辑：沿着 radix tree 走到最远的 KV 匹配，但只返回到**最深的有 mamba_value 的节点**位置。
+这就是 `_match_prefix_helper`（`mamba_radix_cache.py:905`）中 `best_value_len` / `best_last_node` 的逻辑：沿着 radix tree 走到最远的 KV 匹配，但只返回到**最深的有 mamba_value 的节点**位置。
 
 #### Mamba Prefix Matching 完整示例
 
@@ -658,7 +707,7 @@ match_prefix 结果:
 
 处理:
   1. COW: 复制 node A 的 mamba state (slot_3) → 请求私有 slot
-     (cow_mamba=True, mamba_radix_cache.py:424)
+     (cow_mamba=True, mamba_radix_cache.py:998)
   2. Prefill tokens 192..279:
      - Attention 层: tokens 192..279 的 KV 已缓存(复用)，不需要重算
      - Mamba 层: 从 position 192 的 checkpoint 开始，重新跑 tokens 192..279 更新 state
@@ -671,7 +720,7 @@ match_prefix 结果:
 
 1. **存储层面**：完全独立
    - KV cache → `TokenToKVPoolAllocator` + `KVCache` 物理 buffer
-   - Mamba state → `MambaPool`（独立的 slot 池，`memory_pool.py:128`）
+   - Mamba state → `MambaPool`（独立的 slot 池，`memory_pool.py:186`）
    - 显存预算按比例分配：`mamba_full_memory_ratio = 0.9`（默认 Mamba 占剩余显存的 90%）
 
 2. **逐出层面**：独立的双 LRU 链表
@@ -684,7 +733,9 @@ match_prefix 结果:
 
 ### 5.5 Ping-Pong Buffer 机制
 
-当 `mamba_scheduler_strategy == "extra_buffer"` 时，每个请求分配 **2 个** mamba state buffer，交替读写：
+当 `mamba_scheduler_strategy == "extra_buffer"` 时，每个请求分配额外的 mamba state buffer 用于交替读写：
+
+> **Ping-pong buffer 数量取决于是否启用投机解码**：非投机解码时分配 **2 个** track buffer（`mamba_ping_pong_track_buffer_size = 2`），投机解码时只分配 **1 个**（`memory_pool.py:453-454`）。
 
 ```
 Chunk N:   读 buffer[0], 写 buffer[1]
@@ -800,7 +851,7 @@ out_indices = token_to_kv_pool_allocator.alloc_decode(
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `mem_fraction_static` | 0.9 | 静态内存分配比例 |
-| `page_size` | 16 | 分页大小 |
+| `page_size` | 1 | 分页大小（token 粒度）。NSA 模型自动设为 64 |
 | `kv_cache_dtype` | auto | KV 缓存数据类型 |
 | `host_to_device_ratio` | 0 | Host 缓存比例 |
 
@@ -960,15 +1011,15 @@ flowchart TB
 SGLang 会根据 GPU 型号**自动计算**关键参数，用户通常不需要手动指定：
 
 ```python
-# server_args.py:909-951 - 自动计算 mem_fraction_static
+# server_args.py:1020-1063 - 自动计算 mem_fraction_static
 
 reserved_mem = 512  # 元数据常量 (MB)
 
-# 1. Activation 预留: chunked_prefill_size × 1.5 GB
+# 1. Activation 预留: chunked_prefill_size × 1.5 MB
 #    系数 1.5 是经验值，未来可通过 dummy run 更精确估算
 reserved_mem += max(chunked_prefill_size, 2048) * 1.5
 
-# 2. CUDA Graph 预留: cuda_graph_max_bs × 2 GB
+# 2. CUDA Graph 预留: cuda_graph_max_bs × 2 MB
 reserved_mem += cuda_graph_max_bs * 2
 
 # 3. 并行度调整
@@ -977,10 +1028,22 @@ reserved_mem += tp_size * pp_size / 8 * 1024
 # 4. DP Attention 额外开销
 if enable_dp_attention:
     reserved_mem += cuda_graph_max_bs * dp_size * 3
+    if cuda_graph_max_bs > 300:  # 大 batch 额外预留
+        reserved_mem += cuda_graph_max_bs * dp_size * 1.5
 
-# 5. 投机解码额外开销
+# 5. Piecewise CUDA Graph 预留
+if enable_piecewise_cuda_graph:
+    reserved_mem += len(piecewise_cuda_graph_tokens) * 8
+
+# 6. 大显存 GPU 最低预留 10GB
+if gpu_mem > 60 * 1024:
+    reserved_mem = max(reserved_mem, 10 * 1024)
+
+# 7. 投机解码额外开销
 if speculative_algorithm == "STANDALONE":
     reserved_mem += 6 * 1024
+elif speculative_algorithm not in (None, "NGRAM"):
+    reserved_mem += 2 * 1024  # EAGLE 等
 
 # 最终计算
 mem_fraction_static = (gpu_mem - reserved_mem) / gpu_mem
@@ -1002,7 +1065,7 @@ mem_fraction_static = (gpu_mem - reserved_mem) / gpu_mem
 多模态模型需要额外降低 `mem_fraction_static`：
 
 ```python
-# server_args.py:4877-4913 - adjust_mem_fraction_for_vlm
+# server_args.py:5483-5518 - adjust_mem_fraction_for_vlm
 
 # 基础降低系数
 base_mem_fraction_reduction_ratio = 0.95
@@ -1112,11 +1175,13 @@ stats.kv_cache_usage      # KV Cache 使用率
 stats.running_req_count   # 运行请求数
 ```
 
-## 11. SWA 内存池 (v0.5.9 新增)
+## 11. SWA 内存池
 
 **文件**: `srt/mem_cache/swa_memory_pool.py` (461行)
 
-Qwen3.5 等混合架构模型同时包含 Full Attention 层和 SWA (Sliding Window Attention) 层，需要双池架构分别管理两种层的 KV Cache。
+Llama4、Step3p5 等 SWA 混合架构模型同时包含 Full Attention 层和 SWA (Sliding Window Attention) 层，需要双池架构分别管理两种层的 KV Cache。
+
+> **注意**: Qwen3.5 的混合架构是 Full Attention + Linear Attention (GatedDeltaNet)，不使用 SWA。SWA 混合架构适用于 Llama4、Step3p5、GptOss、MiMoV2 等模型。
 
 ### 核心类
 
@@ -1127,14 +1192,17 @@ Qwen3.5 等混合架构模型同时包含 Full Attention 层和 SWA (Sliding Win
 
 ### 双池架构
 
+`SWAKVPool` 是一个**容器类**，内部持有两个独立的 `MHATokenToKVPool` 子池：
+
 ```
-Full Attention 层 → MHATokenToKVPool (保留全部 KV)
-SWA 层           → SWAKVPool (只保留窗口内 KV)
+SWAKVPool (容器)
+  ├── full_kv_pool: MHATokenToKVPool(size=size)      ← Full Attention 层，保留全部 KV
+  └── swa_kv_pool:  MHATokenToKVPool(size=size_swa)   ← SWA 层，只保留窗口内 KV（size_swa 通常更小）
 ```
 
-SWA 层的内存需求远小于 Full Attention 层，双池架构可以显著减少总内存占用。
+通过 `layers_mapping: Dict[int, Tuple[int, bool]]` 将全局 layer_id 路由到对应的子池。`set_kv_buffer()` 内部根据 `is_swa` 标志决定写入哪个子池，SWA 层还需要通过 `full_to_swa_index_mapping` 将 full 索引转换为 swa 索引。
 
-## 12. Sparsity 支持 (v0.5.9 新增)
+## 12. Sparsity 支持
 
 **文件**: `srt/mem_cache/sparsity/`
 
@@ -1153,7 +1221,7 @@ SWA 层的内存需求远小于 Full Attention 层，双池架构可以显著减
 
 Qwen3.5 的 GatedDeltaNet 层需要 Mamba 状态缓存，由 `MambaPool`（`memory_pool.py:186`）管理。
 
-### KV Cache 变体总览 (v0.5.9)
+### KV Cache 变体总览
 
 | 类 | 行号 | 适用模型 |
 |----|------|---------|
@@ -1166,7 +1234,7 @@ Qwen3.5 的 GatedDeltaNet 层需要 Mamba 状态缓存，由 `MambaPool`（`memo
 | `DoubleSparseTokenToKVPool` | L1886 | 双稀疏模型 |
 | `SWAKVPool` | swa_memory_pool.py:20 | SWA 层专用 |
 
-## 14. Host 内存池 (v0.5.9 扩展)
+## 14. Host 内存池
 
 **文件**: `srt/mem_cache/memory_pool_host.py` (1190行)
 

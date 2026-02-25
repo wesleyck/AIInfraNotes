@@ -27,10 +27,10 @@ class Scheduler(
     SchedulerDisaggregationDecodeMixin, # PD 分离 - Decode 端
     SchedulerDisaggregationPrefillMixin,# PD 分离 - Prefill 端
     SchedulerMultiplexMixin,            # PD 复用
-    SchedulerRuntimeCheckerMixin,       # 运行时检查 (v0.5.9 新增)
+    SchedulerRuntimeCheckerMixin,       # 运行时检查
     SchedulerPPMixin,                   # Pipeline Parallel
     SchedulerDPAttnMixin,               # DP Attention
-    SchedulerDllmMixin,                 # dLLM 支持 (v0.5.9 新增)
+    SchedulerDllmMixin,                 # dLLM 支持
 ):
 ```
 
@@ -195,14 +195,21 @@ Overlap Scheduling 之所以能实现 CPU/GPU 并行，根基在于 **CUDA 的�
 
 CUDA Stream 本质上是一个**提交给 GPU 的操作序列**（命令队列）。CPU 往 stream 里"投递"工作（kernel launch、异步 memcpy 等），投递完**立刻返回**——CPU 不等 GPU 执行完。同一个 stream 内的操作按 FIFO 顺序执行，不同 stream 间的操作可以并发。
 
-SGLang 在 `init_overlap()` 中创建了三条 stream：
+SGLang 使用三条 stream，但它们的创建位置不同：
 
 ```python
-# scheduler.py:1010-1020
+# forward_stream 由 TpModelWorker 创建，通过 get_worker_info() 返回给 Scheduler
+# scheduler.py:583
+self.forward_stream = self.tp_worker.get_worker_info()[...]  # 来自 ModelRunner
+
+# init_overlap() 中获取 default_stream 并创建 copy_stream
+# scheduler.py:990-1002
 self.default_stream = self.device_module.current_stream()  # 默认 CUDA stream (stream 0)
-self.forward_stream = self.device_module.Stream()           # 独立 stream，用于模型前向推理
+self.forward_stream_ctx = self.device_module.stream(self.forward_stream)  # 包装为 context manager
 self.copy_stream    = self.device_module.Stream()           # 独立 stream，用于异步数据拷贝
 ```
+
+> **为什么 forward_stream 由 ModelRunner 创建？** 因为 ModelRunner 在初始化时需要用 forward_stream 来 profile 最大 token 数和构建 CUDA Graph，这些操作发生在 Scheduler 的 `init_overlap()` 之前。
 
 > **注意**：`default_stream` 不是"给 CPU 用的 stream"——它是 PyTorch 的默认 CUDA stream。Pre Schedule 阶段的**主体是纯 CPU 的 Python 逻辑**（网络 I/O、调度决策、数据结构维护），但其中可能包含少量 tensor 操作（如 token 处理、radix cache 查找等），这些 tensor 操作会默认提交到 `default_stream`。
 
@@ -556,7 +563,7 @@ flowchart TD
 
 ### 3.2 handle_generate_request 详解
 
-**文件**: `scheduler.py:1510`
+**文件**: `scheduler.py:1481`
 
 ```python
 def handle_generate_request(self, recv_req: TokenizedGenerateReqInput):
@@ -620,7 +627,7 @@ def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
 
 ```mermaid
 flowchart TD
-    S1["Step 1: 处理 chunked_req<br/>if self.chunked_req:<br/>缓存 chunked_req 到 tree_cache<br/>释放其 req_pool_idx"]
+    S1["Step 1: 处理 chunked_req<br/>if self.chunked_req:<br/>stash_chunked_request(req)<br/>→ tree_cache.cache_unfinished_req(req, chunked=True)"]
     S1 --> S2
 
     S2["Step 2: 合并 prefill 完成的请求到 running_batch<br/>if last_batch and last_batch.forward_mode.is_extend():<br/>filter_batch() 移除已完成的请求<br/>running_batch.merge_batch(last_batch)"]
@@ -646,7 +653,9 @@ flowchart TD
 
 **文件**: `scheduler.py:1960`
 
-从 waiting_queue 创建 prefill batch
+从 waiting_queue 创建 prefill batch。
+
+> **注意**: 实际代码分为两层——`get_new_batch_prefill()` 是外层 wrapper，负责创建 `PrefillDelayerSinglePassExecutor`（DP Attention 场景下协调各 worker 的 prefill 时机）；核心选择逻辑在 `_get_new_batch_prefill_raw()` 中。以下为简化合并展示：
 
 ```python
 def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
@@ -699,7 +708,7 @@ def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
 
 ### 4.3 update_running_batch
 
-**文件**: `scheduler.py:2170`
+**文件**: `scheduler.py:2203`
 
 更新正在 decode 的批次。
 
@@ -793,7 +802,7 @@ def calc_priority(self, waiting_queue: List[Req]) -> bool:
 
 ## 7. run_batch 执行流程
 
-**文件**: `scheduler.py:2260`
+**文件**: `scheduler.py:2278`
 
 ```mermaid
 flowchart TD
@@ -861,7 +870,7 @@ self.disagg_decode_prealloc_queue = DecodePreallocQueue(...)  # 预分配 KV
 
 > **完整配置参数表**: 见 **§19**
 
-**文件**: `scheduler.py:2170` - `update_running_batch()`
+**文件**: `scheduler.py:2203` - `update_running_batch()`
 
 当 decode 阶段 KV Cache 不足时，会触发 retraction (请求回退)。
 
@@ -1035,16 +1044,23 @@ flowchart TB
 ### 10.1 process_batch_result 分发
 
 ```python
+# scheduler.py:2447
 def process_batch_result(self, batch, result):
-    if batch.forward_mode.is_prebuilt():
-        self.process_batch_result_prebuilt(batch)
-    elif batch.forward_mode.is_idle():
-        self.process_batch_result_idle(batch, result)
+    if batch.forward_mode.is_decode():          # decode 最高频，放在第一个分支
+        self.process_batch_result_decode(batch, result)
     elif batch.forward_mode.is_extend():
         self.process_batch_result_prefill(batch, result)
-    else:  # DECODE
-        self.process_batch_result_decode(batch, result)
+    elif batch.forward_mode.is_prebuilt():      # PD 分离 decode 端
+        self.process_batch_result_prebuilt(batch)
+    elif batch.forward_mode.is_idle():          # DP Attention idle 批次
+        self.process_batch_result_idle(batch, result)
+
+    self.log_batch_result_stats(batch, result)
+    self._maybe_clear_mm_inputs(batch)
+    self.maybe_send_health_check_signal()
 ```
+
+> **为什么 decode 放第一个？** 在稳态运行中，decode 是最高频的 forward mode（每个请求只 prefill 一次，但会 decode 多轮），将其放在 if-elif 链的第一个位置可以减少分支判断开销。
 
 ### 10.2 Prefill 结果处理
 
@@ -1093,7 +1109,7 @@ def process_batch_result_decode(self, batch, result):
 
 **启用条件**: `--enable-mixed-chunk`
 
-### 12.1 概念
+### 11.1 概念
 
 在同一批次中混合 chunked prefill 和 decode 请求。
 
@@ -1111,7 +1127,7 @@ flowchart LR
     Budget["总 token 预算 =<br/>chunked_prefill_size +<br/>running_batch_decode_tokens"]
 ```
 
-### 12.2 PrefillAdder 中的处理
+### 11.2 PrefillAdder 中的处理
 
 ```python
 # schedule_policy.py:317
@@ -1246,9 +1262,9 @@ flowchart TD
 | `max_prefill_tokens` | 计算 | 单批最大 prefill token 数 |
 | `max_running_requests` | 计算 | 最大并发请求数 |
 | `schedule_policy` | "fcfs" | 调度策略 |
-| `new_token_ratio` | 0.4 | 新 token 预留比例 |
-| `min_new_token_ratio` | 0.1 | 最小新 token 预留比例 |
-| `new_token_ratio_decay` | 0.001 | 预留比例衰减速率 |
+| `new_token_ratio` | 0.7 | 新 token 预留比例 (`SGLANG_INIT_NEW_TOKEN_RATIO * schedule_conservativeness`) |
+| `min_new_token_ratio` | ~0.098 | 最小新 token 预留比例 (`init_ratio * 0.14`) |
+| `new_token_ratio_decay` | ~0.001 | 预留比例衰减速率 (`(init - min) / 600`) |
 | `disaggregation_mode` | "null" | PD 分离模式 |
 | `enable_priority_scheduling` | False | 启用优先级调度 |
 | `priority_scheduling_preemption_threshold` | 0 | 抢占阈值 |
@@ -1290,22 +1306,22 @@ logger.error(f"Grammar accept_token failed for req {req.rid}")
 
 | 行号 | 触发位置 | 条件 |
 |------|---------|------|
-| L1893 | `get_new_batch_prefill()` | `get_num_allocatable_reqs(running_bs) <= 0`（请求槽位满） |
-| L1958 | `get_new_batch_prefill()` 循环中 | `len(can_run_list) >= get_num_allocatable_reqs(running_bs)` |
-| L1963 | `get_new_batch_prefill()` 循环中 | PD 分离 PREFILL 模式下 `req_to_token_pool` 用尽 |
-| L1988 | `get_new_batch_prefill()` 循环中 | `AddReqResult.NO_TOKEN` + hierarchical cache |
-| L1992 | `get_new_batch_prefill()` 循环中 | `AddReqResult.NO_TOKEN` (通用) |
+| L2006 | `_get_new_batch_prefill_raw()` | `get_num_allocatable_reqs(running_bs) <= 0` 且有 `chunked_req`（请求槽位满） |
+| L2072 | `_get_new_batch_prefill_raw()` 循环中 | `len(can_run_list) >= get_num_allocatable_reqs(running_bs)` |
+| L2077 | `_get_new_batch_prefill_raw()` 循环中 | PD 分离 PREFILL 模式下 `req_to_token_pool` 用尽 |
+| L2113 | `_get_new_batch_prefill_raw()` 循环中 | `AddReqResult.NO_TOKEN` (通用) |
+| L2109 | `_get_new_batch_prefill_raw()` 循环中 | `AddReqResult.NO_TOKEN` + hierarchical cache（条件性设置） |
 
 ### 19.2 重置为 False 的场景
 
 | 行号 | 触发位置 | 条件 |
 |------|---------|------|
-| L727 | `init_running_status()` | 初始化 |
-| L1811 | `get_next_batch_to_run()` | `filter_batch()` 后 batch_size 减小 |
-| L1874 | `get_new_batch_prefill()` | 尝试 preemption 前重置 |
-| L2079 | `update_running_batch()` | `filter_batch()` 后 batch 为空 |
-| L2147 | `update_running_batch()` | decode 批次收缩 |
-| L2679 | retraction 处理完成 | 重置以允许新 prefill |
+| L749 | `init_running_status()` | 初始化 |
+| L1910 | `get_next_batch_to_run()` | `filter_batch()` 后 batch_size 减小 |
+| L1988 | `_get_new_batch_prefill_raw()` | `try_preemption` 时重置以尝试抢占 |
+| L2209 | `update_running_batch()` | `filter_batch()` 后 batch 为空 |
+| L2263 | `update_running_batch()` | decode 批次收缩 |
+| L2868 | retraction 处理完成 | 重置以允许新 prefill |
 
 ## 20. is_disable_overlap_for_batch 条件
 
@@ -1663,42 +1679,79 @@ for mb_id in range(pp_loop_size):
 
 有专门的 `event_loop_pp_disagg_prefill()` 和 `event_loop_pp_disagg_decode()` 处理 KV 传输共识，支持 PP + PD 分离的组合部署。
 
-## 28. PrefillDelayer (v0.5.9 新增)
+## 28. PrefillDelayer
 
 **文件**: `srt/managers/prefill_delayer.py` (256行)
 
-在 DP Attention 场景下，多个 DP worker 的 prefill 时机需要全局协商。PrefillDelayer 通过状态机机制实现延迟协商：
+**为什么需要**: DP Attention 场景下，不同 worker 的 waiting_queue 深度不同。如果各 worker 独立决定 prefill 时机，会导致负载不均——一个 worker 在 prefill 大请求，另一个已经完成进入 idle，而 DP all-reduce 要求所有 worker 同步，idle 的 worker 只能空等 GPU。PrefillDelayer 通过全局协商让各 worker 对齐 prefill 时机，提升 DP workers 间的 GPU 利用率。
+
+**默认状态**: `enable_prefill_delayer = false`（`server_args.py` L342），DP Attention 场景推荐开启。
 
 ### 28.1 核心机制
 
-1. **状态机**: 每个 DP worker 维护一个状态（IDLE → WAITING → READY → RUNNING），通过 ZMQ 广播状态变化
-2. **全局协商**: 所有 DP worker 必须同时进入 READY 状态才能开始 prefill，避免负载不均
-3. **水位线强制允许**: 当 waiting_queue 长度超过阈值时，即使未完成协商也强制允许 prefill，防止饥饿
+每轮调度时，通过 NCCL `all_gather` 在所有 DP workers 间同步两个信息：本 worker 是否有可 prefill 的请求（`local_prefillable`）、是否触发水位线强制允许（`local_token_watermark_force_allow`）。
+
+汇总后判断全局状态，决策逻辑如下：
+
+| 全局状态 | 含义 | 决策 | 原因 |
+|---------|------|------|------|
+| `"all"` | 所有 DP worker 都有可 prefill 的请求 | 允许 prefill | 全员同步 prefill，无浪费 |
+| `"none"` | 没有任何 DP worker 有可 prefill 的请求 | 允许（无意义） | 不影响调度 |
+| `"mixed"` | 部分有、部分没有 | 延迟，最多 `max_delay_passes` 轮 | 等待其他 worker 也积累请求 |
+
+`"mixed"` 状态下的特殊处理：
+1. **水位线强制允许**: 若任一 worker 的 `token_usage < token_usage_low_watermark`，立即允许 prefill，防止 KV cache 利用率过低
+2. **延迟计数**: 维护 `_State.delayed_count`，每轮 mixed 状态递增，达到 `max_delay_passes` 后超时强制允许
+3. **状态重置**: 一旦决策为允许（无论原因），状态重置为 `None`，下轮重新开始
 
 ### 28.2 与调度策略的协作
 
-PrefillDelayer 在 `get_new_batch_prefill()` 之前被调用，决定是否允许本轮创建 prefill 批次。如果 PrefillDelayer 返回 False，则跳过 prefill，直接进入 decode 路径。
+PrefillDelayer 的协商逻辑嵌入在 `get_new_batch_prefill()` 的调用链中（`scheduler.py:1960-1975`）：
 
-## 29. SchedulerRecvSkipper (v0.5.9 新增)
+```python
+def get_new_batch_prefill(self):
+    # 1. 创建单轮协商执行器
+    if self.prefill_delayer:
+        _, token_usage, _, _ = self._get_token_info()
+        executor = PrefillDelayerSinglePassExecutor(self.prefill_delayer, token_usage)
+
+    # 2. 核心选择逻辑（executor 传入 PrefillAdder）
+    ret = self._get_new_batch_prefill_raw(prefill_delayer_single_pass=executor)
+
+    # 3. 记录指标
+    if self.prefill_delayer:
+        executor.finalize(actual_prefill=ret is not None)
+
+    return ret
+```
+
+在 `_get_new_batch_prefill_raw()` 内部，`PrefillAdder.add_one_req()` 会调用 `executor.negotiate_should_allow_prefill()`，若协商不允许则返回 `AddReqResult.OTHER`，跳过该请求的 prefill。
+
+## 29. SchedulerRecvSkipper
 
 **文件**: `srt/managers/scheduler_recv_skipper.py` (38行)
 
 基于 ForwardMode 的加权计数器，决定是否跳过 `recv_requests()` 调用。在高负载 decode 场景下，频繁的 recv 会增加 CPU 开销，SchedulerRecvSkipper 通过计数器机制减少不必要的 recv 调用。
 
-## 30. SchedulerRuntimeCheckerMixin (v0.5.9 新增)
+## 30. SchedulerRuntimeCheckerMixin
 
 **文件**: `srt/managers/scheduler_runtime_checker_mixin.py` (364行)
 
 运行时检查 mixin，提供：
-- **Token 使用率监控**: 定期检查 KV Cache 的 token 使用率
-- **Mamba Token 信息**: 对于混合架构模型（如 Qwen3.5），监控 Mamba/线性注意力层的 token 状态
-- **Watchdog**: 检测调度器是否卡死，超时后触发告警
+- **Token 使用率监控**: `_get_token_info()` 定期检查 KV Cache 的 token 使用率
+- **混合架构 Token 信息**: 对于 Mamba 模型提供 `_get_mamba_token_info()`，对于 SWA（滑动窗口注意力）混合模型提供 `_get_swa_token_info()`。Qwen3.5 的 GatedDeltaNet 线性注意力层走 `_check_hybrid_memory()` 路径
+- **Watchdog**: `create_scheduler_watchdog()` 监控 `forward_ct` 计数器，检测调度器是否卡死，超时后触发告警
 
-## 31. SchedulerInputBlocker (v0.5.9 新增)
+## 31. SchedulerInputBlocker
 
 **文件**: `srt/managers/scheduler_input_blocker.py` (106行)
 
-输入阻塞逻辑，在特定条件下阻止新请求进入 waiting_queue。用于流量控制和过载保护。
+输入阻塞逻辑，专门用于 **colocated batch generation** 场景（通过 `SGLANG_ENABLE_COLOCATED_BATCH_GEN` 环境变量启用）。在权重更新期间阻塞新请求输入，确保更新过程不受干扰。
+
+状态机：`UNBLOCKED → BLOCKED → GLOBAL_UNBLOCK_BARRIER → UNBLOCKED`
+- `BLOCKED`: 收到 `BlockReqInput(BLOCK)` 后进入，缓存所有新请求到 `_pending_reqs`
+- `GLOBAL_UNBLOCK_BARRIER`: 收到 `BlockReqInput(UNBLOCK)` 后进入，通过 `PollBasedBarrier` 等待所有 TP rank 同步解锁
+- `UNBLOCKED`: barrier 完成后释放所有缓存的请求
 
 ## 32. 下一步
 

@@ -10,13 +10,21 @@
 
 ```mermaid
 flowchart LR
-    A["HTTP Request"] --> B["HTTP Server<br/>(FastAPI)"]
-    B --> C["TokenizerManager<br/>(tokenize +<br/>多模态预处理)"]
-    C -->|"ZMQ"| D["Scheduler<br/>(调度batch)"]
-    D --> E["ModelRunner<br/>(model forward)"]
-    E --> F["Sampling<br/>(logits→token)"]
-    F --> G["Constrained<br/>Generation<br/>(Grammar/StructTag)"]
-    G --> H["Detokenizer<br/>(token→text)"]
+    subgraph MainProc["主进程"]
+        A["HTTP Request"] --> B["HTTP Server<br/>(FastAPI)"]
+        B --> C["TokenizerManager<br/>(tokenize +<br/>多模态预处理)"]
+    end
+    subgraph SchedProc["Scheduler 进程"]
+        D["Scheduler<br/>(调度batch)"] --> W["TpModelWorker"]
+        W --> E["ModelRunner<br/>(model forward)"]
+        E --> F["Sampling<br/>(logits→token)"]
+        F --> G["Constrained<br/>Generation"]
+    end
+    subgraph DetokProc["Detokenizer 进程"]
+        H["Detokenizer<br/>(token→text)"]
+    end
+    C -->|"ZMQ"| D
+    G -->|"ZMQ"| H
     H --> I["HTTP Response"]
 ```
 
@@ -39,46 +47,46 @@ flowchart TD
 ## 笔记目录
 
 ### Phase 0: 全局架构
-- [ ] `01-architecture.md` - 系统架构、进程模型、event_loop_overlap、请求生命周期
+- `01-architecture.md` - 系统架构、进程模型、event_loop_overlap、请求生命周期
 
 ### Phase 1: 数据结构
-- [ ] `02-core-data-structures.md` - Req、ScheduleBatch、ModelWorkerBatch、ForwardBatch、MultimodalInputs
+- `02-core-data-structures.md` - Req、ScheduleBatch、ModelWorkerBatch、ForwardBatch、MultimodalInputs
 
 ### Phase 2: 调度系统
-- [ ] `03-scheduler.md` - Scheduler 事件循环、批次调度、retraction、结果处理
-- [ ] `04-schedule-policy.md` - PrefillAdder、In-batch prefix caching、优先级抢占
-- [ ] `05-chunked-prefill.md` - 分块预填充、多模态分块、PD 分离场景
+- `03-scheduler.md` - Scheduler 事件循环、批次调度、retraction、结果处理
+- `04-schedule-policy.md` - PrefillAdder、In-batch prefix caching、优先级抢占
+- `05-chunked-prefill.md` - 分块预填充、多模态分块、PD 分离场景
 
 ### Phase 3: 内存管理
-- [ ] `06-memory-pool.md` - GPU/Host 内存池设计、KVCache 变体、分配器
-- [ ] `07-radix-cache.md` - RadixAttention 前缀缓存、逐出策略、锁机制
+- `06-memory-pool.md` - GPU/Host 内存池设计、KVCache 变体、分配器
+- `07-radix-cache.md` - RadixAttention 前缀缓存、逐出策略、锁机制
 
 ### Phase 4: 模型执行
-- [ ] `08-model-runner.md` - ModelRunner、CUDA Graph、ForwardBatch、Batch Overlap 集成
-- [ ] `09-attention-backends.md` - FlashInfer、FlashAttention、Triton、线性注意力、TBO 等 17 种后端
-- [ ] `10-model-loading.md` - 模型加载、权重处理、量化支持
-- [ ] `11-multimodal.md` - 多模态完整生命周期、VIT 处理、图像缓存
-- [ ] `24-batch-overlap.md` - Batch Overlap（SBO/TBO）计算-通信重叠
+- `08-model-runner.md` - ModelRunner、CUDA Graph、ForwardBatch
+- `09-attention-backends.md` - FlashInfer、FlashAttention、Triton、线性注意力、TBO 等 17 种后端
+- `10-model-loading.md` - 模型加载、权重处理、量化支持
+- `11-multimodal.md` - 多模态完整生命周期、VIT 处理、图像缓存
 
 ### Phase 5: 高级特性
-- [ ] `12-speculative-decoding.md` - EAGLE、NGram 投机解码
-- [ ] `13-parallel-strategies.md` - TP/PP/EP/DP 并行策略、EPLB、Elastic EP
-- [ ] `14-pd-disaggregation.md` - Prefill-Decode 分离、KV 事件管理
+- `12-speculative-decoding.md` - EAGLE、NGram 投机解码
+- `13-parallel-strategies.md` - TP/PP/EP/DP 并行策略、EPLB、Elastic EP
+- `14-pd-disaggregation.md` - Prefill-Decode 分离、KV 事件管理
+- `24-batch-overlap.md` - Batch Overlap（SBO/TBO）计算-通信重叠优化
 
 ### Phase 6: Kernel 实现
-- [ ] `15-sgl-kernel-overview.md` - sgl-kernel 架构
-- [ ] `16-attention-kernels.md` - Attention kernel 实现
-- [ ] `17-moe-kernels.md` - MoE kernel 实现
-- [ ] `18-quantization.md` - 量化实现详解
+- `15-sgl-kernel-overview.md` - sgl-kernel 架构
+- `16-attention-kernels.md` - Attention kernel 实现
+- `17-moe-kernels.md` - MoE kernel 实现
+- `18-quantization.md` - 量化实现详解
 
 ### Phase 7: 生成与约束
-- [ ] `19-sampling-and-generation.md` - 采样参数、惩罚机制、LogitsProcessor、Sampler
-- [ ] `20-constrained-generation.md` - Grammar Backend、JSON Schema、词表掩码、跳跃解码
-- [ ] `21-reasoning-and-function-call.md` - 推理解析 (ReasoningParser)、函数调用 (FunctionCallParser)
+- `19-sampling-and-generation.md` - 采样参数、惩罚机制、LogitsProcessor、Sampler
+- `20-constrained-generation.md` - Grammar Backend、JSON Schema、词表掩码、跳跃解码
+- `21-reasoning-and-function-call.md` - 推理解析 (ReasoningParser)、函数调用 (FunctionCallParser)
 
 ### Phase 8: 特殊模型与适配
-- [ ] `22-embedding-and-rerank.md` - Embedding/Rerank 模型 (Pooler, CrossEncodingPooler, SparsePooler)
-- [ ] `23-lora.md` - LoRA 适配器 (S-LoRA, Punica, 内存池, 多后端)
+- `22-embedding-and-rerank.md` - Embedding/Rerank 模型 (Pooler, CrossEncodingPooler, SparsePooler)
+- `23-lora.md` - LoRA 适配器 (S-LoRA, Punica, 内存池, 多后端)
 
 ## 核心文件速查
 
@@ -96,7 +104,7 @@ flowchart TD
 | 内存 | `srt/mem_cache/memory_pool.py` | - | KV Cache 内存池 |
 | 缓存 | `srt/mem_cache/radix_cache.py` | - | Radix 前缀缓存 |
 | 执行 | `srt/model_executor/model_runner.py` | - | 模型前向 |
-| 多模态 | `srt/multimodal/processors/qwen_vl.py` | 223 | QwenVLImageProcessor |
+| 多模态 | `srt/multimodal/processors/qwen_vl.py` | 233 | QwenVLImageProcessor |
 | Attention | `srt/layers/attention/` | - | 各种 Attention 后端 |
 | 投机 | `srt/speculative/eagle_worker.py` | - | EAGLE 实现 |
 | 采样 | `srt/sampling/sampling_params.py` | - | SamplingParams 定义 |

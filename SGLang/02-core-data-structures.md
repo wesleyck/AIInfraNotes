@@ -307,9 +307,10 @@ def prepare_for_extend(self):
     )
 
     # 3. 更新 req 的 KV 长度信息
-    for req in self.reqs:
-        req.kv_committed_len = len(req.fill_ids) - 1
-        req.kv_allocated_len = len(req.fill_ids) - 1
+    seq_lens = [len(r.fill_ids) for r in reqs]
+    for req, seq_len in zip(self.reqs, seq_lens):
+        req.kv_committed_len = seq_len   # 注意: 等于 len(fill_ids)，不是 -1
+        req.kv_allocated_len = seq_len
 
     # 4. 处理多模态输入
     for mm_input in multimodal_inputs:
@@ -811,17 +812,17 @@ for req in running_batch.reqs:
 | `mrope_positions` | Tensor | M-ROPE 位置 (Qwen3.5) |
 | `extend_start_loc` | Tensor | Extend 起始位置 |
 
-## 9. v0.5.9 新增数据结构
+## 9. 其他数据结构
 
 ### 9.1 ForwardBatchDeepSeekMHAMixin
 
-**文件**: `srt/model_executor/forward_batch_deepseek_mha_mixin.py` (9681行)
+**文件**: `srt/model_executor/forward_batch_deepseek_mha_mixin.py` (232行)
 
 为 DeepSeek MHA (Multi-Head Attention) 模型提供的 ForwardBatch 扩展 mixin，包含 MLA chunked prefix cache 在 chunked prefill 中使用的专用字段。由于 DeepSeek 的 MLA 架构特殊性，需要额外的 KV cache 索引和元数据管理。
 
 ### 9.2 GraphInputBuffers
 
-**文件**: `srt/model_executor/input_buffers.py` (8047行)
+**文件**: `srt/model_executor/input_buffers.py` (208行)
 
 从 ModelRunner 中重构出来的独立模块，管理 CUDA Graph 的输入缓冲区。将图输入缓冲区的分配、填充、复用逻辑集中管理，减少 ModelRunner 的复杂度。
 
@@ -832,9 +833,9 @@ class GraphInputBuffers:
     # 每次 forward 前将实际数据拷贝到这些缓冲区
 ```
 
-### 9.3 ForwardMode 新增值 (v0.5.9)
+### 9.3 ForwardMode 新增值
 
-相比 v0.5.7，ForwardMode 枚举新增了以下值：
+ForwardMode 枚举还包含以下特殊值：
 
 | 值 | 说明 |
 |---|------|

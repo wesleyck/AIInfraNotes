@@ -18,7 +18,7 @@ SGLang 除了支持生成式 LLM 推理外，还原生支持 **Embedding** 和 *
 
 ### 1.1 模型类型判定
 
-**文件**: `srt/configs/model_config.py:1024`
+**文件**: `srt/configs/model_config.py:1183`
 
 SGLang 通过 `is_generation_model()` 函数判定模型类型：
 
@@ -36,11 +36,13 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         # Rerank / Classification 类
         or "BertForSequenceClassification" in model_architectures
         or "XLMRobertaForSequenceClassification" in model_architectures
+        or "Gemma2ForSequenceClassification" in model_architectures
         # Reward Model / Sequence Classification 类
         or "LlamaForSequenceClassification" in model_architectures
         or "LlamaForSequenceClassificationWithNormal_Weights" in model_architectures
         or "InternLM2ForRewardModel" in model_architectures
         or "Qwen2ForRewardModel" in model_architectures
+        or "Qwen3ForRewardModel" in model_architectures
         or "Qwen2ForSequenceClassification" in model_architectures
         or "Qwen3ForSequenceClassification" in model_architectures
     ):
@@ -62,10 +64,12 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
 | | `XLMRobertaModel` | 多语言 RoBERTa embedding |
 | **Rerank** | `BertForSequenceClassification` | BERT 交叉编码器 |
 | | `XLMRobertaForSequenceClassification` | 多语言 RoBERTa reranker |
+| | `Gemma2ForSequenceClassification` | Gemma2 分类/奖励模型 |
 | **Reward Model** | `LlamaForSequenceClassification` | LLaMA 分类/奖励模型 |
 | | `LlamaForSequenceClassificationWithNormal_Weights` | LLaMA 奖励 (normal weights) |
 | | `InternLM2ForRewardModel` | InternLM2 奖励模型 |
 | | `Qwen2ForRewardModel` | Qwen2 奖励模型 |
+| | `Qwen3ForRewardModel` | Qwen3 奖励模型 |
 | **Classification** | `Qwen2ForSequenceClassification` | Qwen2 序列分类 |
 | | `Qwen3ForSequenceClassification` | Qwen3 序列分类 |
 
@@ -92,8 +96,9 @@ flowchart TD
 | `Contriever` | `models/bert.py` | Embedding | Contriever (继承 BertModel) |
 | `BertForSequenceClassification` | `models/bert.py` | Rerank | BERT 交叉编码器 |
 | `CLIPModel` | `models/clip.py` | Embedding | CLIP 文本+视觉 embedding |
-| `XLMRobertaModel` | `models/xlm_roberta.py` | Embedding | 多语言 RoBERTa |
-| `XLMRobertaForSequenceClassification` | `models/xlm_roberta.py` | Rerank | 多语言 RoBERTa reranker |
+| `XLMRobertaModel` | `models/roberta.py` | Embedding | 多语言 RoBERTa（支持 sparse head 条件切换 SparsePooler） |
+| `XLMRobertaForSequenceClassification` | `models/roberta.py` | Rerank | 多语言 RoBERTa reranker |
+| `Gemma2ForSequenceClassification` | `models/gemma2_reward.py` | Classification | Gemma2 分类/奖励模型 |
 
 ---
 
@@ -215,7 +220,7 @@ if isinstance(prompt[0], MultimodalEmbeddingInput):
 
 ## 3. EmbeddingReqInput 数据结构
 
-**文件**: `srt/managers/io_struct.py:769`
+**文件**: `srt/managers/io_struct.py:791`
 
 ```python
 class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
@@ -227,12 +232,21 @@ class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
     audio_data: Optional[MultimodalDataInputFormat] = None
     # Token IDs 输入 (与 text 二选一)
     input_ids: Optional[Union[List[List[int]], List[int]]] = None
+    # 直接传入嵌入向量 (跳过 tokenize + embedding 层)
+    input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
     # 交叉编码器标记
     is_cross_encoder_request: bool = False
     # Matryoshka 维度截断
     dimensions: Optional[int] = None
     # 请求优先级
     priority: Optional[int] = None
+    # 路由键 (用于 routing-key 调度策略)
+    routing_key: Optional[str] = None
+    # 后台请求标记 (OpenAI Responses API)
+    background: bool = False
+    # LoRA 适配器路径和 ID
+    lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    lora_id: Optional[Union[List[Optional[str]], Optional[str]]] = None
 ```
 
 ### 3.1 normalize_batch_and_arguments
@@ -726,10 +740,12 @@ curl http://localhost:30000/v1/rerank \
 | `srt/layers/sparse_pooler.py` | SparsePooler |
 | `srt/entrypoints/openai/serving_embedding.py` | /v1/embeddings 处理 |
 | `srt/entrypoints/openai/serving_rerank.py` | /v1/rerank 处理 |
-| `srt/managers/io_struct.py:769` | EmbeddingReqInput 数据结构 |
-| `srt/configs/model_config.py:1024` | is_generation_model() |
+| `srt/managers/io_struct.py:791` | EmbeddingReqInput 数据结构 |
+| `srt/configs/model_config.py:1183` | is_generation_model() |
 | `srt/models/llama_embedding.py` | LlamaEmbeddingModel |
 | `srt/models/bert.py` | BertModel, BertForSequenceClassification |
 | `srt/models/clip.py` | CLIPModel |
+| `srt/models/roberta.py` | XLMRobertaModel, XLMRobertaForSequenceClassification |
+| `srt/models/gemma2_reward.py` | Gemma2ForSequenceClassification |
 | `srt/model_executor/model_runner.py` | get_embedding=True 路径 |
 | `srt/managers/scheduler.py` | handle_embedding_request |

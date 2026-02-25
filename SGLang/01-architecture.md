@@ -114,7 +114,7 @@ class TokenizerManager:
         self.mm_processor = get_mm_processor(...)  # 多模态处理器 (如 QwenVLImageProcessor)
 ```
 
-**Qwen3.5 多模态处理器**: `srt/multimodal/processors/qwen_vl.py:QwenVLImageProcessor` (L223)
+**Qwen3.5 多模态处理器**: `srt/multimodal/processors/qwen_vl.py:QwenVLImageProcessor` (L233)
 
 ```python
 # Qwen3.5 处理器支持的模型
@@ -122,11 +122,11 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
     models = [
         Qwen2VLForConditionalGeneration,
         Qwen2_5_VLForConditionalGeneration,
-        Qwen3VLForConditionalGeneration,  # Qwen3-VL
+        Qwen3VLForConditionalGeneration,           # Qwen3-VL
         Qwen3VLMoeForConditionalGeneration,
-        Qwen3OmniMoeForConditionalGeneration,
-        Qwen3_5ForCausalLM,               # Qwen3.5
-        Qwen3_5MoeForCausalLM,            # Qwen3.5 MoE
+        Qwen3_5ForConditionalGeneration,           # Qwen3.5
+        Qwen3_5MoeForConditionalGeneration,        # Qwen3.5 MoE
+        Qwen3OmniMoeForConditionalGeneration,      # Qwen3-Omni
     ]
 ```
 
@@ -141,7 +141,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 4. 调用 TPWorker 执行模型前向
 
 ```python
-# 核心类 (v0.5.9 继承链)
+# 核心类 (继承链)
 class Scheduler(
     SchedulerOutputProcessorMixin,
     SchedulerUpdateWeightsMixin,
@@ -150,10 +150,10 @@ class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
     SchedulerMultiplexMixin,
-    SchedulerRuntimeCheckerMixin,       # v0.5.9 新增: 运行时检查
+    SchedulerRuntimeCheckerMixin,       # 运行时检查
     SchedulerPPMixin,
     SchedulerDPAttnMixin,
-    SchedulerDllmMixin,                 # v0.5.9 新增: dLLM 支持
+    SchedulerDllmMixin,                 # dLLM 支持
 ):
     def __init__(self, ...):
         self.waiting_queue = []      # 等待队列 init_running_status
@@ -196,9 +196,11 @@ gantt
 
     section CPU
     Phase1+2 recv+schedule (N)       :a1, 0, 3
+    Phase3 run_batch(N)              :a2, 3, 3.5
     Phase5 process_result(N-1)       :a3, 4, 7
     Phase6 launch_sample(N)          :a4, 7, 8
     Phase1+2 recv+schedule (N+1)     :a5, 8, 11
+    Phase3 run_batch(N+1)            :a6, 11, 11.5
     Phase5 process_result(N)         :a7, 12, 15
     Phase6 launch_sample(N+1)        :a8, 15, 16
 
@@ -206,6 +208,8 @@ gantt
     forward(N)                       :b1, 3, 12
     forward(N+1)                     :b2, 11, 20
 ```
+
+> **Note**: Phase 3 `run_batch()` 是 CPU 端的 kernel launch 操作，仅将计算指令提交到 GPU stream，近乎瞬间完成（图中宽度仅为示意）。真正的 GPU 计算在 `forward(N)` 中异步执行。
 
 每轮循环的阶段对应 `event_loop_overlap()` 代码:
 
@@ -363,14 +367,25 @@ flowchart LR
 
 ```python
 # Token 输出 (io_struct.py)
-BatchTokenIDOutput:
-    rids: List[str]              # 请求 IDs
-    output_token_ids: List[List[int]]
+BatchTokenIDOutput(BaseBatchReq):
+    finished_reasons: List[BaseFinishReason]  # 完成原因
+    decoded_texts: List[str]                  # 增量解码文本
+    decode_ids: List[int]                     # 增量 token IDs
+    output_ids: Optional[List[int]]           # 完整输出 (skip-tokenizer 模式)
+    prompt_tokens: List[int]                  # prompt token 计数
+    completion_tokens: List[int]              # 生成 token 计数
+    cached_tokens: List[int]                  # 缓存命中 token 计数
+    # ... logprob 字段、hidden_states 等
 
 # 最终输出 (io_struct.py)
-BatchStrOutput:
-    rids: List[str]
-    output_strs: List[str]       # 解码后的文本
+BatchStrOutput(BaseBatchReq):
+    finished_reasons: List[dict]              # 完成原因
+    output_strs: List[str]                    # 解码后的文本
+    output_ids: Optional[List[int]]           # token IDs
+    prompt_tokens: List[int]
+    completion_tokens: List[int]
+    cached_tokens: List[int]
+    # ... logprob 字段等
 ```
 
 ## 6. 源码阅读建议
@@ -407,12 +422,12 @@ SGLang 有两种启动方式，入口不同:
 
 | 函数 | 文件 | 行号 | 作用 |
 |------|------|------|------|
-| `_launch_subprocesses()` | engine.py | ~900 | 启动所有进程 |
+| `_launch_subprocesses()` | engine.py | ~911 | 启动所有进程 |
 | `event_loop_overlap()` | scheduler.py | 1135 | 主调度循环 (默认) |
 | `get_next_batch_to_run()` | scheduler.py | 1875 | 获取下一批次 (统一入口) |
 | `get_new_batch_prefill()` | scheduler.py | ~1960 | 创建 Prefill 批次 |
-| `update_running_batch()` | scheduler.py | ~2170 | 更新 Decode 批次 |
-| `run_batch()` | scheduler.py | ~2260 | 执行批次前向 |
+| `update_running_batch()` | scheduler.py | ~2203 | 更新 Decode 批次 |
+| `run_batch()` | scheduler.py | ~2278 | 执行批次前向 |
 | `forward_batch_generation()` | tp_worker.py | - | 模型前向 |
 
 ### 6.3 核心数据结构
@@ -425,14 +440,9 @@ SGLang 有两种启动方式，入口不同:
 | `ForwardBatch` | forward_batch_info.py | 231 | GPU 层批次 |
 | `ForwardMode` | forward_batch_info.py | 74 | 前向模式枚举 |
 
-## 7. 下一步
+## 7. Batch Overlap 调度模式
 
-理解了全局架构后，下一步深入学习：
-- **02**: 核心数据结构详解 (`Req`, `ScheduleBatch`, `ModelWorkerBatch`, `ForwardBatch`)
-
-## 8. Batch Overlap 调度模式 (v0.5.9 新增)
-
-v0.5.9 引入了 `batch_overlap/` 模块，提供比 `event_loop_overlap` 更细粒度的计算-通信重叠优化，特别适用于 MoE 模型（如 Qwen3.5）。
+SGLang 引入了 `batch_overlap/` 模块，提供比 `event_loop_overlap` 更细粒度的计算-通信重叠优化，特别适用于 MoE 模型（如 Qwen3.5）。
 
 **文件**: `srt/batch_overlap/`
 
@@ -450,7 +460,7 @@ v0.5.9 引入了 `batch_overlap/` 模块，提供比 `event_loop_overlap` 更细
 
 > **详细分析**: 见 **24-batch-overlap.md**
 
-## 9. PrefillDelayer (v0.5.9 新增)
+## 8. PrefillDelayer
 
 **文件**: `srt/managers/prefill_delayer.py` (256行)
 
@@ -460,7 +470,7 @@ v0.5.9 引入了 `batch_overlap/` 模块，提供比 `event_loop_overlap` 更细
 
 > **详细分析**: 见 **03-scheduler.md**
 
-## 10. 新增入口 (v0.5.9)
+## 9. Anthropic API 入口
 
 ### Anthropic API 入口
 
@@ -472,3 +482,8 @@ v0.5.9 引入了 `batch_overlap/` 模块，提供比 `event_loop_overlap` 更细
 | `serving.py` | Anthropic API 服务实现 |
 
 提供与 Anthropic Messages API 兼容的端点，扩展了 SGLang 的 API 兼容性。
+
+## 10. 下一步
+
+理解了全局架构后，下一步深入学习：
+- **02**: 核心数据结构详解 (`Req`, `ScheduleBatch`, `ModelWorkerBatch`, `ForwardBatch`)
