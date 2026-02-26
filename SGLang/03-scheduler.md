@@ -1629,7 +1629,7 @@ class DpPaddingMode(IntEnum):
 
 ## 26. schedule_enhancer（版本核对说明）
 
-> 事实审校结论（v0.5.9 当前代码）：在 `python/sglang/srt/managers/` 下未发现 `名为 scheduler_enhancer.py 的文件`，也未检索到 `schedule_enhancer.get_schedule_decision()` 调用点。
+> 事实审校结论（v0.5.9 当前代码）：在 `python/sglang/srt/managers/` 下未发现 `名为 scheduler_enhancer.py 的文件`，也未检索到可对应的 `schedule_enhancer` 决策调用点。
 >
 > 这说明本节描述更可能来自旧版本/实验分支。为避免误导，当前将其标记为“历史机制待确认”。
 

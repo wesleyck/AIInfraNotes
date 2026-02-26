@@ -397,7 +397,7 @@ def evict(self, params: EvictParams) -> EvictResult:
     return EvictResult(num_tokens_evicted=num_evicted)
 ```
 
-> **关键区别**: 实际实现使用 `self.evictable_leaves` (一个 `set`) 而非 `_collect_leaves()` 遍历。`evictable_leaves` 由 `_update_leaf_status()` 实时维护，避免每次 evict 都遍历整棵树。
+> **关键区别**: 实际实现使用 `self.evictable_leaves` (一个 `set`) 而非“每次逐出前全树收集叶子节点”的遍历策略。`evictable_leaves` 由 `_update_leaf_status()` 实时维护，避免每次 evict 都遍历整棵树。
 
 ## 6. 请求生命周期中的缓存操作
 
