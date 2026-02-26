@@ -4,6 +4,18 @@
 >
 > **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存 + EPLB + MTP + 线性注意力
 
+## 本章定位
+- 主题范围: SBO/TBO 机制与适用边界。
+
+## 设计 Why（为什么这么设计）
+- Overlap 通过重叠计算/通信提升利用率，但依赖严格边界控制。
+- 核心取舍: 吞吐 vs 时延、显存 vs 计算、通用性 vs 特化。
+
+## 阅读建议（进阶）
+1. 先抓目标函数和边界条件，再读具体实现。
+2. 先看调用链和状态变化，再看局部优化细节。
+3. 源码锚点以“路径 + 类/函数”为主，避免依赖易漂移行号。
+
 ## 1. 概述
 
 ### 1.1 为什么需要 Batch Overlap
@@ -69,17 +81,17 @@ python -m sglang.launch_server --model-path Qwen/Qwen3.5-397B-A17B-FP8 \
 
 | 文件 | 行数 | 说明 |
 |------|------|------|
-| `srt/batch_overlap/single_batch_overlap.py` | ~145 | SBO 实现 |
-| `srt/batch_overlap/two_batch_overlap.py` | ~1074 | TBO 实现 |
-| `srt/batch_overlap/operations.py` | ~214 | Stage 执行框架 |
-| `srt/batch_overlap/operations_strategy.py` | ~296 | 模型特定操作策略 |
-| `srt/layers/attention/tbo_backend.py` | ~264 | TBO Attention 后端包装器 |
+| `python/sglang/srt/batch_overlap/single_batch_overlap.py` | ~145 | SBO 实现 |
+| `python/sglang/srt/batch_overlap/two_batch_overlap.py` | ~1074 | TBO 实现 |
+| `python/sglang/srt/batch_overlap/operations.py` | ~214 | Stage 执行框架 |
+| `python/sglang/srt/batch_overlap/operations_strategy.py` | ~296 | 模型特定操作策略 |
+| `python/sglang/srt/layers/attention/tbo_backend.py` | ~264 | TBO Attention 后端包装器 |
 
 ---
 
 ## 2. SBO (Single Batch Overlap)
 
-**文件**: `srt/batch_overlap/single_batch_overlap.py`
+**文件**: `python/sglang/srt/batch_overlap/single_batch_overlap.py`
 
 SBO 在单个 batch 的 MoE 层内部，将 **combine 通信**与 **down GEMM 计算**放在不同 CUDA stream 上并行执行。注意：SBO 重叠的不是"MoE 通信与 attention 计算"，而是 MoE 层内部的两个子操作。
 
@@ -178,7 +190,7 @@ def compute_overlap_args(dispatch_output, alt_stream):
 
 ## 3. TBO (Two Batch Overlap)
 
-**文件**: `srt/batch_overlap/two_batch_overlap.py`
+**文件**: `python/sglang/srt/batch_overlap/two_batch_overlap.py`
 
 TBO 是更激进的重叠策略：将一个 batch 拆成两个子批（A 和 B），通过**交错执行**让 A 的计算与 B 的通信重叠。
 
@@ -231,7 +243,7 @@ def _split_extend_seqs(extend_lens):
 
 ### 3.3 Stage 执行框架
 
-**文件**: `srt/batch_overlap/operations.py`
+**文件**: `python/sglang/srt/batch_overlap/operations.py`
 
 TBO 的执行基于 **Stage 模型**：操作序列被 `YieldOperation` 分隔成多个 stage，两个子批的 stage 交错执行。
 
@@ -276,7 +288,7 @@ def execute_overlapped_operations(inputs_arr, operations_arr, delta_stages):
 
 ### 3.4 操作策略 (OperationsStrategy)
 
-**文件**: `srt/batch_overlap/operations_strategy.py`
+**文件**: `python/sglang/srt/batch_overlap/operations_strategy.py`
 
 `OperationsStrategy` 定义了每层 MoE 的操作序列和 stage 划分。当前支持三种模型架构：
 
@@ -342,7 +354,7 @@ Qwen3 的策略与 DeepSeek 基本相同（代码注释标注为 "unstable, keep
 
 ## 4. TBO Attention Backend
 
-**文件**: `srt/layers/attention/tbo_backend.py`
+**文件**: `python/sglang/srt/layers/attention/tbo_backend.py`
 
 TBO 需要专用的 attention 后端包装器，因为两个子批需要独立的 attention metadata。
 
@@ -396,7 +408,7 @@ TBO attention backend 为 children 独立管理 CUDA Graph 状态：
 
 ## 5. ForwardBatch TBO 字段
 
-**文件**: `srt/model_executor/forward_batch_info.py`
+**文件**: `python/sglang/srt/model_executor/forward_batch_info.py`
 
 ForwardBatch 中与 TBO 相关的字段：
 
@@ -420,3 +432,16 @@ ForwardBatch 中与 TBO 相关的字段：
 | MoE 单卡 | 不适用 | 无 EP 通信开销 |
 | Dense 模型 | 不适用 | 无 MoE 层，不涉及 all-to-all 通信 |
 | TP-only（无 EP） | 不适用 | TP 使用 all-reduce，通信开销较小 |
+
+## 与其他章节关系
+- 是 `03/08/09` 的重叠优化专题。
+
+
+## 最小可验证实验
+- 固定模型和负载，仅切换本章机制开关。
+- 记录 TTFT、TPOT、吞吐、显存峰值与回退率。
+- 总结收益场景、退化场景、推荐默认值。
+
+
+## 常见误解
+- Overlap 在任意负载下都增益。

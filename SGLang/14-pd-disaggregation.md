@@ -4,6 +4,18 @@
 >
 > **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存 + EPLB + MTP + 线性注意力
 
+## 本章定位
+- 主题范围: PD 分离握手、传输与调度协作。
+
+## 设计 Why（为什么这么设计）
+- PD 分离解耦 Prefill/Decode 资源，但引入传输与一致性成本。
+- 核心取舍: 吞吐 vs 时延、显存 vs 计算、通用性 vs 特化。
+
+## 阅读建议（进阶）
+1. 先抓目标函数和边界条件，再读具体实现。
+2. 先看调用链和状态变化，再看局部优化细节。
+3. 源码锚点以“路径 + 类/函数”为主，避免依赖易漂移行号。
+
 ## 1. 概览
 
 PD 分离将 Prefill 和 Decode 阶段部署到不同的 GPU 集群，实现资源独立扩展。外部 Router 将同一请求同时发给 Prefill 和 Decode，Prefill 完成后通过 RDMA 将 KV Cache 传输给 Decode。
@@ -52,13 +64,13 @@ flowchart LR
 
 | 文件/目录 | 说明 | 行数 |
 |-----------|------|------|
-| `disaggregation/prefill.py` | Prefill 服务器逻辑 (Bootstrap/Inflight Queue, 事件循环) | 750 |
-| `disaggregation/decode.py` | Decode 服务器逻辑 (Prealloc/Transfer Queue, DecodeReqToTokenPool) | 1092 |
-| `disaggregation/utils.py` | TransferBackend 枚举、MetadataBuffers、poll_and_all_reduce | 398 |
-| `disaggregation/base/conn.py` | KVArgs, KVPoll, 抽象基类 (BaseKVManager/Sender/Receiver) | 162 |
-| `disaggregation/common/conn.py` | CommonKVBootstrapServer (HTTP), CommonKVManager/Sender/Receiver (ZMQ) | 666 |
-| `disaggregation/decode_schedule_batch_mixin.py` | prepare_for_prebuilt, process_prebuilt (EAGLE 集成) | 185 |
-| `disaggregation/kv_events.py` | KV 事件发布/订阅系统 | 426 |
+| `python/sglang/srt/disaggregation/prefill.py` | Prefill 服务器逻辑 (Bootstrap/Inflight Queue, 事件循环) | 750 |
+| `python/sglang/srt/disaggregation/decode.py` | Decode 服务器逻辑 (Prealloc/Transfer Queue, DecodeReqToTokenPool) | 1092 |
+| `python/sglang/srt/disaggregation/utils.py` | TransferBackend 枚举、MetadataBuffers、poll_and_all_reduce | 398 |
+| `python/sglang/srt/disaggregation/base/conn.py` | KVArgs, KVPoll, 抽象基类 (BaseKVManager/Sender/Receiver) | 162 |
+| `python/sglang/srt/disaggregation/common/conn.py` | CommonKVBootstrapServer (HTTP), CommonKVManager/Sender/Receiver (ZMQ) | 666 |
+| `python/sglang/srt/disaggregation/decode_schedule_batch_mixin.py` | prepare_for_prebuilt, process_prebuilt (EAGLE 集成) | 185 |
+| `python/sglang/srt/disaggregation/kv_events.py` | KV 事件发布/订阅系统 | 426 |
 | `disaggregation/mooncake/` | Mooncake 后端 (RDMA/GPU Direct) | - |
 | `disaggregation/mori/` | Mori 后端 (RDMA, IOEngine) | - |
 | `disaggregation/nixl/` | NIXL 后端 (NVIDIA RDMA) | - |
@@ -157,7 +169,7 @@ sequenceDiagram
     participant P as Prefill KVManager
     participant D as Decode KVReceiver
 
-    Note over BS: aiohttp 服务<br/>common/conn.py:509
+    Note over BS: aiohttp 服务<br/>common/conn.py
 
     P->>BS: PUT /route<br/>{role: "Prefill", tp_rank, dp_rank,<br/>pp_rank, rank_ip, rank_port, page_size}
     Note over P: 注册 ZMQ 地址到<br/>Bootstrap Server
@@ -194,7 +206,7 @@ Router 注入流程 (sgl-model-gateway/src/routers/http/pd_router.rs):
 
 ### 3.3 Bootstrap Server 实现
 
-`CommonKVBootstrapServer` (`common/conn.py:509`) 是一个 aiohttp 服务，在 Prefill 端启动:
+`CommonKVBootstrapServer` (`python/sglang/srt/disaggregation/common/conn.py`) 是一个 aiohttp 服务，在 Prefill 端启动:
 
 ```python
 # 路由表
@@ -228,7 +240,7 @@ PDRouter (`sgl-model-gateway/src/routers/http/pd_router.rs`) 支持多种路由�
 ### 4.1 传输后端
 
 ```python
-# disaggregation/utils.py:247
+- 源码锚点: `python/sglang/srt/disaggregation/utils.py`
 class TransferBackend(Enum):
     MOONCAKE = "mooncake"   # 字节跳动, RDMA/GPU Direct
     MORI = "mori"           # Mori RDMA (IOEngine)
@@ -239,7 +251,7 @@ class TransferBackend(Enum):
 
 ### 4.2 KV 数据结构
 
-`KVArgs` (`base/conn.py:15-42`) 包含传输所需的全部元信息:
+`KVArgs` (`python/sglang/srt/disaggregation/base/conn.py`) 包含传输所需的全部元信息:
 
 ```python
 class KVArgs:
@@ -280,7 +292,7 @@ class KVArgs:
 
 ### 4.3 MetadataBuffers 详细结构
 
-`MetadataBuffers` (`utils.py:84`) 存储 Prefill 端第一个 output token 的元数据，通过 RDMA 传输给 Decode 端:
+`MetadataBuffers` (`python/sglang/srt/disaggregation/utils.py`) 存储 Prefill 端第一个 output token 的元数据，通过 RDMA 传输给 Decode 端:
 
 | Buffer | Shape | Dtype | 用途 |
 |--------|-------|-------|------|
@@ -366,7 +378,7 @@ flowchart LR
 
 ### 5.1 DecodeReqToTokenPool (Decode 端)
 
-Decode 端使用专用的 `DecodeReqToTokenPool` (`decode.py:76`) 而非普通 `ReqToTokenPool`。
+Decode 端使用专用的 `DecodeReqToTokenPool` (`python/sglang/srt/disaggregation/decode.py`) 而非普通 `ReqToTokenPool`。
 
 ```python
 class DecodeReqToTokenPool:
@@ -390,7 +402,7 @@ class DecodeReqToTokenPool:
 ### 5.2 内存估算
 
 ```python
-# decode.py:_allocatable_tokens
+- 源码锚点: `python/sglang/srt/disaggregation/decode.py`
 def _allocatable_tokens(self):
     """
     计算可分配的 token 数
@@ -411,7 +423,7 @@ def _allocatable_tokens(self):
 ### 5.3 Decode 端 Radix Cache 强制禁用
 
 ```python
-# server_args.py:2546 (_handle_pd_disaggregation)
+- 源码锚点: `python/sglang/srt/server_args.py`
 if self.disaggregation_mode == "decode":
     self.disable_radix_cache = True
 ```
@@ -421,7 +433,7 @@ if self.disaggregation_mode == "decode":
 ### 5.4 Prefill 端 CUDA Graph 限制
 
 ```python
-# server_args.py:2567
+- 源码锚点: `python/sglang/srt/server_args.py`
 if not self.enable_piecewise_cuda_graph:
     self.disable_cuda_graph = True
 ```
@@ -511,7 +523,7 @@ NVIDIA 的独立 KV Cache 传输协议，**不基于 NCCL**。
 ### 7.1 传输状态机 (KVPoll)
 
 ```python
-# base/conn.py:44
+- 源码锚点: `python/sglang/srt/disaggregation/base/conn.py`
 class KVPoll:
     Failed = 0          # 失败
     Bootstrapping = 1   # 握手中
@@ -525,7 +537,7 @@ class KVPoll:
 ### 7.2 poll_and_all_reduce 同步机制
 
 ```python
-# utils.py:40
+- 源码锚点: `python/sglang/srt/disaggregation/utils.py`
 def poll_and_all_reduce(pollers, gloo_group):
     polls = [int(poller.poll()) for poller in pollers]
     tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
@@ -544,7 +556,7 @@ def poll_and_all_reduce(pollers, gloo_group):
 MetadataBuffers 中的 `bootstrap_room` 字段用于端到端数据完整性校验:
 
 ```python
-# utils.py:237 (set_buf)
+- 源码锚点: `python/sglang/srt/disaggregation/utils.py`
 self.bootstrap_room[req.metadata_buffer_index, 0] = (
     req.bootstrap_room if req.bootstrap_room is not None else 0
 )
@@ -557,7 +569,7 @@ Decode 端接收到元数据后，验证 `bootstrap_room` 是否与请求匹配�
 当 Decode 端 OOM 时，可以 retract 请求并将 KV Cache 卸载到 CPU:
 
 ```python
-# decode.py:resume_retracted_reqs
+- 源码锚点: `python/sglang/srt/disaggregation/decode.py`
 def resume_retracted_reqs(self):
     """恢复被 retract 的请求 (OOM 后)"""
     for req in self.retracted_queue:
@@ -588,7 +600,7 @@ sequenceDiagram
     Note over D: 接收完成, 开始 Decode
 ```
 
-**Overlap 模式下的差异**: 当 `enable_overlap=True` 时，非最后 chunk 的 KV 传输被延迟到 `process_batch_result_disagg_prefill` 中执行 (`prefill.py:542-543`)，确保 batch result 已经 resolve 后再发送。
+**Overlap 模式下的差异**: 当 `enable_overlap=True` 时，非最后 chunk 的 KV 传输被延迟到 `process_batch_result_disagg_prefill` 中执行 (`python/sglang/srt/disaggregation/prefill.py`)，确保 batch result 已经 resolve 后再发送。
 
 ## 9. 与投机解码集成 (EAGLE + PD)
 
@@ -597,7 +609,7 @@ PD 分离支持 EAGLE 投机解码。Prefill 端生成 EAGLE 所需的 draft 输
 ### 9.1 Prefill 端: 保存 EAGLE 数据
 
 ```python
-# prefill.py:481-488 (process_batch_result_disagg_prefill)
+- 源码锚点: `python/sglang/srt/disaggregation/prefill.py`
 if self.spec_algorithm.is_eagle() and batch.spec_info is not None:
     req.output_topk_p = batch.spec_info.topk_p[i]
     req.output_topk_index = batch.spec_info.topk_index[i]
@@ -611,7 +623,7 @@ else:
 ### 9.2 Decode 端: 重建 EagleDraftInput
 
 ```python
-# decode_schedule_batch_mixin.py:134 (process_prebuilt)
+- 源码锚点: `python/sglang/srt/disaggregation/decode_schedule_batch_mixin.py`
 if self.spec_algorithm.is_eagle():
     topk_p = torch.stack([req.output_topk_p[:num_states] for req in self.reqs])
     topk_index = torch.stack([req.output_topk_index[:num_states] for req in self.reqs])
@@ -632,14 +644,14 @@ Decode 端从 MetadataBuffers 中恢复 EAGLE 数据，重建 `EagleDraftInput`�
 
 ## 10. 与 Pipeline Parallelism 集成
 
-PD 分离支持 PP (Pipeline Parallelism)，通过 `scheduler_pp_mixin.py` 中的专用事件循环实现。
+PD 分离支持 PP (Pipeline Parallelism)，通过 `python/sglang/srt/managers/scheduler_pp_mixin.py` 中的专用事件循环实现。
 
 ### 10.1 专用事件循环
 
 | 事件循环 | 文件位置 | 说明 |
 |----------|----------|------|
-| `event_loop_pp_disagg_prefill` | `scheduler_pp_mixin.py:147` | PP + PD Prefill |
-| `event_loop_pp_disagg_decode` | `scheduler_pp_mixin.py:322` | PP + PD Decode |
+| `event_loop_pp_disagg_prefill` | `python/sglang/srt/managers/scheduler_pp_mixin.py` | PP + PD Prefill |
+| `event_loop_pp_disagg_decode` | `python/sglang/srt/managers/scheduler_pp_mixin.py` | PP + PD Decode |
 
 ### 10.2 PP Prefill 调度
 
@@ -660,7 +672,7 @@ PP Prefill 每个 microbatch 的调度顺序:
 ### 10.3 PP 约束
 
 ```python
-# common/conn.py:379
+- 源码锚点: `python/sglang/srt/disaggregation/common/conn.py`
 assert self.kv_mgr.pp_size == self.prefill_pp_size or self.kv_mgr.pp_size == 1
 ```
 
@@ -679,7 +691,7 @@ Decode 阶段是 memory-bound，GPU 计算单元 (SM) 利用率低。PD-Multiple
 核心技术是 CUDA Green Context — 将 GPU 的 SM 划分为独立的分区，每个分区运行在独立的 CUDA Stream 上。
 
 ```python
-# pdmux_context.py:104
+- 源码锚点: `python/sglang/srt/multiplex/pdmux_context.py`
 def initialize_stream_groups(gpu_id, config):
     total_sm_count = spatial.get_sm_available(gpu_id)
     divisions = divide_sm(total_sm_count, compute_capability, config.sm_group_num - 2)
@@ -700,7 +712,7 @@ def initialize_stream_groups(gpu_id, config):
         )
 ```
 
-**架构约束** (`pdmux_context.py:55`):
+**架构约束** (`python/sglang/srt/multiplex/pdmux_context.py`):
 
 | GPU 架构 | Compute Capability | min_per_part | multiple |
 |----------|-------------------|--------------|----------|
@@ -712,7 +724,7 @@ def initialize_stream_groups(gpu_id, config):
 ### 11.3 PDMuxConfig
 
 ```python
-# pdmux_context.py:15
+- 源码锚点: `python/sglang/srt/multiplex/pdmux_context.py`
 @dataclass
 class PDMuxConfig:
     sm_group_num: int = 8                    # SM 分组数 (≥3)
@@ -726,7 +738,7 @@ class PDMuxConfig:
 ### 11.4 event_loop_pdmux 调度流程
 
 ```python
-# multiplexing_mixin.py:96
+- 源码锚点: `python/sglang/srt/multiplex/multiplexing_mixin.py`
 def event_loop_pdmux(self):
     while True:
         # 1. Decode stream: 接收请求, 更新 running batch
@@ -762,7 +774,7 @@ def event_loop_pdmux(self):
 **关键机制**:
 - `ForwardMode.SPLIT_PREFILL`: 专用 forward 模式，被视为 extend 的变体
 - `split_forward_count`: 每次只 forward 若干层 (由 `split_forward_token_budget` 控制)，避免 Prefill 长时间占用 SM
-- `set_pdmux_status()`: 动态切换 TP group (`parallel_state.py` 中的 `_PDMUX_PREFILL_TP_GROUP`)
+- `set_pdmux_status()`: 动态切换 TP group (`python/sglang/srt/distributed/parallel_state.py` 中的 `_PDMUX_PREFILL_TP_GROUP`)
 - SM 分区根据 decode batch size 动态调整 — batch 越大，分配给 decode 的 SM 越多
 
 ### 11.5 与 PD 分离的对比
@@ -785,7 +797,7 @@ python -m sglang.launch_server \
     --pdmux-config-path pdmux_config.json
 ```
 
-> **互斥约束**: PD-Multiplexing 与 disaggregation mode 互斥 (`server_args.py:5193`)。
+> **互斥约束**: PD-Multiplexing 与 disaggregation mode 互斥 (`python/sglang/srt/server_args.py`)。
 
 ## 12. Encode Server 分离
 
@@ -793,15 +805,15 @@ python -m sglang.launch_server \
 
 | 文件 | 说明 |
 |------|------|
-| `disaggregation/encode_server.py` | Encode 端服务器，独立运行 ViT 编码 |
-| `disaggregation/encode_receiver.py` | Encode 端接收器，接收编码结果 |
-| `disaggregation/decode_schedule_batch_mixin.py` | Decode 端调度批次 Mixin (prepare_for_prebuilt, process_prebuilt) |
+| `python/sglang/srt/disaggregation/encode_server.py` | Encode 端服务器，独立运行 ViT 编码 |
+| `python/sglang/srt/disaggregation/encode_receiver.py` | Encode 端接收器，接收编码结果 |
+| `python/sglang/srt/disaggregation/decode_schedule_batch_mixin.py` | Decode 端调度批次 Mixin (prepare_for_prebuilt, process_prebuilt) |
 
 通过 `--encoder-only` 和 `--language-only` 参数启用。Encode Server 处理多模态输入的编码，将结果通过传输后端发送给 Language Server，避免 ViT 编码阻塞 LLM 推理。
 
 ## 13. KV 事件管理
 
-**文件**: `disaggregation/kv_events.py` (426 行)
+**文件**: `python/sglang/srt/disaggregation/kv_events.py` (426 行)
 
 事件发布/订阅系统，用于 PD 分离场景下的 KV Cache 状态同步。
 
@@ -906,3 +918,16 @@ curl http://<prefill_host>:8998/health
 
 - **15**: sgl-kernel 架构
 - **16**: Attention kernel 实现
+
+## 与其他章节关系
+- 连接 `03/05/06/13`。
+
+
+## 最小可验证实验
+- 固定模型和负载，仅切换本章机制开关。
+- 记录 TTFT、TPOT、吞吐、显存峰值与回退率。
+- 总结收益场景、退化场景、推荐默认值。
+
+
+## 常见误解
+- PD 分离总是收益为正。

@@ -4,6 +4,18 @@
 >
 > **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存 + EPLB + MTP + 线性注意力
 
+## 本章定位
+- 主题范围: 进程模型、组件职责、请求主链路。
+
+## 设计 Why（为什么这么设计）
+- 进程拆分用于隔离职责与故障域，同时兼顾吞吐与可扩展性。
+- 核心取舍: 吞吐 vs 时延、显存 vs 计算、通用性 vs 特化。
+
+## 阅读建议（进阶）
+1. 先抓目标函数和边界条件，再读具体实现。
+2. 先看调用链和状态变化，再看局部优化细节。
+3. 源码锚点以“路径 + 类/函数”为主，避免依赖易漂移行号。
+
 ## 1. 进程模型
 
 SGLang 采用多进程架构，核心进程包括：
@@ -89,15 +101,15 @@ TP>1 时每个 rank 一个 Scheduler 进程，但**只有 rank 0** 持有 ZMQ �
 
 **关键代码位置**:
 - 进程启动: `srt/entrypoints/engine.py:_launch_subprocesses()` (L900，函数定义位置)
-- HTTP 方式调用: `srt/entrypoints/http_server.py` (L1692，import 并调用 `_launch_subprocesses`)
+- HTTP 方式调用: `python/sglang/srt/entrypoints/http_server.py` (L1692，import 并调用 `_launch_subprocesses`)
 - Python API 方式: `srt/entrypoints/engine.py:Engine.__init__()` (L160，同样调用 `_launch_subprocesses`)
-- ZMQ 通信: `srt/managers/tokenizer_communicator_mixin.py`
+- ZMQ 通信: `python/sglang/srt/managers/tokenizer_communicator_mixin.py`
 
 ## 2. 核心组件
 
 ### 2.1 TokenizerManager (主进程)
 
-**文件**: `srt/managers/tokenizer_manager.py`
+**文件**: `python/sglang/srt/managers/tokenizer_manager.py`
 
 职责：
 1. 接收原始请求 (文本 + 多模态数据)
@@ -114,7 +126,7 @@ class TokenizerManager:
         self.mm_processor = get_mm_processor(...)  # 多模态处理器 (如 QwenVLImageProcessor)
 ```
 
-**Qwen3.5 多模态处理器**: `srt/multimodal/processors/qwen_vl.py:QwenVLImageProcessor` (L233)
+**Qwen3.5 多模态处理器**: `srt/multimodal/processors/qwen_vl.py:QwenVLImageProcessor` 
 
 ```python
 # Qwen3.5 处理器支持的模型
@@ -132,7 +144,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
 ### 2.2 Scheduler (子进程)
 
-**文件**: `srt/managers/scheduler.py`
+**文件**: `python/sglang/srt/managers/scheduler.py`
 
 职责：
 1. 管理请求队列 (waiting_queue, running_batch)
@@ -164,7 +176,7 @@ class Scheduler(
 
 ### 2.3 TPWorker (Scheduler 内)
 
-**文件**: `srt/managers/tp_worker.py`
+**文件**: `python/sglang/srt/managers/tp_worker.py`
 
 职责：
 1. 加载模型权重
@@ -173,7 +185,7 @@ class Scheduler(
 
 ### 2.4 DetokenizerManager (子进程)
 
-**文件**: `srt/managers/detokenizer_manager.py`
+**文件**: `python/sglang/srt/managers/detokenizer_manager.py`
 
 职责：
 1. 接收 token IDs
@@ -184,7 +196,7 @@ class Scheduler(
 
 SGLang 默认使用 **overlap 模式** 的事件循环，通过 CPU/GPU 重叠执行来提高吞吐量。
 
-**文件**: `srt/managers/scheduler.py:event_loop_overlap()` (L1135)
+**文件**: `srt/managers/scheduler.py:event_loop_overlap()` 
 
 ### 3.1 Overlap 机制原理
 
@@ -234,7 +246,7 @@ GPU 两次 forward 之间有短暂间隙，这是 Phase 1+2（接收请求 + 调
 
 ### 3.3 get_next_batch_to_run() 调度逻辑
 
-**文件**: `srt/managers/scheduler.py:get_next_batch_to_run()` (L1875)
+**文件**: `srt/managers/scheduler.py:get_next_batch_to_run()` 
 
 调度的统一入口，按以下顺序决定下一个批次：
 1. 处理上轮 chunked prefill 残留请求（缓存 + 释放 `req_pool_idx`）
@@ -396,20 +408,20 @@ SGLang 有两种启动方式，入口不同:
 
 **方式 A: HTTP Server (默认，`python -m sglang.launch_server`)**
 
-1. **先看 HTTP Server 入口**: `srt/entrypoints/launch_server.py` → `srt/entrypoints/http_server.py`
-   - `launch_server.py` 解析命令行参数，调用 `http_server.py:launch_server()`
+1. **先看 HTTP Server 入口**: `python/sglang/launch_server.py` → `python/sglang/srt/entrypoints/http_server.py`
+   - `python/sglang/launch_server.py` 解析命令行参数，调用 `http_server.py:launch_server()`
    - `launch_server()` 内调用 `_launch_subprocesses()` 启动 Scheduler、Detokenizer 等子进程
    - 然后启动 FastAPI HTTP 服务
 
 **方式 B: Engine Python API (`sgl.Engine()`)**
 
-1. **看 Engine**: `srt/entrypoints/engine.py`
+1. **看 Engine**: `python/sglang/srt/entrypoints/engine.py`
    - `Engine.__init__()` 同样调用 `_launch_subprocesses()` 启动子进程
    - 适用于 Python 程序直接集成，不启动 HTTP 服务
 
 两种方式殊途同归: 都通过 `_launch_subprocesses()` 启动相同的子进程架构。
 
-2. **再看 Scheduler 初始化**: `srt/managers/scheduler.py`
+2. **再看 Scheduler 初始化**: `python/sglang/srt/managers/scheduler.py`
    - `__init__()` 方法
    - 理解各组件如何初始化
 
@@ -448,10 +460,10 @@ SGLang 引入了 `batch_overlap/` 模块，提供比 `event_loop_overlap` 更细
 
 | 模式 | 文件 | 行数 | 说明 |
 |------|------|------|------|
-| SBO (Single Batch Overlap) | `single_batch_overlap.py` | 145 | 单批重叠：在一个 batch 的 forward 内部重叠计算与通信 |
-| TBO (Two Batch Overlap) | `two_batch_overlap.py` | 1074 | 双批重叠：两个 batch 的 forward 交替执行，一个做计算时另一个做通信 |
-| Operations | `operations.py` | 214 | 重叠操作定义 |
-| Strategy | `operations_strategy.py` | 296 | 操作策略选择 |
+| SBO (Single Batch Overlap) | `python/sglang/srt/batch_overlap/single_batch_overlap.py` | 145 | 单批重叠：在一个 batch 的 forward 内部重叠计算与通信 |
+| TBO (Two Batch Overlap) | `python/sglang/srt/batch_overlap/two_batch_overlap.py` | 1074 | 双批重叠：两个 batch 的 forward 交替执行，一个做计算时另一个做通信 |
+| Operations | `python/sglang/srt/batch_overlap/operations.py` | 214 | 重叠操作定义 |
+| Strategy | `python/sglang/srt/batch_overlap/operations_strategy.py` | 296 | 操作策略选择 |
 
 **与 event_loop_overlap 的关系**:
 - `event_loop_overlap` 是 Scheduler 级别的 CPU/GPU 重叠（调度 vs 前向）
@@ -462,7 +474,7 @@ SGLang 引入了 `batch_overlap/` 模块，提供比 `event_loop_overlap` 更细
 
 ## 8. PrefillDelayer
 
-**文件**: `srt/managers/prefill_delayer.py` (256行)
+**文件**: `python/sglang/srt/managers/prefill_delayer.py` (256行)
 
 在 DP Attention 场景下，多个 DP worker 需要协商 prefill 时机。PrefillDelayer 通过状态机和全局协商机制，延迟 prefill 直到所有 worker 准备就绪，避免负载不均。
 
@@ -478,8 +490,8 @@ SGLang 引入了 `batch_overlap/` 模块，提供比 `event_loop_overlap` 更细
 
 | 文件 | 说明 |
 |------|------|
-| `protocol.py` | Anthropic API 协议定义 |
-| `serving.py` | Anthropic API 服务实现 |
+| `python/sglang/srt/entrypoints/anthropic/protocol.py` | Anthropic API 协议定义 |
+| `python/sglang/srt/entrypoints/anthropic/serving.py` | Anthropic API 服务实现 |
 
 提供与 Anthropic Messages API 兼容的端点，扩展了 SGLang 的 API 兼容性。
 
@@ -487,3 +499,16 @@ SGLang 引入了 `batch_overlap/` 模块，提供比 `event_loop_overlap` 更细
 
 理解了全局架构后，下一步深入学习：
 - **02**: 核心数据结构详解 (`Req`, `ScheduleBatch`, `ModelWorkerBatch`, `ForwardBatch`)
+
+## 与其他章节关系
+- 为 `02-24` 提供系统边界。
+
+
+## 最小可验证实验
+- 固定模型和负载，仅切换本章机制开关。
+- 记录 TTFT、TPOT、吞吐、显存峰值与回退率。
+- 总结收益场景、退化场景、推荐默认值。
+
+
+## 常见误解
+- 进程边界等于功能边界。

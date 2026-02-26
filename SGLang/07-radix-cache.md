@@ -4,15 +4,27 @@
 >
 > **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存 + EPLB + MTP + 线性注意力
 
+## 本章定位
+- 主题范围: RadixCache 命中、锁与驱逐。
+
+## 设计 Why（为什么这么设计）
+- 前缀树缓存提升复用率，但必须与锁和驱逐策略协同。
+- 核心取舍: 吞吐 vs 时延、显存 vs 计算、通用性 vs 特化。
+
+## 阅读建议（进阶）
+1. 先抓目标函数和边界条件，再读具体实现。
+2. 先看调用链和状态变化，再看局部优化细节。
+3. 源码锚点以“路径 + 类/函数”为主，避免依赖易漂移行号。
+
 ## 1. RadixCache 概览
 
 **核心文件**:
-- `srt/mem_cache/radix_cache.py` - 基础 RadixCache
-- `srt/mem_cache/base_prefix_cache.py` - 抽象基类
-- `srt/mem_cache/evict_policy.py` - 逐出策略
-- `srt/mem_cache/swa_radix_cache.py` - SWA 变体
-- `srt/mem_cache/mamba_radix_cache.py` - Mamba 变体
-- `srt/mem_cache/hiradix_cache.py` - 层级缓存变体
+- `python/sglang/srt/mem_cache/radix_cache.py` - 基础 RadixCache
+- `python/sglang/srt/mem_cache/base_prefix_cache.py` - 抽象基类
+- `python/sglang/srt/mem_cache/evict_policy.py` - 逐出策略
+- `python/sglang/srt/mem_cache/swa_radix_cache.py` - SWA 变体
+- `python/sglang/srt/mem_cache/mamba_radix_cache.py` - Mamba 变体
+- `python/sglang/srt/mem_cache/hiradix_cache.py` - 层级缓存变体
 
 ### 1.1 什么是 RadixAttention?
 
@@ -348,7 +360,7 @@ def dec_lock_ref(self, node: TreeNode):
 
 ## 5. 逐出策略
 
-**文件**: `evict_policy.py`
+**文件**: `python/sglang/srt/mem_cache/evict_policy.py`
 
 | 策略 | 优先级计算 | 适用场景 |
 |------|-----------|---------|
@@ -481,7 +493,7 @@ def convert_to_bigram_key(token_ids: List[int]) -> List[int]:
 ## 10. Scheduler 集成
 
 ```python
-# scheduler.py 中的选择逻辑 (按优先级从高到低)
+- 源码锚点: `python/sglang/srt/managers/scheduler.py`
 if disable_radix_cache and chunked_prefill:
     # 禁用 radix cache 时使用简化版
     if self.is_hybrid_swa:
@@ -648,7 +660,7 @@ chunk_size = 512
 SGLang Scheduler 是**单线程事件循环**，每个 step 只处理一个 prefill batch。Chunked 请求在每个 chunk 完成后会被移出 running batch，在下一轮重新调度。这保证了 `cache_unfinished_req` → `match_prefix` 的顺序一致性：
 
 ```
-scheduler.py:1789:
+scheduler.py:
     self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
     → insert 当前已完成 chunk 的 KV 到 Tree
     → req_to_token_pool.free(chunked_req.req_pool_idx)  # 释放旧槽位
@@ -742,7 +754,7 @@ flowchart TD
     Q3["Q: lock_ref 如何保证安全?"] --> A4["req1 持有 lock_ref=1, req3 到达后变 2<br/>两者共享的节点不会被 evict<br/>req1 完成后降为 1, req3 完成后降为 0"]
 ```
 
-> **代码路径**: `scheduler.py:1789` → `radix_cache.py:475 cache_unfinished_req` → `insert` + `match_prefix` → `inc_lock_ref`
+> **代码路径**: `python/sglang/srt/managers/scheduler.py` → `radix_cache.py cache_unfinished_req` → `insert` + `match_prefix` → `inc_lock_ref`
 
 ### 12.5 Page Alignment 对部分命中的影响
 
@@ -760,7 +772,7 @@ page_aligned_match = (1124 // 16) * 16  # = 1120
 > **注意**: `extra_key` 用于 **LoRA ID 和 cache_salt**，不是多模态图片隔离！
 
 ```python
-# schedule_batch.py - extra_key 的真正用途
+- 源码锚点: `python/sglang/srt/managers/schedule_batch.py`
 # extra key for classifying the request (e.g. cache_salt)
 if lora_id is not None:
     extra_key = (extra_key or "") + lora_id  # LoRA ID 拼接到 extra_key
@@ -1113,7 +1125,7 @@ def evict(self, num_tokens: int):
 
 ## 14. SWA RadixCache
 
-**文件**: `srt/mem_cache/swa_radix_cache.py` (1188行)
+**文件**: `python/sglang/srt/mem_cache/swa_radix_cache.py` (1188行)
 
 管理 Full Attention 和 SWA 两种 attention 层的缓存。Llama4、Step3p5 等 SWA 混合架构模型需要同时维护两套缓存树。
 
@@ -1129,18 +1141,18 @@ def evict(self, num_tokens: int):
 
 ## 15. BasePrefixCache 接口重构
 
-**文件**: `srt/mem_cache/base_prefix_cache.py`
+**文件**: `python/sglang/srt/mem_cache/base_prefix_cache.py`
 
 SGLang 引入了结构化参数类，统一了各 RadixCache 子类的接口：
 
 | 参数类 | 说明 |
 |--------|------|
-| `MatchPrefixParams` (L35) | 前缀匹配参数：key、cow_mamba、req |
-| `InsertParams` (L46) | 插入参数：key、value、mamba_value、prev_prefix_len、swa_evicted_seqlen、chunked、priority |
-| `InsertResult` (L65) | 插入结果：prefix_len、mamba_exist |
-| `EvictParams` (L73) | 逐出参数：num_tokens、swa_num_tokens、mamba_num |
-| `EvictResult` (L82) | 逐出结果：num_tokens_evicted、swa_num_tokens_evicted、mamba_num_evicted |
-| `MatchResult` (L91) | 匹配结果：device/host 索引、命中长度、mamba 分支信息 |
+| `MatchPrefixParams`  | 前缀匹配参数：key、cow_mamba、req |
+| `InsertParams`  | 插入参数：key、value、mamba_value、prev_prefix_len、swa_evicted_seqlen、chunked、priority |
+| `InsertResult`  | 插入结果：prefix_len、mamba_exist |
+| `EvictParams`  | 逐出参数：num_tokens、swa_num_tokens、mamba_num |
+| `EvictResult`  | 逐出结果：num_tokens_evicted、swa_num_tokens_evicted、mamba_num_evicted |
+| `MatchResult`  | 匹配结果：device/host 索引、命中长度、mamba 分支信息 |
 
 ## 16. 存储后端更新
 
@@ -1159,7 +1171,7 @@ SGLang 支持多个外部存储后端：
 
 ## 17. Mamba RadixCache
 
-**文件**: `srt/mem_cache/mamba_radix_cache.py` (1232行)
+**文件**: `python/sglang/srt/mem_cache/mamba_radix_cache.py` (1232行)
 
 为 Qwen3.5 等包含线性注意力层的模型提供 Mamba 状态的 Radix 缓存支持。
 
@@ -1173,3 +1185,16 @@ SGLang 支持多个外部存储后端：
 
 - **08**: ModelRunner 与 CUDA Graph
 - **09**: Attention 后端 (FlashInfer, FlashAttention)
+
+## 与其他章节关系
+- 为 `03/04/05` 提供前缀复用基础。
+
+
+## 最小可验证实验
+- 固定模型和负载，仅切换本章机制开关。
+- 记录 TTFT、TPOT、吞吐、显存峰值与回退率。
+- 总结收益场景、退化场景、推荐默认值。
+
+
+## 常见误解
+- 命中前缀就能完全复用。

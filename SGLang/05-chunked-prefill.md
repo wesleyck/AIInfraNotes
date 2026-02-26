@@ -1,5 +1,17 @@
 # SGLang Chunked Prefill 分块预填充
 
+## 本章定位
+- 主题范围: Chunked Prefill 与 Mixed Chunk。
+
+## 设计 Why（为什么这么设计）
+- 分块预填充用于缓解长前缀对解码路径的阻塞。
+- 核心取舍: 吞吐 vs 时延、显存 vs 计算、通用性 vs 特化。
+
+## 阅读建议（进阶）
+1. 先抓目标函数和边界条件，再读具体实现。
+2. 先看调用链和状态变化，再看局部优化细节。
+3. 源码锚点以“路径 + 类/函数”为主，避免依赖易漂移行号。
+
 ## 1. 概述
 
 Chunked Prefill（分块预填充）是 SGLang 的核心调度优化技术，用于解决长序列预填充阻塞 Decode 请求的问题。
@@ -44,7 +56,7 @@ flowchart LR
 | `--enable-mixed-chunk` | bool | False | 允许 Prefill + Decode 混合批次 |
 | `--enable-dynamic-chunking` | bool | False | PP 模式下动态调整 chunk 大小 |
 | `--max-prefill-tokens` | int | 16384 | 单批次最大 prefill token 数 |
-| `--prefill-max-requests` | Optional[int] | None | 限制 prefill 批次最大请求数（`server_args.py` L3170） |
+| `--prefill-max-requests` | Optional[int] | None | 限制 prefill 批次最大请求数（`python/sglang/srt/server_args.py` L3170） |
 
 ### 2.1 启用方式
 
@@ -64,7 +76,7 @@ python -m sglang.launch_server \
 ## 3. 初始化流程
 
 ```python
-# scheduler.py L762-785
+- 源码锚点: `python/sglang/srt/managers/scheduler.py`
 def init_chunked_prefill(self):
     # 从 server_args 读取 chunked_prefill_size
     self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -134,7 +146,7 @@ flowchart TB
 ### 4.2 PrefillAdder 核心参数
 
 ```python
-# schedule_policy.py L372-431
+- 源码锚点: `python/sglang/srt/managers/schedule_policy.py`
 class PrefillAdder:
     def __init__(
         self,
@@ -164,7 +176,7 @@ class PrefillAdder:
 > **交叉引用**：分块截断的完整流程（包括 `add_chunked_req` 续传、`truncation_align_size` 对齐、`budget_state` 预算检查等）详见 [`04-schedule-policy.md` §7 Chunked Prefill 处理](04-schedule-policy.md#7-chunked-prefill-处理)。
 
 ```python
-# schedule_policy.py L719-825
+- 源码锚点: `python/sglang/srt/managers/schedule_policy.py`
 def add_one_req(self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]):
     input_tokens = self.ceil_paged_tokens(req.extend_input_len)
     
@@ -239,7 +251,7 @@ sequenceDiagram
 Chunked Prefill 引入了 `ForwardMode.MIXED` 模式。完整的 `ForwardMode` 枚举定义如下：
 
 ```python
-# forward_batch_info.py L74-100
+- 源码锚点: `python/sglang/srt/model_executor/forward_batch_info.py`
 class ForwardMode(IntEnum):
     EXTEND = auto()           # Prefill / 序列扩展
     DECODE = auto()           # 单 token 解码
@@ -281,7 +293,7 @@ Mixed Chunk 允许将 Chunked Prefill 和 Decode 请求合并到同一批次，�
 ### 6.1 启用条件
 
 ```python
-# scheduler.py L2183-2201
+- 源码锚点: `python/sglang/srt/managers/scheduler.py`
 # Mixed-style chunked prefill
 if (
     self.is_mixed_chunk
@@ -303,7 +315,7 @@ if (
 ### 6.2 mix_with_running 实现
 
 ```python
-# schedule_batch.py L1770-1799
+- 源码锚点: `python/sglang/srt/managers/schedule_batch.py`
 def mix_with_running(self, running_batch: "ScheduleBatch"):
     # 设置为 MIXED 模式
     self.forward_mode = ForwardMode.MIXED
@@ -377,7 +389,7 @@ flowchart TB
 实际实现采用**黑名单**机制（而非白名单）：大多数多模态模型默认支持 Chunked Prefill，只有少数旧架构因 embedding 处理方式不兼容而被排除。
 
 ```python
-# model_config.py L1299-1311
+- 源码锚点: `python/sglang/srt/configs/model_config.py`
 def is_multimodal_chunked_prefill_supported(model_architectures: List[str]):
     """检查多模态模型是否支持 Chunked Prefill (黑名单机制)"""
     unsupported = [
@@ -433,7 +445,7 @@ flowchart TB
 ### 7.3 get_embedding_chunk 函数
 
 ```python
-# mm_utils.py L383-425
+- 源码锚点: `python/sglang/srt/managers/mm_utils.py`
 def get_embedding_chunk(
     embedding: torch.Tensor,          # 完整的多模态 embedding
     extend_prefix_len: int,           # 当前 chunk 的起始位置
@@ -475,7 +487,7 @@ def get_embedding_chunk(
 对于包含大量帧的视频，SGLang 提供了优化的分块处理机制：
 
 ```python
-# mm_utils.py L730-787
+- 源码锚点: `python/sglang/srt/managers/mm_utils.py`
 def _get_chunked_prefill_embedding_for_chunked_items(...):
     """
     多模态 embedding 的分块计算优化。
@@ -507,7 +519,7 @@ def _get_chunked_prefill_embedding_for_chunked_items(...):
 当 embedding 长度与 input_ids 中的 placeholder 数量不匹配时：
 
 ```python
-# mm_utils.py L826-855
+- 源码锚点: `python/sglang/srt/managers/mm_utils.py`
 def _adjust_embedding_length(embedding, mask, logger):
     num_mm_tokens_in_embedding = embedding.shape[0]
     num_mm_tokens_in_input_ids = mask.sum().item()
@@ -612,7 +624,7 @@ flowchart TB
 PD 分离使用 `is_chunked` 计数器跟踪分块进度：
 
 ```python
-# prefill.py L429-501
+- 源码锚点: `python/sglang/srt/disaggregation/prefill.py`
 def process_batch_result_disagg_prefill(self, batch, result):
     for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
         if req.is_chunked <= 0:
@@ -634,7 +646,7 @@ def process_batch_result_disagg_prefill(self, batch, result):
 在 PD 分离模式下，每个 chunk 完成后都可以开始 KV 传输：
 
 ```python
-# prefill.py L672-734
+- 源码锚点: `python/sglang/srt/disaggregation/prefill.py`
 def send_kv_chunk(
     self: Scheduler,
     req: Req,
@@ -714,7 +726,7 @@ sequenceDiagram
 分块请求在每个 chunk 完成后更新 RadixCache：
 
 ```python
-# prefill.py L644-670
+- 源码锚点: `python/sglang/srt/disaggregation/prefill.py`
 def process_prefill_chunk(self: Scheduler):
     if self.chunked_req:
         # 将当前 chunk 的 KV 缓存到 tree_cache
@@ -773,7 +785,7 @@ python -m sglang.launch_server \
 ### 9.1 工作原理
 
 ```python
-# scheduler_pp_mixin.py L680-710
+- 源码锚点: `python/sglang/srt/managers/scheduler_pp_mixin.py`
 def predict_next_chunk_size(self: Scheduler, history_len: int) -> Optional[int]:
     """
     根据历史长度动态预测下一个 chunk 大小。
@@ -943,20 +955,20 @@ python -m sglang.launch_server \
 
 | 组件 | 文件 | 关键函数 |
 |------|------|----------|
-| 初始化 | `scheduler.py` | `init_chunked_prefill()` |
-| 调度决策 | `schedule_policy.py` | `PrefillAdder.add_one_req()` |
-| 分块处理 | `schedule_policy.py` | `PrefillAdder.add_chunked_req()` |
-| 混合批次 | `schedule_batch.py` | `ScheduleBatch.mix_with_running()` |
-| 前向模式 | `forward_batch_info.py` | `ForwardMode.MIXED` |
-| PP 动态 | `scheduler_pp_mixin.py` | `predict_next_chunk_size()` |
-| 多模态 Embedding | `mm_utils.py` | `get_embedding_chunk()` |
-| 多模态分块计算 | `mm_utils.py` | `_get_chunked_prefill_embedding_for_chunked_items()` |
-| PD 分离处理 | `disaggregation/prefill.py` | `process_batch_result_disagg_prefill()` |
-| PD KV 传输 | `disaggregation/prefill.py` | `send_kv_chunk()` |
+| 初始化 | `python/sglang/srt/managers/scheduler.py` | `init_chunked_prefill()` |
+| 调度决策 | `python/sglang/srt/managers/schedule_policy.py` | `PrefillAdder.add_one_req()` |
+| 分块处理 | `python/sglang/srt/managers/schedule_policy.py` | `PrefillAdder.add_chunked_req()` |
+| 混合批次 | `python/sglang/srt/managers/schedule_batch.py` | `ScheduleBatch.mix_with_running()` |
+| 前向模式 | `python/sglang/srt/model_executor/forward_batch_info.py` | `ForwardMode.MIXED` |
+| PP 动态 | `python/sglang/srt/managers/scheduler_pp_mixin.py` | `predict_next_chunk_size()` |
+| 多模态 Embedding | `python/sglang/srt/managers/mm_utils.py` | `get_embedding_chunk()` |
+| 多模态分块计算 | `python/sglang/srt/managers/mm_utils.py` | `_get_chunked_prefill_embedding_for_chunked_items()` |
+| PD 分离处理 | `python/sglang/srt/disaggregation/prefill.py` | `process_batch_result_disagg_prefill()` |
+| PD KV 传输 | `python/sglang/srt/disaggregation/prefill.py` | `send_kv_chunk()` |
 
 ## 14. PrefillDelayer 与 Chunked Prefill
 
-在 DP Attention 场景下，`PrefillDelayer`（`srt/managers/prefill_delayer.py`）通过 `PrefillDelayerSinglePassExecutor` 包装后传入 `PrefillAdder`，在 `add_one_req()` 内部检查是否允许 prefill（`schedule_policy.py` L769-774）。
+在 DP Attention 场景下，`PrefillDelayer`（`python/sglang/srt/managers/prefill_delayer.py`）通过 `PrefillDelayerSinglePassExecutor` 包装后传入 `PrefillAdder`，在 `add_one_req()` 内部检查是否允许 prefill（`python/sglang/srt/managers/schedule_policy.py` L769-774）。
 
 关键区别：
 - `add_one_req` 经过 PrefillDelayer 检查：新请求可能被延迟
@@ -972,3 +984,15 @@ Llama4、Step3p5 等 SWA 混合架构（Full Attention + SWA 层）对分块策�
 
 > **注意**: Qwen3.5 的混合架构是 Full Attention + Linear Attention (GatedDeltaNet)，不使用 SWA。SWA 混合架构适用于 Llama4、Step3p5、GptOss、MiMoV2 等模型。
 
+## 与其他章节关系
+- 连接 `03/04/11/14`。
+
+
+## 最小可验证实验
+- 固定模型和负载，仅切换本章机制开关。
+- 记录 TTFT、TPOT、吞吐、显存峰值与回退率。
+- 总结收益场景、退化场景、推荐默认值。
+
+
+## 常见误解
+- Chunked Prefill 一定降低延迟。

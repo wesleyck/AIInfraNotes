@@ -1,4 +1,16 @@
-# 08: Attention 后端
+# 09: Attention 后端
+
+## 本章定位
+- 主题范围: Attention 后端接口与实现差异。
+
+## 设计 Why（为什么这么设计）
+- 多后端并存用于覆盖不同硬件、模型和负载场景。
+- 核心取舍: 吞吐 vs 时延、显存 vs 计算、通用性 vs 特化。
+
+## 阅读建议（进阶）
+1. 先抓目标函数和边界条件，再读具体实现。
+2. 先看调用链和状态变化，再看局部优化细节。
+3. 源码锚点以“路径 + 类/函数”为主，避免依赖易漂移行号。
 
 ## 1. 概述
 
@@ -102,7 +114,7 @@ decode_attention_fwd(q, k_cache, v_cache, o, kv_indptr=..., kv_indices=..., num_
 > `RadixAttention` 是一个 **`nn.Module` 调度器**，它**不实现** Attention 数学运算，而是持有层级元数据（head 配置、scale、sliding window 等）并将计算委托给 `AttentionBackend`。
 
 ```python
-# python/sglang/srt/layers/radix_attention.py
+- 源码锚点: `python/sglang/srt/layers/radix_attention.py`
 class RadixAttention(nn.Module):
     def __init__(self, num_heads, head_dim, scaling, num_kv_heads, layer_id,
                  logit_cap=0.0, sliding_window_size=-1, is_cross_attention=False, ...):
@@ -161,7 +173,7 @@ class RadixAttention(nn.Module):
 
 ## 2. 基础接口 (AttentionBackend)
 
-`base_attn_backend.py` 定义了所有后端必须实现的接口：
+`python/sglang/srt/layers/attention/base_attn_backend.py` 定义了所有后端必须实现的接口：
 
 ```python
 class AttentionBackend(ABC):
@@ -171,7 +183,7 @@ class AttentionBackend(ABC):
         """每次 forward 前初始化元数据"""
         pass
 
-    # ---- 主入口: 四路分发 (base_attn_backend.py:79-121) ----
+    # ---- 主入口: 四路分发 (base_attn_backend.py) ----
     def forward(self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs):
         """根据 forward_mode 分发到具体方法"""
         if forward_batch.forward_mode.is_idle():
@@ -203,7 +215,7 @@ class AttentionBackend(ABC):
     def init_forward_metadata_replay_cuda_graph(...): ...
     def get_cuda_graph_seq_len_fill_value(self): ...
 
-    # ---- 投机解码支持 (base_attn_backend.py:60-77) ----
+    # ---- 投机解码支持 (base_attn_backend.py) ----
     def get_verify_buffers_to_fill_after_draft(self):
         """返回 verify 阶段需要在 draft 后填充的 buffer (tree mask, positions)"""
         return [None, None]
@@ -216,13 +228,13 @@ class AttentionBackend(ABC):
     def support_triton(self): return True  # 是否支持 Triton kernel
 
     def get_indexer_metadata(self, layer_id, forward_batch):
-        """获取 NSA indexer 元数据, None 表示不支持 (base_attn_backend.py:163-169)"""
+        """获取 NSA indexer 元数据, None 表示不支持 (base_attn_backend.py)"""
         return None
 ```
 
 ## 3. 后端注册机制
 
-`attention_registry.py` 使用装饰器模式注册后端：
+`python/sglang/srt/layers/attention/attention_registry.py` 使用装饰器模式注册后端：
 
 ```python
 ATTENTION_BACKENDS = {}
@@ -414,7 +426,7 @@ begin_forward是plan接口
 #### 4.1.6 create_flashinfer_kv_indices_triton 核心逻辑
 
 ```python
-# sglang/srt/layers/attention/utils.py
+- 源码锚点: `python/sglang/srt/layers/attention/utils.py`
 @triton.jit
 def create_flashinfer_kv_indices_triton(
     req_to_token,        # [max_bs, max_context_len] 请求→token位置映射
@@ -464,7 +476,7 @@ FlashInfer 是 SGLang 默认的 Attention 后端，由 [flashinfer-ai](https://g
 ### 5.1 Qwen3 / Qwen3.5 特殊处理
 
 ```python
-# flashinfer_backend.py L162-172
+- 源码锚点: `python/sglang/srt/layers/attention/flashinfer_backend.py`
 # Qwen2/Qwen3 模型需要更大的 workspace
 if (
     "Qwen2ForCausalLM" in model_runner.model_config.hf_config.architectures
@@ -497,7 +509,7 @@ flowchart TD
 #### 5.2.1 `num_wrappers` 决策逻辑
 
 ```python
-# flashinfer_backend.py __init__()
+- 源码锚点: `python/sglang/srt/layers/attention/flashinfer_backend.py`
 if model_runner.sliding_window_size is not None:
     self.num_wrappers = 2                               # 全局 + 滑动窗口
     self.dispatch_reason = WrapperDispatch.SLIDING_WINDOW
@@ -526,7 +538,7 @@ def _get_wrapper_idx(self, layer: RadixAttention):
 #### 5.2.2 `workspace_buffer` 共享机制
 
 ```python
-# flashinfer_backend.py — 全局单例 workspace
+- 源码锚点: `python/sglang/srt/layers/attention/flashinfer_backend.py`
 global_workspace_buffer = None  # 模块级全局变量
 
 class FlashInferAttnBackend:
@@ -698,7 +710,7 @@ def call_begin_forward(self, wrapper, req_pool_indices, paged_kernel_lens, ...):
 #### 5.8.2 Cascade 实现
 
 ```python
-# flashinfer_backend.py forward_extend() 情况 3
+- 源码锚点: `python/sglang/srt/layers/attention/flashinfer_backend.py`
 # 新 KV 的 attention (使用 Ragged wrapper)
 o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
     q, k, v, causal=True, sm_scale=layer.scaling
@@ -778,13 +790,13 @@ Paged (分页存储, page_size=1):
 #### 5.9.3 代码中的选择逻辑
 
 ```python
-# flashinfer_backend.py init_forward_metadata() (简化, 实际逻辑在 L468-498)
+- 源码锚点: `python/sglang/srt/layers/attention/flashinfer_backend.py`
 if forward_batch.forward_mode.is_decode():
     # Decode 总是使用 Paged
     self.forward_metadata = DecodeMetadata(decode_wrappers=...)
 
 elif forward_batch.forward_mode.is_extend():
-    # use_ragged 的决策路径 (flashinfer_backend.py:471-483):
+    # use_ragged 的决策路径 (flashinfer_backend.py):
     if self.is_multimodal or self.multi_item_scoring_delimiter is not None:
         # 多模态/多项评分: 强制 Paged (ragged 不支持特殊参数)
         use_ragged = False
@@ -836,17 +848,17 @@ elif forward_batch.forward_mode.is_extend():
 
 | 后端 | 返回值 | 原因 |
 |------|-------|------|
-| FlashInfer | **1** | kernel 内部有 `seq_len > 0` 检查 (`flashinfer_backend.py:745-746`) |
-| Triton | **1** | 与 FlashInfer 保持一致 (`triton_backend.py:783`) |
-| FlashAttention | **1** | 与 FlashInfer 保持一致 (`flashattention_backend.py:2192`) |
-| FlashMLA | **1** | 继承自 FlashInfer (`flashmla_backend.py:343-344`) |
-| CUTLASS MLA | **1** | 继承自 FlashInfer (`cutlass_mla_backend.py:223-224`) |
-| NSA | **1** | 继承自 FlashInfer (`nsa_backend.py:2017-2019`) |
+| FlashInfer | **1** | kernel 内部有 `seq_len > 0` 检查 (`python/sglang/srt/layers/attention/flashinfer_backend.py`) |
+| Triton | **1** | 与 FlashInfer 保持一致 (`python/sglang/srt/layers/attention/triton_backend.py`) |
+| FlashAttention | **1** | 与 FlashInfer 保持一致 (`python/sglang/srt/layers/attention/flashattention_backend.py`) |
+| FlashMLA | **1** | 继承自 FlashInfer (`python/sglang/srt/layers/attention/flashmla_backend.py`) |
+| CUTLASS MLA | **1** | 继承自 FlashInfer (`python/sglang/srt/layers/attention/cutlass_mla_backend.py`) |
+| NSA | **1** | 继承自 FlashInfer (`python/sglang/srt/layers/attention/nsa_backend.py`) |
 
 > **所有后端统一返回 1**。这是因为 CUDA Graph 捕获时 padding 请求的 `seq_len` 必须 > 0，否则某些 kernel 会跳过计算导致 CUDA Graph 捕获不完整。
 
 ```python
-# cuda_graph_runner.py 使用此值填充 padding 请求
+- 源码锚点: `python/sglang/srt/model_executor/cuda_graph_runner.py`
 seq_len_fill_value = attn_backend.get_cuda_graph_seq_len_fill_value()
 self.seq_lens.fill_(seq_len_fill_value)  # 默认填充
 ```
@@ -885,7 +897,7 @@ class FlashAttentionBackend(AttentionBackend):
 
 @dataclass
 class FlashAttentionMetadata:
-    # 基础字段 (flashattention_backend.py:39-86)
+    # 基础字段 (flashattention_backend.py)
     cache_seqlens_int32: torch.Tensor  # [bs], KV 序列长度
     max_seq_len_q: int = 1             # query 最大序列长度
     max_seq_len_k: int = 0             # key 最大序列长度
@@ -996,16 +1008,16 @@ sglang/srt/layers/attention/triton_ops/
 ```python
 class TritonAttnBackend(AttentionBackend):
     def __init__(self, model_runner, skip_prefill=False):
-        # KV split 优化参数 (triton_backend.py:108-111)
+        # KV split 优化参数 (triton_backend.py)
         self.static_kv_splits = get_bool_env_var(
             "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"  # 布尔值: 是否使用静态 KV 分片
         )
         self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits  # 默认 8
 
-        # 确定性推理模式 (triton_backend.py:119-121)
+        # 确定性推理模式 (triton_backend.py)
         self.enable_deterministic = model_runner.server_args.enable_deterministic_inference
 
-        # 确定性模式下的特殊配置 (triton_backend.py:124-130)
+        # 确定性模式下的特殊配置 (triton_backend.py)
         if self.enable_deterministic:
             self.split_tile_size = get_int_env_var(
                 "SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE", 256  # 确定性模式默认 256
@@ -1027,7 +1039,7 @@ class ForwardMetadata:
     qo_indptr: torch.Tensor          # Query 累积指针
     custom_mask: torch.Tensor        # 自定义 mask (投机解码用)
     mask_indptr: torch.Tensor        # mask 累积指针
-    # Sliding Window 支持 (triton_backend.py:48-52)
+    # Sliding Window 支持 (triton_backend.py)
     window_kv_indptr: torch.Tensor   # 窗口内 KV 累积指针
     window_kv_indices: torch.Tensor  # 窗口内 KV 实际位置
     window_num_kv_splits: torch.Tensor  # 窗口内 KV 分片数
@@ -1077,7 +1089,7 @@ def get_num_kv_splits(self, num_kv_splits, seq_lens):
 #### 8.3.3 Split Attention 的 merge 过程
 
 ```python
-# decode_attention.py 内部逻辑 (简化)
+- 源码锚点: `python/sglang/srt/layers/attention/triton_ops/decode_attention.py`
 def decode_attention_fwd(q, k_cache, v_cache, o, kv_indptr, kv_indices, num_kv_splits, ...):
     # 1. 每个 split 独立计算
     for split_idx in range(num_kv_splits):
@@ -1122,7 +1134,7 @@ python -m sglang.launch_server ... \
 | 性能 | 最优 | 略慢 (10-20%) |
 
 ```python
-# triton_backend.py
+- 源码锚点: `python/sglang/srt/layers/attention/triton_backend.py`
 if self.enable_deterministic:
     # 使用 unified 1-stage kernel (确定性)
     return self._forward_extend_unified(q, o, layer, forward_batch, ...)
@@ -1234,7 +1246,7 @@ flowchart TB
     style TRITON_S fill:#FFB6C1
 ```
 
-**详细路由规则** (参考 `server_args.py:1795-1833`):
+**详细路由规则** (参考 `python/sglang/srt/server_args.py`):
 
 ```
 1. 特殊模型优先匹配 (按 model_arch 分支):
@@ -1264,7 +1276,7 @@ flowchart TB
 ### 9.2 相关配置参数
 
 ```python
-# server_args.py
+- 源码锚点: `python/sglang/srt/server_args.py`
 attention_backend: Optional[str] = None         # 通用后端
 decode_attention_backend: Optional[str] = None  # Decode 专用
 prefill_attention_backend: Optional[str] = None # Prefill 专用
@@ -1409,7 +1421,7 @@ class MLATokenToKVPool(KVCache):
 ### 12.4 MLA Forward 流程
 
 ```python
-# flashinfer_mla_backend.py
+- 源码锚点: `python/sglang/srt/layers/attention/flashinfer_mla_backend.py`
 def forward_decode(self, q, k, v, layer, forward_batch, save_kv_cache=True, 
                    q_rope=None, k_rope=None):
     # 1. 保存 KV (合并 k_nope 和 k_rope)
@@ -1443,7 +1455,7 @@ def forward_decode(self, q, k, v, layer, forward_batch, save_kv_cache=True,
 FlashMLA 使用 **block 级别**的索引 (而非 token 级别):
 
 ```python
-# flashmla_backend.py
+- 源码锚点: `python/sglang/srt/layers/attention/flashmla_backend.py`
 PAGE_SIZE = 64  # FlashMLA 固定使用 64 的 page size
 
 def init_forward_metadata(self, forward_batch):
@@ -1553,7 +1565,7 @@ class EagleVerifyInput(SpecInput):
 #### 13.4.1 Decode 阶段
 
 ```python
-# triton_backend.py / flashinfer_backend.py
+- 源码锚点: `python/sglang/srt/layers/attention/triton_backend.py`
 if forward_mode.is_decode_or_idle():
     if spec_info is None:
         # 正常 decode: 标准索引构建
@@ -1615,7 +1627,7 @@ def init_forward_metadata_replay_cuda_graph(self, ..., spec_info):
 当使用 **Tree Speculation** (topk > 1) 时，FlashAttention 需要两阶段 attention：
 
 ```python
-# flashattention_backend.py
+- 源码锚点: `python/sglang/srt/layers/attention/flashattention_backend.py`
 if self.topk > 1 and forward_mode.is_decode():
     # 阶段 1: Prefix attention (主 page_table)
     o1 = flash_attn_with_kvcache(q, k_cache, v_cache, 
@@ -1737,9 +1749,9 @@ Qwen3.5 的 GatedDeltaNet 层使用线性注意力，SGLang 提供了专门的�
 
 | 文件 | 说明 |
 |------|------|
-| `lightning_attn.py` | Lightning Attention 后端 |
-| `seg_la.py` | Segmented Linear Attention 后端 |
-| `linear_metadata.py` | 线性注意力元数据管理 |
+| `python/sglang/srt/layers/attention/linear/lightning_attn.py` | Lightning Attention 后端 |
+| `python/sglang/srt/layers/attention/linear/seg_la.py` | Segmented Linear Attention 后端 |
+| `python/sglang/srt/layers/attention/linear/linear_metadata.py` | 线性注意力元数据管理 |
 
 ### FLA (Flash Linear Attention)
 
@@ -1755,23 +1767,23 @@ SGLang 提供了大量 attention 后端：
 
 | 后端 | 文件 | 说明 |
 |------|------|------|
-| Wave | `wave_backend.py` + `wave_ops/` | Wave Attention 后端，含 decode/extend/prefill 三种 attention |
-| TRT-LLM MHA | `trtllm_mha_backend.py` | TensorRT-LLM MHA 后端（非 MLA 模型） |
-| Torch Flex | `torch_flex_backend.py` | PyTorch Flex Attention 后端 |
-| TBO | `tbo_backend.py` | Two Batch Overlap 专用后端 |
+| Wave | `python/sglang/srt/layers/attention/wave_backend.py` + `wave_ops/` | Wave Attention 后端，含 decode/extend/prefill 三种 attention |
+| TRT-LLM MHA | `python/sglang/srt/layers/attention/trtllm_mha_backend.py` | TensorRT-LLM MHA 后端（非 MLA 模型） |
+| Torch Flex | `python/sglang/srt/layers/attention/torch_flex_backend.py` | PyTorch Flex Attention 后端 |
+| TBO | `python/sglang/srt/layers/attention/tbo_backend.py` | Two Batch Overlap 专用后端 |
 
 ### MLA 后端
 
 | 后端 | 文件 | 说明 |
 |------|------|------|
-| TRT-LLM MLA | `trtllm_mla_backend.py` | TensorRT-LLM MLA 后端 |
-| CUTLASS MLA | `cutlass_mla_backend.py` | CUTLASS MLA 后端 |
+| TRT-LLM MLA | `python/sglang/srt/layers/attention/trtllm_mla_backend.py` | TensorRT-LLM MLA 后端 |
+| CUTLASS MLA | `python/sglang/srt/layers/attention/cutlass_mla_backend.py` | CUTLASS MLA 后端 |
 
 ### 混合/线性 Attention 后端
 
 | 后端 | 文件 | 说明 |
 |------|------|------|
-| Hybrid Linear | `hybrid_linear_attn_backend.py` | 混合线性注意力后端，组合 full attention + linear attention |
+| Hybrid Linear | `python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py` | 混合线性注意力后端，组合 full attention + linear attention |
 
 ### 特殊包装后端 (via attn_backend_wrapper)
 
@@ -1785,7 +1797,7 @@ SGLang 提供了大量 attention 后端：
 
 ## 18. 注册后端总览
 
-**文件**: `srt/layers/attention/attention_registry.py`
+**文件**: `python/sglang/srt/layers/attention/attention_registry.py`
 
 共注册了 17 个后端：
 
@@ -1812,10 +1824,23 @@ SGLang 提供了大量 attention 后端：
 ### NSA 后端扩展
 
 `nsa/` 目录新增了 MTP 验证和预计算相关文件：
-- `nsa_mtp_verification.py` - MTP 验证
-- `nsa_backend_mtp_precompute.py` - MTP 预计算
+- `python/sglang/srt/layers/attention/nsa/nsa_mtp_verification.py` - MTP 验证
+- `python/sglang/srt/layers/attention/nsa/nsa_backend_mtp_precompute.py` - MTP 预计算
 
 ## 19. 下一步
 
 - **10**: 模型加载、权重处理、量化支持
 - **11**: 多模态完整生命周期 (Qwen3.5)
+
+## 与其他章节关系
+- 是 `08` 的 attention 执行底座。
+
+
+## 最小可验证实验
+- 固定模型和负载，仅切换本章机制开关。
+- 记录 TTFT、TPOT、吞吐、显存峰值与回退率。
+- 总结收益场景、退化场景、推荐默认值。
+
+
+## 常见误解
+- 后端差异只影响速度不影响稳定性。

@@ -4,6 +4,18 @@
 >
 > **核心组件**: FlashAttention 3/4, CUTLASS MLA (SM100), FlashMLA (SM90), Cascade, Sparse Attention, Wave Attention, NSA
 
+## 本章定位
+- 主题范围: Attention kernel 实现与优化。
+
+## 设计 Why（为什么这么设计）
+- Attention kernel 决定主路径效率与显存行为。
+- 核心取舍: 吞吐 vs 时延、显存 vs 计算、通用性 vs 特化。
+
+## 阅读建议（进阶）
+1. 先抓目标函数和边界条件，再读具体实现。
+2. 先看调用链和状态变化，再看局部优化细节。
+3. 源码锚点以“路径 + 类/函数”为主，避免依赖易漂移行号。
+
 ## 1. 概览
 
 ```mermaid
@@ -41,21 +53,21 @@ graph TB
 
 | Kernel | 源文件 | 硬件 | 用途 |
 |--------|--------|------|------|
-| `fwd` / `fwd_kvcache` | `flash_attn.py` → `flash_extension.cc` | SM80+ | FA3/FA4 前向 |
-| `cutlass_mla_decode` | `csrc/attention/cutlass_mla_kernel.cu` | SM100 | CUTLASS MLA decode (Blackwell) |
+| `fwd` / `fwd_kvcache` | `sgl-kernel/python/sgl_kernel/flash_attn.py` → `sgl-kernel/csrc/flash_extension.cc` | SM80+ | FA3/FA4 前向 |
+| `cutlass_mla_decode` | `sgl-kernel/csrc/attention/cutlass_mla_kernel.cu` | SM100 | CUTLASS MLA decode (Blackwell) |
 | `cutlass_sm100_mla/*` | `csrc/attention/cutlass_sm100_mla/` | SM100 | SM100 MLA 设备/kernel 实现 |
 | | `├── device/sm100_mla.hpp` | | MLA device-level wrapper |
 | | `├── kernel/sm100_fmha_mla_tma_warpspecialized.hpp` | | TMA Warp-specialized MLA kernel |
 | | `├── kernel/sm100_fmha_mla_reduction.hpp` | | MLA Split-KV reduction kernel |
 | | `└── kernel/sm100_mla_tile_scheduler.hpp` | | Persistent Tile Scheduler |
-| `cascade` | `csrc/attention/cascade.cu` | SM80+ | Cascade attention (合并 2 个 attention 输出) |
-| `merge_state` | `csrc/attention/merge_attn_states.cu` | All | 分块状态合并 (online softmax) |
-| `fwd_sparse` | `csrc/attention/vertical_slash_index.cu` | SM80+ | 稀疏注意力索引转换 |
-| `flash_mla_with_kvcache` | `flash_mla.py` → `flashmla_extension.cc` | SM90 | FlashMLA 后端 (独立项目, 非 CUTLASS MLA) |
-| `flash_mla_sparse_fwd` | `flash_mla.py` | SM90 | FlashMLA 稀疏 prefill |
-| `wave_backend` | `wave_backend.py` (Triton) | All | Wave Attention (decode/extend/prefill) |
-| `nsa_backend` | `nsa_backend.py` + `nsa/` | SM80+ | NSA 稀疏注意力 + MTP 支持 |
-| `cpu_flash_attn` | `csrc/cpu/flash_attn.cpp` | CPU | CPU FlashAttention (x86_64/aarch64) |
+| `cascade` | `sgl-kernel/csrc/attention/cascade.cu` | SM80+ | Cascade attention (合并 2 个 attention 输出) |
+| `merge_state` | `sgl-kernel/csrc/attention/merge_attn_states.cu` | All | 分块状态合并 (online softmax) |
+| `fwd_sparse` | `sgl-kernel/csrc/attention/vertical_slash_index.cu` | SM80+ | 稀疏注意力索引转换 |
+| `flash_mla_with_kvcache` | `sgl-kernel/python/sgl_kernel/flash_mla.py` → `sgl-kernel/csrc/flashmla_extension.cc` | SM90 | FlashMLA 后端 (独立项目, 非 CUTLASS MLA) |
+| `flash_mla_sparse_fwd` | `sgl-kernel/python/sgl_kernel/flash_mla.py` | SM90 | FlashMLA 稀疏 prefill |
+| `wave_backend` | `python/sglang/srt/layers/attention/wave_backend.py` (Triton) | All | Wave Attention (decode/extend/prefill) |
+| `nsa_backend` | `python/sglang/srt/layers/attention/nsa_backend.py` + `nsa/` | SM80+ | NSA 稀疏注意力 + MTP 支持 |
+| `cpu_flash_attn` | `sgl-kernel/csrc/cpu/flash_attn.cpp` | CPU | CPU FlashAttention (x86_64/aarch64) |
 
 ## 2. FlashAttention 3/4 集成
 
@@ -79,7 +91,7 @@ flowchart LR
 ### 2.2 核心 API
 
 ```python
-# flash_attn.py: flash_attn_with_kvcache
+- 源码锚点: `sgl-kernel/python/sgl_kernel/flash_attn.py`
 def flash_attn_with_kvcache(
     # 基础输入
     q,                    # (batch, seqlen_q, nheads, headdim)
@@ -130,7 +142,7 @@ def flash_attn_with_kvcache(
 ```
 
 ```python
-# flash_attn.py: flash_attn_varlen_func
+- 源码锚点: `sgl-kernel/python/sgl_kernel/flash_attn.py`
 def flash_attn_varlen_func(
     q,              # (total_q, nheads, headdim)
     k,              # (total_k, nheads_k, headdim)
@@ -200,7 +212,7 @@ flowchart LR
 
 ### 3.2 Kernel 实现
 
-**文件**: `csrc/attention/cutlass_mla_kernel.cu`
+**文件**: `sgl-kernel/csrc/attention/cutlass_mla_kernel.cu`
 **要求**: CUDA >= 12.4 (编译时检查，低版本会直接报错)
 
 ```cpp
@@ -269,7 +281,7 @@ FlashMLA 是一个**独立维护的项目** (非 FlashInfer 的一部分)，专�
 
 > **要求**: CUDA Driver >= 12.4 (加载 flashmla_ops 扩展时检查)
 
-**文件**: `python/sgl_kernel/flash_mla.py` + `csrc/flashmla_extension.cc`
+**文件**: `sgl-kernel/python/sgl_kernel/flash_mla.py` + `sgl-kernel/csrc/flashmla_extension.cc`
 
 ```python
 import sgl_kernel
@@ -364,7 +376,7 @@ output_lse = log(out_se) + max_lse
 
 ### 4.3 Kernel 实现
 
-**文件**: `csrc/attention/merge_attn_states.cu`
+**文件**: `sgl-kernel/csrc/attention/merge_attn_states.cu`
 
 ```cpp
 template <typename scalar_t, const uint NUM_THREADS>
@@ -403,10 +415,10 @@ __global__ void merge_attn_states_kernel(
 ### 4.4 API
 
 ```python
-# attention.py: merge_state (v1) — 基于 Triton 实现
+- 源码锚点: `sgl-kernel/python/sgl_kernel/attention.py`
 merge_state(v_a, s_a, v_b, s_b, v_merged=None, s_merged=None)
 
-# attention.py: merge_state_v2 — 基于自定义 CUDA kernel (merge_attn_states.cu)
+- 源码锚点: `sgl-kernel/python/sgl_kernel/attention.py`
 merge_state_v2(v_a, s_a, v_b, s_b, v_merged=None, s_merged=None)
 ```
 
@@ -593,7 +605,7 @@ else:
 
 | 问题 | 原因 | 解决 |
 |------|------|------|
-| `cutlass_mla_decode` 失败 | 非 SM100 | 使用 FlashMLA 后端 (`flash_mla.py`, SM90) |
+| `cutlass_mla_decode` 失败 | 非 SM100 | 使用 FlashMLA 后端 (`sgl-kernel/python/sgl_kernel/flash_mla.py`, SM90) |
 | FA4 不支持 KV 更新 | 设计限制 | 使用 FA3 |
 | 大 batch MLA hang | Split-KV bug | 设置 `num_kv_splits=1` |
 
@@ -629,21 +641,21 @@ NSA (Native Sparse Attention) 扩展了 MTP (Multi-Token Prediction) 支持。
 
 | 文件 | 功能 |
 |------|------|
-| `nsa_backend.py` | NSA 注意力后端主入口 (位于 `layers/attention/` 目录) |
-| `nsa_mtp_verification.py` | NSA 与 MTP 联合验证逻辑，确保投机解码中稀疏注意力的正确性 |
-| `nsa_backend_mtp_precompute.py` | MTP 预计算后端，在 prefill 阶段预先计算 NSA 所需的索引和元数据 |
-| `nsa_indexer.py` | NSA 索引器，负责稀疏 token 选择和索引构建 |
-| `dequant_k_cache.py` | KV Cache 反量化，将量化的 K cache 还原为高精度 |
-| `quant_k_cache.py` | KV Cache 量化，将 K cache 压缩为低精度格式 |
-| `tilelang_kernel.py` | TileLang kernel 实现 |
-| `transform_index.py` | 索引变换工具 |
-| `triton_kernel.py` | Triton kernel 实现 |
-| `index_buf_accessor.py` | 索引缓冲区访问器 |
-| `utils.py` | NSA 通用工具函数 |
+| `python/sglang/srt/layers/attention/nsa_backend.py` | NSA 注意力后端主入口 (位于 `layers/attention/` 目录) |
+| `python/sglang/srt/layers/attention/nsa/nsa_mtp_verification.py` | NSA 与 MTP 联合验证逻辑，确保投机解码中稀疏注意力的正确性 |
+| `python/sglang/srt/layers/attention/nsa/nsa_backend_mtp_precompute.py` | MTP 预计算后端，在 prefill 阶段预先计算 NSA 所需的索引和元数据 |
+| `python/sglang/srt/layers/attention/nsa/nsa_indexer.py` | NSA 索引器，负责稀疏 token 选择和索引构建 |
+| `python/sglang/srt/layers/attention/nsa/dequant_k_cache.py` | KV Cache 反量化，将量化的 K cache 还原为高精度 |
+| `python/sglang/srt/layers/attention/nsa/quant_k_cache.py` | KV Cache 量化，将 K cache 压缩为低精度格式 |
+| `python/sglang/srt/layers/attention/nsa/tilelang_kernel.py` | TileLang kernel 实现 |
+| `python/sglang/srt/layers/attention/nsa/transform_index.py` | 索引变换工具 |
+| `python/sglang/srt/layers/attention/nsa/triton_kernel.py` | Triton kernel 实现 |
+| `python/sglang/srt/layers/attention/nsa/index_buf_accessor.py` | 索引缓冲区访问器 |
+| `python/sglang/srt/disaggregation/utils.py` | NSA 通用工具函数 |
 
 ### 10.2 MTP + NSA 协作
 
-在 MTP 场景下，draft model 生成多个候选 token，NSA 需要在验证阶段正确处理稀疏注意力模式。`nsa_mtp_verification.py` 负责协调两者的交互，`nsa_backend_mtp_precompute.py` 则在 prefill 阶段预计算稀疏索引以减少验证延迟。
+在 MTP 场景下，draft model 生成多个候选 token，NSA 需要在验证阶段正确处理稀疏注意力模式。`python/sglang/srt/layers/attention/nsa/nsa_mtp_verification.py` 负责协调两者的交互，`python/sglang/srt/layers/attention/nsa/nsa_backend_mtp_precompute.py` 则在 prefill 阶段预计算稀疏索引以减少验证延迟。
 
 ## 11. CPU FlashAttention
 
@@ -653,9 +665,22 @@ sgl-kernel 的 CPU 后端新增了 FlashAttention 实现，支持在纯 CPU 环�
 
 - 利用 AVX/NEON 向量指令加速 attention 计算
 - 支持 x86_64 和 aarch64 架构
-- 与 GPU 版本共享相同的 Python API 接口，通过 `csrc/cpu/interface.cpp` 统一注册
+- 与 GPU 版本共享相同的 Python API 接口，通过 `sgl-kernel/csrc/cpu/interface.cpp` 统一注册
 - 适用于边缘部署、CPU-only 推理等场景
 
 ## 12. 下一步
 
 - **17**: MoE kernel 详解 (路由, Grouped GEMM)
+
+## 与其他章节关系
+- 细化 `09` 的核心算子。
+
+
+## 最小可验证实验
+- 固定模型和负载，仅切换本章机制开关。
+- 记录 TTFT、TPOT、吞吐、显存峰值与回退率。
+- 总结收益场景、退化场景、推荐默认值。
+
+
+## 常见误解
+- 只看 FLOPs 就能判断 attention 性能。

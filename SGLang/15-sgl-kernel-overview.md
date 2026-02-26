@@ -4,6 +4,18 @@
 >
 > **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存 + EPLB + MTP + 线性注意力
 
+## 本章定位
+- 主题范围: sgl-kernel 版图与调用方式。
+
+## 设计 Why（为什么这么设计）
+- sgl-kernel 将热点算子下沉，是推理性能上限的重要来源。
+- 核心取舍: 吞吐 vs 时延、显存 vs 计算、通用性 vs 特化。
+
+## 阅读建议（进阶）
+1. 先抓目标函数和边界条件，再读具体实现。
+2. 先看调用链和状态变化，再看局部优化细节。
+3. 源码锚点以“路径 + 类/函数”为主，避免依赖易漂移行号。
+
 ## 1. 概览
 
 `sgl-kernel` 是 SGLang 的高性能 CUDA kernel 库，提供 LLM 推理所需的核心计算原语。
@@ -215,7 +227,7 @@ merge_state(v_a, s_a, v_b, s_b, v_merged, s_merged)
 | DSv3 | `dsv3_fused_a_gemm`, `dsv3_router_gemm` | DeepSeek-V3 专用融合 GEMM |
 | QServe | `qserve_w4a8_per_chn_gemm`, `qserve_w4a8_per_group_gemm` | W4A8 量化推理 |
 
-> Marlin repack 算子 (`gptq_marlin_repack`、`awq_marlin_repack`、`awq_marlin_moe_repack`) 仍然保留在 `marlin.py` 中，用于将 GPTQ/AWQ 权重重排为 Marlin 内部布局。
+> Marlin repack 算子 (`gptq_marlin_repack`、`awq_marlin_repack`、`awq_marlin_moe_repack`) 仍然保留在 `sgl-kernel/python/sgl_kernel/marlin.py` 中，用于将 GPTQ/AWQ 权重重排为 Marlin 内部布局。
 
 ```python
 # FP8 矩阵乘法
@@ -496,7 +508,7 @@ build_tree_kernel_efficient(
 
 ## 5. KV Cache I/O
 
-PD 分离场景下的 KV 传输优化。`kvcacheio.py` 定义了 13 个传输函数，但 `__init__.py` 仅导出 4 个基础 API（`transfer_kv_per_layer`、`transfer_kv_all_layer`、`transfer_kv_per_layer_mla`、`transfer_kv_all_layer_mla`）。其余布局转换变体需通过 `from sgl_kernel.kvcacheio import ...` 显式导入。
+PD 分离场景下的 KV 传输优化。`sgl-kernel/python/sgl_kernel/kvcacheio.py` 定义了 13 个传输函数，但 `sgl-kernel/python/sgl_kernel/__init__.py` 仅导出 4 个基础 API（`transfer_kv_per_layer`、`transfer_kv_all_layer`、`transfer_kv_per_layer_mla`、`transfer_kv_all_layer_mla`）。其余布局转换变体需通过 `from sgl_kernel.kvcacheio import ...` 显式导入。
 
 不同 API 对应不同的 KV Cache 内存布局组合：
 
@@ -717,51 +729,64 @@ sgl-kernel 扩展了多平台后端支持，不再局限于 NVIDIA CUDA。
 
 ### 9.1 MUSA (摩尔线程)
 
-- **扩展注册**: `csrc/common_extension_musa.cc` — 替代 `common_extension.cc` 的 MUSA 版本
-- **构建配置**: `pyproject_musa.toml` + `setup_musa.py` — 独立的 MUSA 构建流程
+- **扩展注册**: `sgl-kernel/csrc/common_extension_musa.cc` — 替代 `sgl-kernel/csrc/common_extension.cc` 的 MUSA 版本
+- **构建配置**: `pyproject_musa.toml` + `sgl-kernel/setup_musa.py` — 独立的 MUSA 构建流程
 - **适配方式**: 通过条件编译和独立的扩展注册文件，将 CUDA kernel 映射到 MUSA 后端
 
 ### 9.2 ROCm (AMD)
 
-- **扩展注册**: `csrc/common_extension_rocm.cc` — ROCm 平台的算子注册
-- **构建配置**: `pyproject_rocm.toml` + `setup_rocm.py` — 独立的 ROCm 构建流程
-- **头文件**: `include/pytorch_extension_utils_rocm.h` — ROCm 兼容的 PyTorch 扩展工具
-- **测试**: AMD 确定性 AllReduce 测试 (`tests/test_amd_deterministic_custom_allreduce.py`)
+- **扩展注册**: `sgl-kernel/csrc/common_extension_rocm.cc` — ROCm 平台的算子注册
+- **构建配置**: `pyproject_rocm.toml` + `sgl-kernel/setup_rocm.py` — 独立的 ROCm 构建流程
+- **头文件**: `sgl-kernel/include/pytorch_extension_utils_rocm.h` — ROCm 兼容的 PyTorch 扩展工具
+- **测试**: AMD 确定性 AllReduce 测试 (`sgl-kernel/tests/test_amd_deterministic_custom_allreduce.py`)
 
 ### 9.3 CPU 后端
 
 - **包名**: `sglang-kernel-cpu`（独立于 `sgl-kernel`，不同的 PyPI 包）
-- **入口**: `csrc/cpu/interface.cpp` + `csrc/cpu/torch_extension_cpu.cpp`
+- **入口**: `sgl-kernel/csrc/cpu/interface.cpp` + `sgl-kernel/csrc/cpu/torch_extension_cpu.cpp`
 - **构建配置**: `pyproject_cpu.toml`（torch 版本固定为 `==2.9.0`）
 - **支持的 kernel**:
 
 | 文件 | 功能 |
 |------|------|
-| `flash_attn.cpp` | CPU FlashAttention 实现 |
-| `gemm.cpp` | 通用 GEMM 基础设施 |
-| `gemm_int4.cpp` | INT4 GEMM |
-| `gemm_int8.cpp` | INT8 GEMM |
-| `gemm_fp8.cpp` | FP8 GEMM |
-| `moe.cpp` | MoE 基础设施 |
-| `moe_int4.cpp` | INT4 MoE |
-| `moe_int8.cpp` | INT8 MoE |
-| `moe_fp8.cpp` | FP8 MoE |
-| `activation.cpp` | 激活函数 (SiLU 等) |
-| `norm.cpp` | RMSNorm 等 |
-| `rope.cpp` | RoPE 位置编码 |
-| `topk.cpp` | TopK 路由 |
-| `bmm.cpp` | 批量矩阵乘法 |
-| `qkv_proj.cpp` | QKV 投影 |
-| `decode.cpp` / `extend.cpp` | Decode/Extend 阶段 |
-| `numa_utils.cpp` / `shm.cpp` | NUMA 亲和 / 共享内存 |
-| `mamba/conv.cpp` | CPU Mamba 因果卷积 |
-| `mamba/fla.cpp` | CPU GatedDeltaRule (线性注意力) |
-| `model/qwen3.cpp` | CPU Qwen3 模型实现 |
+| `sgl-kernel/csrc/cpu/flash_attn.cpp` | CPU FlashAttention 实现 |
+| `sgl-kernel/csrc/cpu/gemm.cpp` | 通用 GEMM 基础设施 |
+| `sgl-kernel/csrc/cpu/gemm_int4.cpp` | INT4 GEMM |
+| `sgl-kernel/csrc/cpu/gemm_int8.cpp` | INT8 GEMM |
+| `sgl-kernel/csrc/cpu/gemm_fp8.cpp` | FP8 GEMM |
+| `sgl-kernel/csrc/cpu/moe.cpp` | MoE 基础设施 |
+| `sgl-kernel/csrc/cpu/moe_int4.cpp` | INT4 MoE |
+| `sgl-kernel/csrc/cpu/moe_int8.cpp` | INT8 MoE |
+| `sgl-kernel/csrc/cpu/moe_fp8.cpp` | FP8 MoE |
+| `sgl-kernel/csrc/cpu/activation.cpp` | 激活函数 (SiLU 等) |
+| `sgl-kernel/csrc/cpu/norm.cpp` | RMSNorm 等 |
+| `sgl-kernel/csrc/cpu/rope.cpp` | RoPE 位置编码 |
+| `sgl-kernel/csrc/cpu/topk.cpp` | TopK 路由 |
+| `sgl-kernel/csrc/cpu/bmm.cpp` | 批量矩阵乘法 |
+| `sgl-kernel/csrc/cpu/qkv_proj.cpp` | QKV 投影 |
+| `sgl-kernel/csrc/cpu/decode.cpp` / `sgl-kernel/csrc/cpu/extend.cpp` | Decode/Extend 阶段 |
+| `sgl-kernel/csrc/cpu/numa_utils.cpp` / `sgl-kernel/csrc/cpu/shm.cpp` | NUMA 亲和 / 共享内存 |
+| `sgl-kernel/csrc/cpu/mamba/conv.cpp` | CPU Mamba 因果卷积 |
+| `sgl-kernel/csrc/cpu/mamba/fla.cpp` | CPU GatedDeltaRule (线性注意力) |
+| `sgl-kernel/csrc/cpu/model/qwen3.cpp` | CPU Qwen3 模型实现 |
 
 - **架构**: 支持 x86_64 和 aarch64，利用 AVX/NEON 向量指令加速
-- **向量化**: `vec.h` / `vec_pack.h` 提供跨平台 SIMD 抽象
+- **向量化**: `sgl-kernel/csrc/cpu/vec.h` / `sgl-kernel/csrc/cpu/vec_pack.h` 提供跨平台 SIMD 抽象
 
 ## 10. 下一步
 
 - **16**: Attention kernel 详解 (FlashAttention, MLA, Sparse)
 - **17**: MoE kernel 详解 (路由, Grouped GEMM)
+
+## 与其他章节关系
+- 为 `08/09/16/17/18/19` 提供算子支持。
+
+
+## 最小可验证实验
+- 固定模型和负载，仅切换本章机制开关。
+- 记录 TTFT、TPOT、吞吐、显存峰值与回退率。
+- 总结收益场景、退化场景、推荐默认值。
+
+
+## 常见误解
+- 算子越多越好。

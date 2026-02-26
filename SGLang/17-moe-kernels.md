@@ -4,6 +4,18 @@
 >
 > **核心组件**: Fused Gating, Token Alignment, Grouped GEMM, Expert Specialization
 
+## 本章定位
+- 主题范围: MoE kernel 主执行路径。
+
+## 设计 Why（为什么这么设计）
+- MoE 性能取决于路由、重排、分组 GEMM 的协同。
+- 核心取舍: 吞吐 vs 时延、显存 vs 计算、通用性 vs 特化。
+
+## 阅读建议（进阶）
+1. 先抓目标函数和边界条件，再读具体实现。
+2. 先看调用链和状态变化，再看局部优化细节。
+3. 源码锚点以“路径 + 类/函数”为主，避免依赖易漂移行号。
+
 ## 1. MoE 执行流程
 
 MoE (Mixture-of-Experts) 的执行通常分为三个阶段：路由、对齐、专家计算。
@@ -23,7 +35,7 @@ flowchart TB
 `topk_softmax` 是最基础的路由方式，通过 softmax 获取概率并采样前 K 个专家。
 
 ```python
-# moe.py: topk_softmax
+- 源码锚点: `sgl-kernel/python/sgl_kernel/moe.py`
 topk_softmax(
     topk_weights,      # [num_tokens, topk]
     topk_ids,          # [num_tokens, topk]
@@ -38,7 +50,7 @@ topk_softmax(
 针对大规模专家系统 (如 256 专家)，常用的层级分组路由。
 
 ```python
-# moe.py: moe_fused_gate
+- 源码锚点: `sgl-kernel/python/sgl_kernel/moe.py`
 moe_fused_gate(
     input_tensor,                  # [num_tokens, num_experts] 门控 logits
     bias,                          # 门控偏置 (可选，用于调整专家选择倾向)
@@ -84,7 +96,7 @@ moe_fused_gate(
 `moe_align_block_size` 负责计算每个专家收到的 token 数量，并生成排序索引。
 
 ```python
-# moe.py: moe_align_block_size
+- 源码锚点: `sgl-kernel/python/sgl_kernel/moe.py`
 moe_align_block_size(
     topk_ids, num_experts, block_size,
     sorted_token_ids,   # [num_tokens * topk] 输出聚合后的索引
@@ -105,7 +117,7 @@ moe_align_block_size(
 在 DeepSeek-V3 等模型中，广泛使用 FP8 块级量化。
 
 ```python
-# moe.py: fp8_blockwise_scaled_grouped_mm
+- 源码锚点: `sgl-kernel/python/sgl_kernel/moe.py`
 fp8_blockwise_scaled_grouped_mm(
     # 输出
     output,              # [total_tokens, N] 输出张量
@@ -137,7 +149,7 @@ fp8_blockwise_scaled_grouped_mm(
 对于 4-bit 量化权重、16-bit 激活的模型，使用 Marlin 优化的 MoE Kernel：
 
 ```python
-# fused_moe.py: moe_wna16_marlin_gemm
+- 源码锚点: `python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py`
 moe_wna16_marlin_gemm(
     # 输入/输出
     a,                        # [M, K] 激活输入
@@ -171,10 +183,10 @@ moe_wna16_marlin_gemm(
 
 ### 4.3 CUTLASS W4A8 MoE GEMM
 
-`cutlass_moe.py` 提供了基于 CUTLASS 的 W4A8 (INT4 权重 + FP8 激活) MoE 矩阵乘法，针对 Hopper (H100) 架构优化。
+`python/sglang/srt/layers/moe/cutlass_moe.py` 提供了基于 CUTLASS 的 W4A8 (INT4 权重 + FP8 激活) MoE 矩阵乘法，针对 Hopper (H100) 架构优化。
 
 ```python
-# cutlass_moe.py: 准备 MoE 分组数据
+- 源码锚点: `python/sglang/srt/layers/moe/cutlass_moe.py`
 get_cutlass_w4a8_moe_mm_data(
     topk_ids, expert_offsets,
     problem_sizes1, problem_sizes2,
@@ -182,7 +194,7 @@ get_cutlass_w4a8_moe_mm_data(
     num_experts, n, k,
 )
 
-# cutlass_moe.py: 执行 W4A8 分组矩阵乘法
+- 源码锚点: `python/sglang/srt/layers/moe/cutlass_moe.py`
 cutlass_w4a8_moe_mm(
     d, a, b, a_scales, b_scales,
     experts_offsets, problem_sizes,
@@ -203,7 +215,7 @@ cutlass_w4a8_moe_mm(
 - `cutlass_fp4_group_mm`: 高性能 FP4 专家计算。
 
 ```python
-# moe.py: cutlass_fp4_group_mm
+- 源码锚点: `sgl-kernel/python/sgl_kernel/moe.py`
 cutlass_fp4_group_mm(
     a_fp4,            # [total_tokens, K//2] FP4 打包激活 (uint8)
     b_fp4,            # [E, N, K//2] FP4 打包权重 (uint8)
@@ -226,10 +238,10 @@ cutlass_fp4_group_mm(
 ### 6.2 Shuffle Rows
 在专家计算前后，经常需要对 token 进行位置重排。`shuffle_rows` 实现了基于映射表的行重排序，是 MoE token 分发/收集的核心原语。
 
-**来源**: `gemm.py`
+**来源**: `sgl-kernel/python/sgl_kernel/gemm.py`
 
 ```python
-# gemm.py: shuffle_rows
+- 源码锚点: `sgl-kernel/python/sgl_kernel/gemm.py`
 shuffle_rows(
     input_tensor,         # [M, K] 输入张量
     dst2src_map,          # [M_out] 目标行 → 源行的映射索引
@@ -272,3 +284,16 @@ Expert Specialization 是一种优化策略，将特定专家绑定到特定的 
 ## 9. 下一步
 
 - **18**: 量化实现详解 (FP8, INT8, FP4, Marlin)
+
+## 与其他章节关系
+- 连接 `13/15/18` 的 MoE 路径。
+
+
+## 最小可验证实验
+- 固定模型和负载，仅切换本章机制开关。
+- 记录 TTFT、TPOT、吞吐、显存峰值与回退率。
+- 总结收益场景、退化场景、推荐默认值。
+
+
+## 常见误解
+- MoE 只要路由快就够。

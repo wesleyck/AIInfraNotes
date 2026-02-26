@@ -6,6 +6,18 @@
 
 本文详细分析 SGLang 调度系统的**四个**核心数据结构，以及它们之间的转换关系。
 
+## 本章定位
+- 主题范围: 核心数据结构及转换关系。
+
+## 设计 Why（为什么这么设计）
+- 数据结构分层用于隔离调度语义与执行语义，避免跨层耦合。
+- 核心取舍: 吞吐 vs 时延、显存 vs 计算、通用性 vs 特化。
+
+## 阅读建议（进阶）
+1. 先抓目标函数和边界条件，再读具体实现。
+2. 先看调用链和状态变化，再看局部优化细节。
+3. 源码锚点以“路径 + 类/函数”为主，避免依赖易漂移行号。
+
 ## 1. 数据结构概览
 
 SGLang 的批次数据在不同层级有不同的表示：
@@ -45,13 +57,13 @@ flowchart TB
 ```mermaid
 flowchart TD
     subgraph Pipeline["数据流转换流程"]
-        REQ["<b>Req</b> (请求级别) 调度核心<br/>schedule_batch.py:512<br/>• 单个请求的完整生命周期状态<br/>• 包含输入、输出、KV Cache、多模态等"]
+        REQ["<b>Req</b> (请求级别) 调度核心<br/>schedule_batch.py<br/>• 单个请求的完整生命周期状态<br/>• 包含输入、输出、KV Cache、多模态等"]
         
-        SB["<b>ScheduleBatch</b> (调度级别)<br/>schedule_batch.py:1202<br/>• 由 Scheduler 管理<br/>• 包含多个 Req 的批次信息<br/>• 主要在 CPU 上"]
+        SB["<b>ScheduleBatch</b> (调度级别)<br/>schedule_batch.py<br/>• 由 Scheduler 管理<br/>• 包含多个 Req 的批次信息<br/>• 主要在 CPU 上"]
         
-        MWB["<b>ModelWorkerBatch</b> (执行级别)<br/>schedule_batch.py:2337<br/>• 解耦调度数据与执行数据<br/>• 仅保留前向计算所需字段<br/>• 不持有内存池/调度策略引用"]
+        MWB["<b>ModelWorkerBatch</b> (执行级别)<br/>schedule_batch.py<br/>• 解耦调度数据与执行数据<br/>• 仅保留前向计算所需字段<br/>• 不持有内存池/调度策略引用"]
         
-        FB["<b>ForwardBatch</b> (GPU 级别) ★ 前向核心<br/>forward_batch_info.py:231<br/>• 由 ModelRunner 管理<br/>• 全部是 GPU Tensor<br/>• 包含 attention backend、位置编码等"]
+        FB["<b>ForwardBatch</b> (GPU 级别) ★ 前向核心<br/>forward_batch_info.py<br/>• 由 ModelRunner 管理<br/>• 全部是 GPU Tensor<br/>• 包含 attention backend、位置编码等"]
 
         REQ --> SB
         SB -->|batch.get_model_worker_batch| MWB
@@ -60,12 +72,12 @@ flowchart TD
 ```
 
 **文件位置**:
-- `srt/managers/schedule_batch.py` - Req, ScheduleBatch, ModelWorkerBatch
-- `srt/model_executor/forward_batch_info.py` - ForwardBatch, ForwardMode
+- `python/sglang/srt/managers/schedule_batch.py` - Req, ScheduleBatch, ModelWorkerBatch
+- `python/sglang/srt/model_executor/forward_batch_info.py` - ForwardBatch, ForwardMode
 
 ## 2. Req 类详解
 
-**定义**: `schedule_batch.py:512`
+**定义**: `python/sglang/srt/managers/schedule_batch.py`
 
 `Req` 类表示单个请求的完整生命周期状态。
 
@@ -184,7 +196,7 @@ class Req:
 
 ## 3. ScheduleBatch 类详解
 
-**定义**: `schedule_batch.py:1202`
+**定义**: `python/sglang/srt/managers/schedule_batch.py`
 
 `ScheduleBatch` 是调度层的批次抽象，由 `Scheduler` 管理。
 
@@ -234,7 +246,7 @@ class ScheduleBatch:
 
 ### 3.2 ForwardMode 枚举
 
-**定义**: `srt/model_executor/forward_batch_info.py:74`
+**定义**: `python/sglang/srt/model_executor/forward_batch_info.py`
 
 ```python
 class ForwardMode(IntEnum):
@@ -378,7 +390,7 @@ def get_model_worker_batch(self) -> ModelWorkerBatch:
 
 ## 4. ModelWorkerBatch 类详解
 
-**定义**: `schedule_batch.py:2337`
+**定义**: `python/sglang/srt/managers/schedule_batch.py`
 
 `ModelWorkerBatch` 是传递给 `TPWorker.forward_batch_generation()` 的数据结构。
 
@@ -490,7 +502,7 @@ Qwen3.5 继承 Qwen3-VL 的 **Multimodal Rotary Position Embedding**：
 
 ## 6. ForwardBatch 类详解
 
-**定义**: `forward_batch_info.py:231`
+**定义**: `python/sglang/srt/model_executor/forward_batch_info.py`
 
 `ForwardBatch` 是模型前向传播的核心数据结构，由 `ModelRunner` 管理，包含所有 GPU Tensor。
 
@@ -553,7 +565,7 @@ class ForwardBatch:
 ### 6.2 从 ModelWorkerBatch 创建
 
 ```python
-# forward_batch_info.py:398
+- 源码锚点: `python/sglang/srt/model_executor/forward_batch_info.py`
 @classmethod
 def init_new(cls, batch: ModelWorkerBatch, model_runner: ModelRunner):
     """从 ModelWorkerBatch 创建 ForwardBatch"""
@@ -816,13 +828,13 @@ for req in running_batch.reqs:
 
 ### 9.1 ForwardBatchDeepSeekMHAMixin
 
-**文件**: `srt/model_executor/forward_batch_deepseek_mha_mixin.py` (232行)
+**文件**: `python/sglang/srt/model_executor/forward_batch_deepseek_mha_mixin.py` (232行)
 
 为 DeepSeek MHA (Multi-Head Attention) 模型提供的 ForwardBatch 扩展 mixin，包含 MLA chunked prefix cache 在 chunked prefill 中使用的专用字段。由于 DeepSeek 的 MLA 架构特殊性，需要额外的 KV cache 索引和元数据管理。
 
 ### 9.2 GraphInputBuffers
 
-**文件**: `srt/model_executor/input_buffers.py` (208行)
+**文件**: `python/sglang/srt/model_executor/input_buffers.py` (208行)
 
 从 ModelRunner 中重构出来的独立模块，管理 CUDA Graph 的输入缓冲区。将图输入缓冲区的分配、填充、复用逻辑集中管理，减少 ModelRunner 的复杂度。
 
@@ -849,3 +861,16 @@ ForwardMode 枚举还包含以下特殊值：
 - **05**: Chunked Prefill 分块预填充
 - **06**: 内存池设计 (ReqToTokenPool, KVCache)
 - **07**: RadixCache 前缀缓存
+
+## 与其他章节关系
+- 是 `03/08` 的基础。
+
+
+## 最小可验证实验
+- 固定模型和负载，仅切换本章机制开关。
+- 记录 TTFT、TPOT、吞吐、显存峰值与回退率。
+- 总结收益场景、退化场景、推荐默认值。
+
+
+## 常见误解
+- 所有 batch 结构只是同义别名。

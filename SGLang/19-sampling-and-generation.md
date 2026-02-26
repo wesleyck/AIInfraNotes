@@ -6,6 +6,18 @@
 >
 > **核心组件**: SamplingParams, SamplingBatchInfo, LogitsProcessor, Sampler, PenaltyLib
 
+## 本章定位
+- 主题范围: 采样参数、惩罚与采样器。
+
+## 设计 Why（为什么这么设计）
+- 采样链路决定可控性与质量，也影响吞吐。
+- 核心取舍: 吞吐 vs 时延、显存 vs 计算、通用性 vs 特化。
+
+## 阅读建议（进阶）
+1. 先抓目标函数和边界条件，再读具体实现。
+2. 先看调用链和状态变化，再看局部优化细节。
+3. 源码锚点以“路径 + 类/函数”为主，避免依赖易漂移行号。
+
 ## 1. 概览
 
 采样（Sampling）是 LLM 推理中从 logits 到 token 的最后一环。SGLang 实现了完整的采样管道：
@@ -20,16 +32,16 @@ flowchart LR
 ```
 
 **核心文件**:
-- `srt/sampling/sampling_params.py` — 采样参数定义
-- `srt/sampling/sampling_batch_info.py` — 批次级采样状态
+- `python/sglang/srt/sampling/sampling_params.py` — 采样参数定义
+- `python/sglang/srt/sampling/sampling_batch_info.py` — 批次级采样状态
 - `srt/sampling/penaltylib/` — 惩罚机制 (频率/存在/最小长度)
-- `srt/sampling/custom_logit_processor.py` — 自定义 logit 处理器
-- `srt/layers/logits_processor.py` — LogitsProcessor 层
-- `srt/layers/sampler.py` — Sampler 实现
+- `python/sglang/srt/sampling/custom_logit_processor.py` — 自定义 logit 处理器
+- `python/sglang/srt/layers/logits_processor.py` — LogitsProcessor 层
+- `python/sglang/srt/layers/sampler.py` — Sampler 实现
 
 ## 2. SamplingParams
 
-**文件**: `srt/sampling/sampling_params.py`
+**文件**: `python/sglang/srt/sampling/sampling_params.py`
 
 每个请求携带一个 `SamplingParams` 实例，定义该请求的采样行为。
 
@@ -99,7 +111,7 @@ TOP_K_ALL = 1 << 30  # 1,073,741,824，表示"不限制 top-k"
 
 ## 3. SamplingBatchInfo
 
-**文件**: `srt/sampling/sampling_batch_info.py`
+**文件**: `python/sglang/srt/sampling/sampling_batch_info.py`
 
 将多个请求的 `SamplingParams` 批量化为张量，供 GPU 并行处理。
 
@@ -279,7 +291,7 @@ orchestrator.release()
 
 ## 5. LogitsProcessor
 
-**文件**: `srt/layers/logits_processor.py`
+**文件**: `python/sglang/srt/layers/logits_processor.py`
 
 负责将模型的 hidden states 转换为 logits。
 
@@ -341,7 +353,7 @@ class LogitsProcessorOutput:
 
 ## 6. Sampler
 
-**文件**: `srt/layers/sampler.py`
+**文件**: `python/sglang/srt/layers/sampler.py`
 
 核心采样逻辑：从 logits 到 token ID。
 
@@ -396,7 +408,7 @@ flowchart TD
 SGLang 支持三种内置采样后端和自定义后端注册机制：
 
 ```python
-# sampler.py
+- 源码锚点: `python/sglang/srt/layers/sampler.py`
 _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
 _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 
@@ -439,7 +451,7 @@ def create_sampler(backend: Optional[str] = None) -> Sampler:
 通过 Gumbel Trick + MurmurHash3 实现可复现的采样：
 
 ```python
-# srt/layers/utils/hash.py — Triton 实现的 MurmurHash3 32-bit
+- 源码锚点: `python/sglang/srt/layers/utils/hash.py`
 # 输入: (seed, position, col_index) 三元组，每个 vocab token 有独立哈希值
 hash_val = murmur_hash32(seed, positions, col_indices)
 
@@ -458,7 +470,7 @@ token = argmax(log(probs) + gumbel_noise)
 在 TP（Tensor Parallel）多卡场景下，各 rank 独立执行 sampling，可能因浮点非确定性选择不同的 token。SGLang 通过 `all_reduce` 同步 token ID：
 
 ```python
-# sampler.py L208-220
+- 源码锚点: `python/sglang/srt/layers/sampler.py`
 if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
     torch.distributed.all_reduce(
         batch_next_token_ids,
@@ -475,7 +487,7 @@ if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
 
 ## 7. 自定义 Logit Processor
 
-**文件**: `srt/sampling/custom_logit_processor.py`
+**文件**: `python/sglang/srt/sampling/custom_logit_processor.py`
 
 用户可以通过继承 `CustomLogitProcessor` 实现自定义的 logit 修改逻辑。
 
@@ -622,7 +634,7 @@ top_k_top_p_sampling_from_logits(
 
 ## 9. compute_logprobs_only 方法
 
-**文件**: `srt/layers/sampler.py` L224-271
+**文件**: `python/sglang/srt/layers/sampler.py` L224-271
 
 `Sampler` 类除了 `forward()` 之外，还提供 `compute_logprobs_only()` 方法，用于 **prefill-only scoring** 场景（只计算 logprob，不做采样）。
 
@@ -678,7 +690,7 @@ flowchart TD
 
 确定性采样的哈希函数从简单的线性组合升级为 **MurmurHash3** 算法，显著改善了哈希质量和采样的均匀性。
 
-**文件**: `srt/layers/utils/hash.py`
+**文件**: `python/sglang/srt/layers/utils/hash.py`
 
 旧版本使用简单的乘法-异或组合：
 ```python
@@ -700,11 +712,11 @@ def murmur_hash32(seed, positions, col_indices):
 - 使用标准 MurmurHash3 算法，雪崩效应更好（输入微小变化导致输出完全不同）
 - Triton kernel 实现，GPU 上高效并行
 - 输入扩展为 `(seed, position, col_index)` 三元组，每个 vocab token 有独立哈希值
-- `sampling_batch_info.py` 中 `sampling_seed` 字段配合 `enable_deterministic_inference` 全局开关使用
+- `python/sglang/srt/sampling/sampling_batch_info.py` 中 `sampling_seed` 字段配合 `enable_deterministic_inference` 全局开关使用
 
 ### 11.2 自定义 Logit Processor 更新
 
-**文件**: `srt/sampling/custom_logit_processor.py`
+**文件**: `python/sglang/srt/sampling/custom_logit_processor.py`
 
 新增了多个内置 `ThinkingBudgetLogitProcessor` 子类，覆盖更多推理模型：
 
@@ -722,3 +734,16 @@ def murmur_hash32(seed, positions, col_indices):
 ## 12. 下一步
 
 - **20**: 约束生成 (Grammar Backends, JSON Schema, Regex)
+
+## 与其他章节关系
+- 受 `20/21` 约束并服务 `03/08`。
+
+
+## 最小可验证实验
+- 固定模型和负载，仅切换本章机制开关。
+- 记录 TTFT、TPOT、吞吐、显存峰值与回退率。
+- 总结收益场景、退化场景、推荐默认值。
+
+
+## 常见误解
+- 采样参数相互独立无顺序影响。

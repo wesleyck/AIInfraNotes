@@ -4,6 +4,18 @@
 >
 > **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存 + EPLB + MTP + 线性注意力
 
+## 本章定位
+- 主题范围: Embedding/Rerank 请求与执行。
+
+## 设计 Why（为什么这么设计）
+- Embedding/Rerank 与生成任务目标函数不同，执行路径也不同。
+- 核心取舍: 吞吐 vs 时延、显存 vs 计算、通用性 vs 特化。
+
+## 阅读建议（进阶）
+1. 先抓目标函数和边界条件，再读具体实现。
+2. 先看调用链和状态变化，再看局部优化细节。
+3. 源码锚点以“路径 + 类/函数”为主，避免依赖易漂移行号。
+
 ## 1. 概览
 
 SGLang 除了支持生成式 LLM 推理外，还原生支持 **Embedding** 和 **Rerank** 模型。这两类任务的核心区别在于：
@@ -18,7 +30,7 @@ SGLang 除了支持生成式 LLM 推理外，还原生支持 **Embedding** 和 *
 
 ### 1.1 模型类型判定
 
-**文件**: `srt/configs/model_config.py:1183`
+**文件**: `python/sglang/srt/configs/model_config.py`
 
 SGLang 通过 `is_generation_model()` 函数判定模型类型：
 
@@ -90,15 +102,15 @@ flowchart TD
 
 | 架构类 | 文件 | 类型 | 说明 |
 |--------|------|------|------|
-| `LlamaEmbeddingModel` | `models/llama_embedding.py` | Embedding | LLaMA 基础 embedding |
-| `MistralModel` | `models/llama_embedding.py` | Embedding | Mistral embedding (复用 LLaMA) |
-| `BertModel` | `models/bert.py` | Embedding | BERT 系列 (BGE, GTE 等) |
-| `Contriever` | `models/bert.py` | Embedding | Contriever (继承 BertModel) |
-| `BertForSequenceClassification` | `models/bert.py` | Rerank | BERT 交叉编码器 |
-| `CLIPModel` | `models/clip.py` | Embedding | CLIP 文本+视觉 embedding |
-| `XLMRobertaModel` | `models/roberta.py` | Embedding | 多语言 RoBERTa（支持 sparse head 条件切换 SparsePooler） |
-| `XLMRobertaForSequenceClassification` | `models/roberta.py` | Rerank | 多语言 RoBERTa reranker |
-| `Gemma2ForSequenceClassification` | `models/gemma2_reward.py` | Classification | Gemma2 分类/奖励模型 |
+| `LlamaEmbeddingModel` | `python/sglang/srt/models/llama_embedding.py` | Embedding | LLaMA 基础 embedding |
+| `MistralModel` | `python/sglang/srt/models/llama_embedding.py` | Embedding | Mistral embedding (复用 LLaMA) |
+| `BertModel` | `python/sglang/srt/models/bert.py` | Embedding | BERT 系列 (BGE, GTE 等) |
+| `Contriever` | `python/sglang/srt/models/bert.py` | Embedding | Contriever (继承 BertModel) |
+| `BertForSequenceClassification` | `python/sglang/srt/models/bert.py` | Rerank | BERT 交叉编码器 |
+| `CLIPModel` | `python/sglang/srt/models/clip.py` | Embedding | CLIP 文本+视觉 embedding |
+| `XLMRobertaModel` | `python/sglang/srt/models/roberta.py` | Embedding | 多语言 RoBERTa（支持 sparse head 条件切换 SparsePooler） |
+| `XLMRobertaForSequenceClassification` | `python/sglang/srt/models/roberta.py` | Rerank | 多语言 RoBERTa reranker |
+| `Gemma2ForSequenceClassification` | `python/sglang/srt/models/gemma2_reward.py` | Classification | Gemma2 分类/奖励模型 |
 
 ---
 
@@ -106,7 +118,7 @@ flowchart TD
 
 ### 2.1 Embedding 请求 (/v1/embeddings)
 
-**文件**: `srt/entrypoints/openai/serving_embedding.py`
+**文件**: `python/sglang/srt/entrypoints/openai/serving_embedding.py`
 
 ```mermaid
 sequenceDiagram
@@ -157,7 +169,7 @@ sequenceDiagram
 
 ### 2.2 Rerank 请求 (/v1/rerank)
 
-**文件**: `srt/entrypoints/openai/serving_rerank.py`
+**文件**: `python/sglang/srt/entrypoints/openai/serving_rerank.py`
 
 ```mermaid
 sequenceDiagram
@@ -205,7 +217,7 @@ Rerank 的关键区别：
 SGLang 支持多模态 embedding（如 CLIP），处理流程：
 
 ```python
-# serving_embedding.py:_convert_to_internal_request
+- 源码锚点: `python/sglang/srt/entrypoints/openai/serving_embedding.py`
 if isinstance(prompt[0], MultimodalEmbeddingInput):
     texts, images = [], []
     for item in prompt:
@@ -220,7 +232,7 @@ if isinstance(prompt[0], MultimodalEmbeddingInput):
 
 ## 3. EmbeddingReqInput 数据结构
 
-**文件**: `srt/managers/io_struct.py:791`
+**文件**: `python/sglang/srt/managers/io_struct.py`
 
 ```python
 class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
@@ -312,7 +324,7 @@ flowchart TD
 
 ### 4.1 Pooler
 
-**文件**: `srt/layers/pooler.py:28`
+**文件**: `python/sglang/srt/layers/pooler.py`
 
 ```python
 class Pooler(nn.Module):
@@ -347,7 +359,7 @@ class Pooler(nn.Module):
 
 ### 4.2 CrossEncodingPooler
 
-**文件**: `srt/layers/pooler.py:81`
+**文件**: `python/sglang/srt/layers/pooler.py`
 
 用于 Rerank 模型，将 hidden_states 转换为相关性分数：
 
@@ -379,7 +391,7 @@ class CrossEncodingPooler(nn.Module):
 
 ### 4.3 SparsePooler
 
-**文件**: `srt/layers/sparse_pooler.py:16`
+**文件**: `python/sglang/srt/layers/sparse_pooler.py`
 
 用于稀疏检索模型（如 SPLADE），在词表空间生成稀疏向量：
 
@@ -425,7 +437,7 @@ class SparsePooler(nn.Module):
 
 ### 5.1 LlamaEmbeddingModel
 
-**文件**: `srt/models/llama_embedding.py:14`
+**文件**: `python/sglang/srt/models/llama_embedding.py`
 
 最简单的 embedding 模型实现，复用生成式 LlamaModel 的 transformer 层：
 
@@ -457,7 +469,7 @@ flowchart LR
 
 ### 5.2 BertModel 系列
 
-**文件**: `srt/models/bert.py`
+**文件**: `python/sglang/srt/models/bert.py`
 
 BERT 实现是最复杂的 embedding 模型，具有以下特点：
 
@@ -531,13 +543,13 @@ flowchart TD
 #### 5.2.4 模型入口
 
 ```python
-# bert.py 末尾
+- 源码锚点: `python/sglang/srt/models/bert.py`
 EntryClass = [BertModel, Contriever, BertForSequenceClassification]
 ```
 
 ### 5.3 CLIPModel
 
-**文件**: `srt/models/clip.py:393`
+**文件**: `python/sglang/srt/models/clip.py`
 
 CLIP 模型同时支持文本和视觉 embedding：
 
@@ -558,12 +570,12 @@ CLIP 使用 **CLS pooling**（取第一个 token）而非 LAST pooling，并将 
 
 ## 6. ModelRunner 集成
 
-**文件**: `srt/model_executor/model_runner.py`
+**文件**: `python/sglang/srt/model_executor/model_runner.py`
 
 ModelRunner 通过 `is_generation` 标志来区分路径：
 
 ```python
-# model_runner.py:1947 (forward_extend)
+- 源码锚点: `python/sglang/srt/model_executor/model_runner.py`
 if not self.is_generation:
     kwargs["get_embedding"] = True
 
@@ -584,12 +596,12 @@ Embedding 路径的关键区别：
 
 ## 7. Scheduler 差异
 
-**文件**: `srt/managers/scheduler.py`
+**文件**: `python/sglang/srt/managers/scheduler.py`
 
 ### 7.1 请求处理
 
 ```python
-# scheduler.py:1027 - 请求分发
+- 源码锚点: `python/sglang/srt/managers/scheduler.py`
 (TokenizedEmbeddingReqInput, self.handle_embedding_request),
 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
 ```
@@ -736,16 +748,29 @@ curl http://localhost:30000/v1/rerank \
 
 | 文件 | 说明 |
 |------|------|
-| `srt/layers/pooler.py` | Pooler, CrossEncodingPooler |
-| `srt/layers/sparse_pooler.py` | SparsePooler |
-| `srt/entrypoints/openai/serving_embedding.py` | /v1/embeddings 处理 |
-| `srt/entrypoints/openai/serving_rerank.py` | /v1/rerank 处理 |
-| `srt/managers/io_struct.py:791` | EmbeddingReqInput 数据结构 |
-| `srt/configs/model_config.py:1183` | is_generation_model() |
-| `srt/models/llama_embedding.py` | LlamaEmbeddingModel |
-| `srt/models/bert.py` | BertModel, BertForSequenceClassification |
-| `srt/models/clip.py` | CLIPModel |
-| `srt/models/roberta.py` | XLMRobertaModel, XLMRobertaForSequenceClassification |
-| `srt/models/gemma2_reward.py` | Gemma2ForSequenceClassification |
-| `srt/model_executor/model_runner.py` | get_embedding=True 路径 |
-| `srt/managers/scheduler.py` | handle_embedding_request |
+| `python/sglang/srt/layers/pooler.py` | Pooler, CrossEncodingPooler |
+| `python/sglang/srt/layers/sparse_pooler.py` | SparsePooler |
+| `python/sglang/srt/entrypoints/openai/serving_embedding.py` | /v1/embeddings 处理 |
+| `python/sglang/srt/entrypoints/openai/serving_rerank.py` | /v1/rerank 处理 |
+| `python/sglang/srt/managers/io_struct.py` | EmbeddingReqInput 数据结构 |
+| `python/sglang/srt/configs/model_config.py` | is_generation_model() |
+| `python/sglang/srt/models/llama_embedding.py` | LlamaEmbeddingModel |
+| `python/sglang/srt/models/bert.py` | BertModel, BertForSequenceClassification |
+| `python/sglang/srt/models/clip.py` | CLIPModel |
+| `python/sglang/srt/models/roberta.py` | XLMRobertaModel, XLMRobertaForSequenceClassification |
+| `python/sglang/srt/models/gemma2_reward.py` | Gemma2ForSequenceClassification |
+| `python/sglang/srt/model_executor/model_runner.py` | get_embedding=True 路径 |
+| `python/sglang/srt/managers/scheduler.py` | handle_embedding_request |
+
+## 与其他章节关系
+- 复用主引擎但任务目标不同。
+
+
+## 最小可验证实验
+- 固定模型和负载，仅切换本章机制开关。
+- 记录 TTFT、TPOT、吞吐、显存峰值与回退率。
+- 总结收益场景、退化场景、推荐默认值。
+
+
+## 常见误解
+- Embedding 与生成可完全复用同一策略。

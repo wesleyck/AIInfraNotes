@@ -4,6 +4,18 @@
 >
 > **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存 + EPLB + MTP + 线性注意力
 
+## 本章定位
+- 主题范围: TP/DP/PP/EP 等并行组合。
+
+## 设计 Why（为什么这么设计）
+- 并行策略本质是通信开销与计算收益的边界管理。
+- 核心取舍: 吞吐 vs 时延、显存 vs 计算、通用性 vs 特化。
+
+## 阅读建议（进阶）
+1. 先抓目标函数和边界条件，再读具体实现。
+2. 先看调用链和状态变化，再看局部优化细节。
+3. 源码锚点以“路径 + 类/函数”为主，避免依赖易漂移行号。
+
 ## 1. 概览
 
 SGLang 支持多种并行策略来扩展大型模型的推理能力：
@@ -55,11 +67,11 @@ flowchart TB
 | **Context Parallelism** | CP | 序列长度 | 长序列 | ring attention |
 
 **核心文件**:
-- `srt/distributed/parallel_state.py` - 进程组管理、GroupCoordinator
-- `srt/layers/linear.py` - TP 层实现 (`ColumnParallelLinear` / `RowParallelLinear`)
-- `srt/layers/dp_attention.py` - DP Attention 核心实现
-- `srt/managers/data_parallel_controller.py` - DP 控制器
-- `srt/layers/model_parallel.py` - TransformersForCausalLM bridge 的 TP 适配
+- `python/sglang/srt/distributed/parallel_state.py` - 进程组管理、GroupCoordinator
+- `python/sglang/srt/layers/linear.py` - TP 层实现 (`ColumnParallelLinear` / `RowParallelLinear`)
+- `python/sglang/srt/layers/dp_attention.py` - DP Attention 核心实现
+- `python/sglang/srt/managers/data_parallel_controller.py` - DP 控制器
+- `python/sglang/srt/layers/model_parallel.py` - TransformersForCausalLM bridge 的 TP 适配
 
 ## 2. Tensor Parallelism (TP)
 
@@ -95,7 +107,7 @@ flowchart LR
 | **Row Parallel** | 按行切分 `W[:N/TP, :]` | all-reduce | 层后 (必须) |
 
 ```python
-# layers/linear.py — 主要 TP 实现
+- 源码锚点: `python/sglang/srt/layers/linear.py`
 class ColumnParallelLinear(LinearBase):       # L277
     """列并行: Y = X @ A, A 按第二维切分为 [A_1, ..., A_p]
     每个 GPU 持有 output_size // tp_size 列，输出可选 all-gather 拼接"""
@@ -111,7 +123,7 @@ class RowParallelLinear(LinearBase):          # L1280
         # 权重 shape: [output_size, input_size_per_partition]
 ```
 
-> **注**: `layers/model_parallel.py` 中的 `ColwiseParallelSharded` / `RowwiseParallelMaybeWait` 仅用于 `TransformersForCausalLM` bridge（HuggingFace 模型自动适配），不是 SGLang 原生模型的 TP 实现。
+> **注**: `python/sglang/srt/layers/model_parallel.py` 中的 `ColwiseParallelSharded` / `RowwiseParallelMaybeWait` 仅用于 `TransformersForCausalLM` bridge（HuggingFace 模型自动适配），不是 SGLang 原生模型的 TP 实现。
 
 ### 2.3 典型切分策略 (Qwen3 为例)
 
@@ -127,7 +139,7 @@ class RowParallelLinear(LinearBase):          # L1280
 ### 2.4 进程组初始化
 
 ```python
-# parallel_state.py:1595
+- 源码锚点: `python/sglang/srt/distributed/parallel_state.py`
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     expert_model_parallel_size: int = 1,
@@ -144,7 +156,7 @@ def initialize_model_parallel(
     TP Groups: [g0,g1], [g2,g3], [g4,g5], [g6,g7]
     PP Groups: [g0,g2,g4,g6], [g1,g3,g5,g7]
     """
-    # 创建 TP 组 (L1661-1685)
+    # 创建 TP 组 
     num_tp_groups = world_size // tensor_model_parallel_size
     for i in range(num_tp_groups):
         ranks = list(range(i * tp_size, (i + 1) * tp_size))
@@ -155,7 +167,7 @@ def initialize_model_parallel(
 
 ## 3. GroupCoordinator (通信抽象)
 
-**文件**: `parallel_state.py:175`
+**文件**: `python/sglang/srt/distributed/parallel_state.py`
 
 `GroupCoordinator` 是 SGLang 的核心通信抽象，封装了多种后端。
 
@@ -184,7 +196,7 @@ graph TD
 ### 3.2 all-reduce 路由
 
 ```python
-# parallel_state.py:529 (简化路由逻辑，实际代码更复杂)
+- 源码锚点: `python/sglang/srt/distributed/parallel_state.py`
 def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
     if self.world_size == 1:
         return input_                                    # 单卡直接返回
@@ -339,13 +351,13 @@ tp_size = moe_dp_size × ep_size × moe_tp_size
 Rank layout (从外到内): `Global(TP) → MOE_DP → EP → MOE_TP`
 
 ```python
-# parallel_state.py — MoE 并行维度计算
+- 源码锚点: `python/sglang/srt/distributed/parallel_state.py`
 moe_ep_size = expert_model_parallel_size          # ep_size
 moe_dp_size = moe_data_model_parallel_size        # moe_dp_size
 moe_tp_size = tp_size // moe_ep_size // moe_dp_size
 ```
 
-**约束条件** (`server_args.py:2100`):
+**约束条件** (`python/sglang/srt/server_args.py`):
 ```python
 assert ep_size * moe_dp_size <= tp_size
 # 当 ep_size > 1 时，必须严格相等:
@@ -356,7 +368,7 @@ if ep_size > 1:
 ### 5.3 EP 组初始化
 
 ```python
-# parallel_state.py:1799-1822 — MOE_EP 组
+- 源码锚点: `python/sglang/srt/distributed/parallel_state.py`
 if moe_ep_size == tensor_model_parallel_size:
     _MOE_EP = _TP  # EP 组与 TP 组相同
 else:
@@ -372,8 +384,8 @@ else:
                 group_ranks.append(ranks)
     _MOE_EP = init_model_parallel_group(group_ranks, group_name="moe_ep")
 
-# parallel_state.py:1777-1797 — MOE_DP 组
-# parallel_state.py:1824-1848 — MOE_TP 组
+- 源码锚点: `python/sglang/srt/distributed/parallel_state.py`
+- 源码锚点: `python/sglang/srt/distributed/parallel_state.py`
 ```
 
 **示例**: `tp=8, ep=4, moe_dp=2` → `moe_tp_size = 8 // 4 // 2 = 1`
@@ -433,7 +445,7 @@ graph TB
 
 ### 6.2 负载均衡策略
 
-**文件**: `data_parallel_controller.py:70`
+**文件**: `python/sglang/srt/managers/data_parallel_controller.py`
 
 ```python
 class LoadBalanceMethod(Enum):
@@ -443,7 +455,7 @@ class LoadBalanceMethod(Enum):
     TOTAL_TOKENS = auto()           # 路由到总 token 数最少的 DP rank
 ```
 
-`DPBudget` 类 (L87) 维护每个 DP rank 的实时负载（请求数 + token 数），`TOTAL_REQUESTS` 和 `TOTAL_TOKENS` 基于此做调度决策。
+`DPBudget` 类  维护每个 DP rank 的实时负载（请求数 + token 数），`TOTAL_REQUESTS` 和 `TOTAL_TOKENS` 基于此做调度决策。
 
 ### 6.3 启动 DP
 
@@ -459,7 +471,7 @@ python -m sglang.launch_server --model-path ... \
 
 ## 7. DP Attention (Data Parallel Attention)
 
-**文件**: `srt/layers/dp_attention.py` (577 行)
+**文件**: `python/sglang/srt/layers/dp_attention.py` (577 行)
 
 DP Attention 是 SGLang 的高级优化技术，将 TP 组拆分为 Attention TP + Attention DP，在保持模型并行的同时提升吞吐。
 
@@ -505,7 +517,7 @@ flowchart TB
 ### 7.2 核心原理
 
 ```python
-# dp_attention.py:230
+- 源码锚点: `python/sglang/srt/layers/dp_attention.py`
 def compute_dp_attention_world_info(
     enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size: int = 1
 ):
@@ -567,7 +579,7 @@ sequenceDiagram
 ### 7.4 Padding 模式
 
 ```python
-# dp_attention.py:50
+- 源码锚点: `python/sglang/srt/layers/dp_attention.py`
 class DpPaddingMode(IntEnum):
     MAX_LEN = auto()  # Padding 到最大长度, 用 all_gather_into_tensor
     SUM_LEN = auto()  # Padding 到总长度, 用 all_reduce
@@ -658,7 +670,7 @@ CP 是 Attention 并行维度的一部分，与 DP Attention 共存于同一 TP 
 attn_tp_size = tp_size // attn_dp_size // attn_cp_size
 ```
 
-**进程组初始化** (`parallel_state.py:1710-1738`):
+**进程组初始化** (`python/sglang/srt/distributed/parallel_state.py`):
 
 ```python
 # ATTN_CP 组: 同一 DP rank、同一 attn_tp_rank 的 rank 组成 CP 组
@@ -698,7 +710,7 @@ PD-Multiplexing 是一种在**同一组 GPU** 上同时处理 Prefill 和 Decode
 
 ### 8.2 动态 TP Group 切换
 
-**文件**: `parallel_state.py` — `_PDMUX_PREFILL_TP_GROUP` 在 `initialize_model_parallel()` 中通过 `duplicate_tp_group=True` 创建 (L1687-1704)
+**文件**: `python/sglang/srt/distributed/parallel_state.py` — `_PDMUX_PREFILL_TP_GROUP` 在 `initialize_model_parallel()` 中通过 `duplicate_tp_group=True` 创建 
 
 ```python
 # duplicate GroupCoordinator for prefill in PD-Multiplexing
@@ -722,12 +734,12 @@ def get_tp_group() -> GroupCoordinator:
 
 ### 8.3 调度循环
 
-**文件**: `srt/multiplex/multiplexing_mixin.py` (通过 `SchedulerMultiplexMixin` 混入 Scheduler)
+**文件**: `python/sglang/srt/multiplex/multiplexing_mixin.py` (通过 `SchedulerMultiplexMixin` 混入 Scheduler)
 
 PD-Multiplexing 使用独立的 CUDA Stream 分别执行 Prefill 和 Decode：
 
 ```python
-# multiplexing_mixin.py (简化)
+- 源码锚点: `python/sglang/srt/multiplex/multiplexing_mixin.py`
 while True:
     with torch.cuda.stream(decode_stream):
         set_pdmux_status(False)          # Decode 使用默认 TP Group
@@ -748,17 +760,17 @@ while True:
         # 继续 prefill forward...
 ```
 
-配合 `ForwardMode.SPLIT_PREFILL` 使用，该模式在 `forward_batch_info.py` 中定义，被视为 extend 的一种变体。
+配合 `ForwardMode.SPLIT_PREFILL` 使用，该模式在 `python/sglang/srt/model_executor/forward_batch_info.py` 中定义，被视为 extend 的一种变体。
 
 ### 8.4 约束条件
 
 ```python
-# server_args.py:5184-5197 中的限制
+- 源码锚点: `python/sglang/srt/server_args.py`
 assert self.pp_size == 1,              "PD-Multiplexing 不支持 Pipeline Parallelism"
 assert self.chunked_prefill_size == -1, "PD-Multiplexing 与 Chunked Prefill 不兼容"
 assert self.disaggregation_mode == "null", "PD-Multiplexing 与 PD 分离不兼容"
 assert self.disable_overlap_schedule,  "PD-Multiplexing 与 Overlap Schedule 不兼容"
-# 注意: torch >= 2.7 时会有性能退化警告 (CUDA Green Context 兼容性问题)
+# 注意: torch > 2.6.x 时会有性能退化警告 (CUDA Green Context 兼容性问题)
 ```
 
 ### 8.5 启用方式
@@ -877,19 +889,19 @@ Qwen3.5 等 MoE 模型在 EP 场景下需要动态负载均衡。EPLB 通过监�
 
 | 文件 | 说明 |
 |------|------|
-| `eplb_manager.py` | EPLB 管理器 |
-| `expert_distribution.py` | 专家分布统计 |
-| `expert_location.py` | 专家位置数据结构 |
-| `expert_location_dispatch.py` | 专家位置调度 |
-| `expert_location_updater.py` | 专家位置更新 |
-| `eplb_algorithms/deepseek.py` | DeepSeek EPLB 算法 |
-| `eplb_algorithms/deepseek_vec.py` | DeepSeek 向量化 EPLB |
-| `eplb_algorithms/elasticity_aware.py` | 弹性感知 EPLB |
-| `eplb_simulator/reader.py` | EPLB 模拟器 |
+| `python/sglang/srt/eplb/eplb_manager.py` | EPLB 管理器 |
+| `python/sglang/srt/eplb/expert_distribution.py` | 专家分布统计 |
+| `python/sglang/srt/eplb/expert_location.py` | 专家位置数据结构 |
+| `python/sglang/srt/eplb/expert_location_dispatch.py` | 专家位置调度 |
+| `python/sglang/srt/eplb/expert_location_updater.py` | 专家位置更新 |
+| `python/sglang/srt/eplb/eplb_algorithms/deepseek.py` | DeepSeek EPLB 算法 |
+| `python/sglang/srt/eplb/eplb_algorithms/deepseek_vec.py` | DeepSeek 向量化 EPLB |
+| `python/sglang/srt/eplb/eplb_algorithms/elasticity_aware.py` | 弹性感知 EPLB |
+| `python/sglang/srt/eplb/eplb_simulator/reader.py` | EPLB 模拟器 |
 
 ## 13. Elastic EP
 
-**文件**: `srt/elastic_ep/elastic_ep.py`
+**文件**: `python/sglang/srt/elastic_ep/elastic_ep.py`
 
 弹性专家并行，支持动态调整 EP 的并行度。
 
@@ -901,12 +913,12 @@ Qwen3.5 等 MoE 模型在 EP 场景下需要动态负载均衡。EPLB 通过监�
 
 | 文件 | 说明 |
 |------|------|
-| `config.py` | DLLM 配置 |
-| `algorithm/base.py` | 算法基类 |
-| `algorithm/joint_threshold.py` | 联合阈值算法 |
-| `algorithm/low_confidence.py` | 低置信度算法 |
-| `mixin/req.py` | 请求 Mixin |
-| `mixin/scheduler.py` | 调度器 Mixin |
+| `python/sglang/srt/dllm/config.py` | DLLM 配置 |
+| `python/sglang/srt/dllm/algorithm/base.py` | 算法基类 |
+| `python/sglang/srt/dllm/algorithm/joint_threshold.py` | 联合阈值算法 |
+| `python/sglang/srt/dllm/algorithm/low_confidence.py` | 低置信度算法 |
+| `python/sglang/srt/dllm/mixin/req.py` | 请求 Mixin |
+| `python/sglang/srt/dllm/mixin/scheduler.py` | 调度器 Mixin |
 
 ## 15. Token Dispatcher 多后端
 
@@ -914,15 +926,28 @@ Qwen3.5 等 MoE 模型在 EP 场景下需要动态负载均衡。EPLB 通过监�
 
 | 后端 | 文件 | 说明 |
 |------|------|------|
-| DeepEP | `deepep.py` | DeepEP 通信后端 |
-| FuseEP | `fuseep.py` | 融合 EP 后端 (Ascend NPU) |
-| Mooncake | `mooncake.py` | Mooncake 通信后端 |
-| MoriEP | `moriep.py` | Mori EP 后端 |
-| FlashInfer | `flashinfer.py` | FlashInfer 后端 |
-| Standard | `standard.py` | 标准后端 |
-| FlashInfer Utils | `flashinfer_utils.py` | FlashInfer 工具函数 |
+| DeepEP | `python/sglang/srt/layers/moe/token_dispatcher/deepep.py` | DeepEP 通信后端 |
+| FuseEP | `python/sglang/srt/layers/moe/token_dispatcher/fuseep.py` | 融合 EP 后端 (Ascend NPU) |
+| Mooncake | `python/sglang/srt/layers/moe/token_dispatcher/mooncake.py` | Mooncake 通信后端 |
+| MoriEP | `python/sglang/srt/layers/moe/token_dispatcher/moriep.py` | Mori EP 后端 |
+| FlashInfer | `python/sglang/srt/layers/moe/token_dispatcher/flashinfer.py` | FlashInfer 后端 |
+| Standard | `python/sglang/srt/layers/moe/token_dispatcher/standard.py` | 标准后端 |
+| FlashInfer Utils | `python/sglang/srt/layers/moe/token_dispatcher/flashinfer_utils.py` | FlashInfer 工具函数 |
 
 ## 16. 下一步
 
 - **14**: PD 分离 (Prefill-Decode Disaggregation)
 - **15**: sgl-kernel 架构
+
+## 与其他章节关系
+- 横切 `03/08/14/15`。
+
+
+## 最小可验证实验
+- 固定模型和负载，仅切换本章机制开关。
+- 记录 TTFT、TPOT、吞吐、显存峰值与回退率。
+- 总结收益场景、退化场景、推荐默认值。
+
+
+## 常见误解
+- 并行度越高越快。

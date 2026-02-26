@@ -6,6 +6,18 @@
 >
 > **核心组件**: ReasoningParser, FunctionCallParser, BaseFormatDetector, StructuralTag
 
+## 本章定位
+- 主题范围: Reasoning/Function Call 解析链路。
+
+## 设计 Why（为什么这么设计）
+- 流式解析必须依赖增量状态机保证结构正确性。
+- 核心取舍: 吞吐 vs 时延、显存 vs 计算、通用性 vs 特化。
+
+## 阅读建议（进阶）
+1. 先抓目标函数和边界条件，再读具体实现。
+2. 先看调用链和状态变化，再看局部优化细节。
+3. 源码锚点以“路径 + 类/函数”为主，避免依赖易漂移行号。
+
 ## 1. 概览
 
 SGLang 提供两个独立但可协作的解析系统，处理思维链 (Chain-of-Thought) 推理和函数/工具调用：
@@ -20,16 +32,16 @@ flowchart TD
 ```
 
 **核心文件**:
-- `srt/parser/reasoning_parser.py` — 推理内容解析器
-- `srt/function_call/function_call_parser.py` — 函数调用解析器
-- `srt/function_call/base_format_detector.py` — 函数调用检测器基类
-- `srt/function_call/core_types.py` — 核心数据类型
-- `srt/entrypoints/openai/serving_chat.py` — serving 层集成
-- `srt/constrained/reasoner_grammar_backend.py` — Reasoner Grammar 包装器
+- `python/sglang/srt/parser/reasoning_parser.py` — 推理内容解析器
+- `python/sglang/srt/function_call/function_call_parser.py` — 函数调用解析器
+- `python/sglang/srt/function_call/base_format_detector.py` — 函数调用检测器基类
+- `python/sglang/srt/function_call/core_types.py` — 核心数据类型
+- `python/sglang/srt/entrypoints/openai/serving_chat.py` — serving 层集成
+- `python/sglang/srt/constrained/reasoner_grammar_backend.py` — Reasoner Grammar 包装器
 
 ## 2. ReasoningParser 架构
 
-**文件**: `srt/parser/reasoning_parser.py`
+**文件**: `python/sglang/srt/parser/reasoning_parser.py`
 
 ### 2.1 类体系
 
@@ -126,12 +138,12 @@ flowchart TD
 
 ### 2.5 StreamingParseResult (推理解析)
 
-**文件**: `srt/parser/reasoning_parser.py`
+**文件**: `python/sglang/srt/parser/reasoning_parser.py`
 
-> **注意**: 此类与 `srt/function_call/core_types.py` 中的同名类是**两个不同的类**。推理解析版本是普通类，包含 `normal_text` + `reasoning_text`；函数调用版本是 Pydantic `BaseModel`，包含 `normal_text` + `calls`。
+> **注意**: 此类与 `python/sglang/srt/function_call/core_types.py` 中的同名类是**两个不同的类**。推理解析版本是普通类，包含 `normal_text` + `reasoning_text`；函数调用版本是 Pydantic `BaseModel`，包含 `normal_text` + `calls`。
 
 ```python
-# srt/parser/reasoning_parser.py — 推理解析用
+- 源码锚点: `python/sglang/srt/parser/reasoning_parser.py`
 class StreamingParseResult:
     normal_text: str = ""       # 非推理内容 (会传给用户/函数调用解析)
     reasoning_text: str = ""    # 推理内容 (thinking 部分)
@@ -148,7 +160,7 @@ class StreamingParseResult:
 **MiniMaxAppendThinkDetector**: 特殊检测器，在输出前主动追加 `<think>` 标记。与其他检测器的被动检测不同，它在首次流式输出时修改文本：
 
 ```python
-# reasoning_parser.py L252-274
+- 源码锚点: `python/sglang/srt/parser/reasoning_parser.py`
 class MiniMaxAppendThinkDetector(BaseReasoningFormatDetector):
     def __init__(self, stream_reasoning=True, force_reasoning=False):
         super().__init__("<think>", "</think>", force_reasoning=force_reasoning, ...)
@@ -175,7 +187,7 @@ class MiniMaxAppendThinkDetector(BaseReasoningFormatDetector):
 
 ## 3. FunctionCallParser 架构
 
-**文件**: `srt/function_call/function_call_parser.py`
+**文件**: `python/sglang/srt/function_call/function_call_parser.py`
 
 ### 3.1 类体系
 
@@ -206,9 +218,9 @@ flowchart TD
 
 ### 3.2 核心数据类型
 
-**文件**: `srt/function_call/core_types.py`
+**文件**: `python/sglang/srt/function_call/core_types.py`
 
-> **注意**: 此处的 `StreamingParseResult` 是 Pydantic `BaseModel`，与 `srt/parser/reasoning_parser.py` 中的同名普通类不同（见 Section 2.5）。
+> **注意**: 此处的 `StreamingParseResult` 是 Pydantic `BaseModel`，与 `python/sglang/srt/parser/reasoning_parser.py` 中的同名普通类不同（见 Section 2.5）。
 
 ```python
 class ToolCallItem(BaseModel):
@@ -229,7 +241,7 @@ class StructureInfo:
 
 ### 3.3 BaseFormatDetector 流式状态管理
 
-**文件**: `srt/function_call/base_format_detector.py`
+**文件**: `python/sglang/srt/function_call/base_format_detector.py`
 
 ```python
 class BaseFormatDetector(ABC):
@@ -341,12 +353,12 @@ elif tool_choice == "required" or isinstance(tool_choice, ToolChoice):
 
 ### 4.1 supports_structural_tag() 方法
 
-**文件**: `srt/function_call/base_format_detector.py:323`
+**文件**: `python/sglang/srt/function_call/base_format_detector.py`
 
 并非所有 detector 都支持 structural_tag 格式。`BaseFormatDetector` 提供了 `supports_structural_tag()` 方法来控制此行为：
 
 ```python
-# base_format_detector.py L323-325
+- 源码锚点: `python/sglang/srt/function_call/base_format_detector.py`
 class BaseFormatDetector(ABC):
     def supports_structural_tag(self) -> bool:
         """Return True if this detector supports structural tag format."""
@@ -368,7 +380,7 @@ class BaseFormatDetector(ABC):
 在 `get_structure_constraint()` 中的使用：
 
 ```python
-# function_call_parser.py L193-205
+- 源码锚点: `python/sglang/srt/function_call/function_call_parser.py`
 def get_structure_constraint(self, tool_choice):
     if (
         self.detector.supports_structural_tag()      # 先检查 detector 是否支持
@@ -387,7 +399,7 @@ def get_structure_constraint(self, tool_choice):
 
 ## 5. Serving 层集成
 
-**文件**: `srt/entrypoints/openai/serving_chat.py`
+**文件**: `python/sglang/srt/entrypoints/openai/serving_chat.py`
 
 ### 5.1 流式处理管线
 
@@ -448,12 +460,12 @@ if function_call_parser:
 
 ### 6.1 think_end_id 注入
 
-**文件**: `srt/managers/scheduler.py:447`
+**文件**: `python/sglang/srt/managers/scheduler.py`
 
 Scheduler 初始化时，如果启用了 `reasoning_parser`，会将 think_end_token 编码为 token ID 注入 tokenizer：
 
 ```python
-# scheduler.py:447
+- 源码锚点: `python/sglang/srt/managers/scheduler.py`
 if self.server_args.reasoning_parser and self.tokenizer:
     reasoning_parser = ReasoningParser(
         model_type=self.server_args.reasoning_parser, stream_reasoning=False
@@ -469,7 +481,7 @@ if self.server_args.reasoning_parser and self.tokenizer:
 
 ### 6.2 ReasonerGrammarBackend
 
-**文件**: `srt/constrained/reasoner_grammar_backend.py`
+**文件**: `python/sglang/srt/constrained/reasoner_grammar_backend.py`
 
 包装普通 Grammar Backend，在 thinking 阶段跳过约束：
 
@@ -568,7 +580,7 @@ response = client.chat.completions.create(
 
 函数调用检测器从约 10 个扩展到 **22 个注册名**（含别名如 qwen=qwen25, glm=glm45），映射到约 **20 个独立 detector 类**，覆盖了主流推理模型的工具调用格式。
 
-**文件**: `srt/function_call/function_call_parser.py`
+**文件**: `python/sglang/srt/function_call/function_call_parser.py`
 
 ```python
 FunctionCallParser.ToolCallParserEnum = {
@@ -604,7 +616,7 @@ FunctionCallParser.ToolCallParserEnum = {
 
 ### 8.2 core_types.py 更新
 
-`core_types.py` 保持了简洁的数据模型设计，核心类型未变：
+`python/sglang/srt/function_call/core_types.py` 保持了简洁的数据模型设计，核心类型未变：
 
 ```python
 class ToolCallItem(BaseModel):
@@ -642,3 +654,16 @@ class StructureInfo:
 
 - **22**: Embedding 与 Rerank 模型 (Pooler, CrossEncodingPooler, SparsePooler)
 - **23**: LoRA 适配器支持 (S-LoRA, Punica, 多后端 SGEMM)
+
+## 与其他章节关系
+- 连接约束生成与服务层输出。
+
+
+## 最小可验证实验
+- 固定模型和负载，仅切换本章机制开关。
+- 记录 TTFT、TPOT、吞吐、显存峰值与回退率。
+- 总结收益场景、退化场景、推荐默认值。
+
+
+## 常见误解
+- 函数调用解析可以后处理一次完成。

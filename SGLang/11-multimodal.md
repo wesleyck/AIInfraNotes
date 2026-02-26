@@ -1,15 +1,27 @@
 # 11. 多模态处理 (Multimodal Processing)
 
+## 本章定位
+- 主题范围: 多模态预处理与执行交互。
+
+## 设计 Why（为什么这么设计）
+- 多模态把异构输入映射为统一执行表示，复杂度集中在入口。
+- 核心取舍: 吞吐 vs 时延、显存 vs 计算、通用性 vs 特化。
+
+## 阅读建议（进阶）
+1. 先抓目标函数和边界条件，再读具体实现。
+2. 先看调用链和状态变化，再看局部优化细节。
+3. 源码锚点以“路径 + 类/函数”为主，避免依赖易漂移行号。
+
 ## 1. 概述
 
 SGLang 的多模态系统处理图像、视频、音频等非文本输入，支持 Qwen3.5、LLaVA、InternVL 等模型。
 
-> **⚠ 同名文件区分**：本文涉及两个 `mm_utils.py`，功能完全不同：
+> **⚠ 同名文件区分**：本文涉及两个 `python/sglang/srt/managers/mm_utils.py`，功能完全不同：
 >
 > | 路径 | 职责 | 核心函数 |
 > |------|------|---------|
-> | `multimodal/mm_utils.py` | ViT DP 并行编码 | `get_dp_encoder_lb_assignment()`, `run_dp_sharded_mrope_vision_model()` |
-> | `managers/mm_utils.py` | 嵌入融合、缓存 | `embed_mm_inputs()`, `get_embedding_and_mask()`, `general_mm_embed_routine()` |
+> | `python/sglang/srt/multimodal/mm_utils.py` | ViT DP 并行编码 | `get_dp_encoder_lb_assignment()`, `run_dp_sharded_mrope_vision_model()` |
+> | `python/sglang/srt/managers/mm_utils.py` | 嵌入融合、缓存 | `embed_mm_inputs()`, `get_embedding_and_mask()`, `general_mm_embed_routine()` |
 >
 > 后文引用时均使用 **完整路径前缀** 以避免歧义。
 
@@ -33,7 +45,7 @@ flowchart TB
 ### 2.1 BaseMultimodalProcessor
 
 ```python
-# base_processor.py L174-244
+- 源码锚点: `python/sglang/srt/multimodal/processors/base_processor.py`
 class BaseMultimodalProcessor(ABC):
     """Base class for all multimodal processors."""
 
@@ -48,7 +60,7 @@ class BaseMultimodalProcessor(ABC):
         # 每帧估算 token 数 (粗略值，实际因模型和图像而异)
         self.NUM_TOKEN_PER_FRAME = 330
 
-        # 双 executor 并行处理 (L188-194)
+        # 双 executor 并行处理 
         self.io_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=int(os.environ.get("SGLANG_IO_WORKERS", 4))
         )  # ThreadPool: I/O 密集任务 (图片加载/URL 下载)
@@ -57,7 +69,7 @@ class BaseMultimodalProcessor(ABC):
             max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
         )  # ProcessPool: CPU 密集任务 (图片预处理/resize)
 
-        # 属性名 → 模态类型映射 (L197-227)
+        # 属性名 → 模态类型映射 
         self.ATTR_NAME_TO_MODALITY = {
             "pixel_values": Modality.IMAGE,
             "image_grid_thw": Modality.IMAGE,
@@ -66,7 +78,7 @@ class BaseMultimodalProcessor(ABC):
             ...  # 共 20+ 个属性映射
         }
 
-        # 特征字段名列表 (L231-236)
+        # 特征字段名列表 
         self.FEATURE_NAMES = [
             "pixel_values",           # 图像像素值
             "pixel_values_videos",    # 视频像素值
@@ -74,7 +86,7 @@ class BaseMultimodalProcessor(ABC):
             "input_features",         # 通用输入特征
         ]
 
-        # 条件初始化 CUDA IPC 内存池 (L240-244)
+        # 条件初始化 CUDA IPC 内存池 
         if SGL_USE_CUDA_IPC and not skip_mm_pool:
             self.cudaipc_mmfeature_pool = MmItemMemoryPool(...)
 ```
@@ -87,7 +99,7 @@ class BaseMultimodalProcessor(ABC):
 ### 2.2 MultimodalSpecialTokens
 
 ```python
-# base_processor.py L78-172
+- 源码锚点: `python/sglang/srt/multimodal/processors/base_processor.py`
 @dataclasses.dataclass
 class MultimodalSpecialTokens:
     """Manages special tokens for multimodal inputs."""
@@ -125,7 +137,7 @@ class MultimodalSpecialTokens:
 ### 2.3 QwenVLImageProcessor (Qwen3.5 专用)
 
 ```python
-# processors/qwen_vl.py L233-434
+- 源码锚点: `python/sglang/srt/multimodal/processors/qwen_vl.py`
 class QwenVLImageProcessor(BaseMultimodalProcessor):
     """Compatible with Qwen-VL & Qwen-Omni Series."""
 
@@ -147,7 +159,7 @@ class QwenVLImageProcessor(BaseMultimodalProcessor):
         self.min_pixels = MIN_PIXELS      # 4 * 28 * 28
         self.max_pixels = MAX_PIXELS      # 16384 * 28 * 28
 
-        # 特殊 token (qwen_vl.py L264-273)
+        # 特殊 token (qwen_vl.py)
         self.mm_tokens = MultimodalSpecialTokens(
             image_token="<|vision_start|><|image_pad|><|vision_end|>",
             image_token_id=hf_config.image_token_id,
@@ -199,7 +211,7 @@ class QwenVLImageProcessor(BaseMultimodalProcessor):
 ### 2.4 AsyncMMDataProcessor
 
 ```python
-# managers/async_mm_data_processor.py
+- 源码锚点: `python/sglang/srt/managers/async_mm_data_processor.py`
 class AsyncMMDataProcessor:
     """TokenizerManager 调用多模态处理的直接入口，异步包装器。"""
 
@@ -237,7 +249,7 @@ class AsyncMMDataProcessor:
 ### 2.5 MultimodalDataItem
 
 ```python
-# schedule_batch.py L221-334
+- 源码锚点: `python/sglang/srt/managers/schedule_batch.py`
 @dataclasses.dataclass
 class MultimodalDataItem:
     """单个模态的所有输入数据。例如 3 张图 + 1 段音频 → 2 个 MultimodalDataItem。"""
@@ -276,7 +288,7 @@ class MultimodalDataItem:
 ### 3.1 smart_resize (Qwen-VL)
 
 ```python
-# processors/qwen_vl.py L56-86
+- 源码锚点: `python/sglang/srt/multimodal/processors/qwen_vl.py`
 def smart_resize(
     height: int,
     width: int,
@@ -331,7 +343,7 @@ def _compute_grid_thw(images):
 ### 3.3 视频处理
 
 ```python
-# processors/qwen_vl.py L153-229
+- 源码锚点: `python/sglang/srt/multimodal/processors/qwen_vl.py`
 def preprocess_video(vr, image_factor=28, video_config={}):
     """Process video for Qwen-VL."""
 
@@ -359,7 +371,7 @@ def preprocess_video(vr, image_factor=28, video_config={}):
 
 ### 3.4 process_and_combine_mm_data() — 多模态数据处理核心入口
 
-`BaseMultimodalProcessor.process_and_combine_mm_data()` 是预处理阶段的核心函数（`base_processor.py` L974-1114），负责将原始多模态输入转换为统一的 `MultimodalDataItem` 列表。
+`BaseMultimodalProcessor.process_and_combine_mm_data()` 是预处理阶段的核心函数（`python/sglang/srt/multimodal/processors/base_processor.py` L974-1114），负责将原始多模态输入转换为统一的 `MultimodalDataItem` 列表。
 
 ```python
 def process_and_combine_mm_data(
@@ -372,18 +384,18 @@ def process_and_combine_mm_data(
 
 处理流程分为 4 个阶段：
 
-1. **按模态分类**（L998-1012）：将输入分为 `raw_images`、`raw_videos`、`raw_audios` 和 `dict_items`（预计算 embedding 或 processor_output 格式）
+1. **按模态分类**：将输入分为 `raw_images`、`raw_videos`、`raw_audios` 和 `dict_items`（预计算 embedding 或 processor_output 格式）
 
-2. **原始数据处理**（L1014-1025）：调用 `_process_and_collect_mm_items()` 执行 HuggingFace AutoProcessor，生成 `pixel_values`、`input_ids` 等
+2. **原始数据处理**：调用 `_process_and_collect_mm_items()` 执行 HuggingFace AutoProcessor，生成 `pixel_values`、`input_ids` 等
 
-3. **字典格式处理**（L1027-1045）：处理两种特殊输入格式
+3. **字典格式处理**：处理两种特殊输入格式
    - `processor_output`：已经过 HF processor 的数据，直接收集
    - `precomputed_embedding`：预计算的 embedding，跳过 VIT 编码
 
-4. **CUDA IPC 包装**（L1071-1114）：当 `SGL_USE_CUDA_IPC=1` 时，将 GPU tensor 包装为 `CudaIpcTensorTransportProxy`，实现跨进程零拷贝传输
+4. **CUDA IPC 包装**：当 `SGL_USE_CUDA_IPC=1` 时，将 GPU tensor 包装为 `CudaIpcTensorTransportProxy`，实现跨进程零拷贝传输
 
 ```python
-# base_processor.py L1071-1112 — CUDA IPC 分支
+- 源码锚点: `python/sglang/srt/multimodal/processors/base_processor.py`
 if SGL_USE_CUDA_IPC:
     for item in all_collected_items:
         if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
@@ -409,7 +421,7 @@ if SGL_USE_CUDA_IPC:
 ### 4.1 缓存机制
 
 ```python
-# mem_cache/multimodal_cache.py
+- 源码锚点: `python/sglang/srt/mem_cache/multimodal_cache.py`
 class MultimodalCache(ABC):
     """Abstract base for multimodal embedding cache."""
 
@@ -458,7 +470,7 @@ class MultiModalStaticCache(MultimodalCache):
 缓存的 get/set 发生在 **模型 forward 阶段**（而非 Scheduler 调度阶段）。入口是 `get_embedding_and_mask()`，它依次尝试两种路径：
 
 ```python
-# managers/mm_utils.py L858-867 — get_embedding_and_mask()
+- 源码锚点: `python/sglang/srt/managers/mm_utils.py`
 # 1. 优先尝试预计算 embedding（来自 precomputed_embedding 格式的输入）
 embedding = _get_precomputed_embedding(
     embedding_items, prefix_length, extend_length, items_offset_list
@@ -474,7 +486,7 @@ if embedding is None:
 当前实际调用的缓存路径是 `_get_chunked_prefill_embedding()`：
 
 ```python
-# managers/mm_utils.py L563-574 — _get_chunked_prefill_embedding()
+- 源码锚点: `python/sglang/srt/managers/mm_utils.py`
 item_hashes = [item.hash for item in embedding_items_per_req]
 embedding_items_hash = MultiModalStaticCache.combine_hashes(item_hashes)
 
@@ -491,8 +503,8 @@ if embedding_per_req is None:
 
 | 函数 | 行号 | 状态 | Cache 设备 |
 |------|------|------|-----------|
-| `_get_chunked_prefill_embedding()` | mm_utils.py L551 | 当前默认，标记 `TODO: To be obsoleted` | GPU |
-| `_get_chunked_prefill_embedding_for_chunked_items()` | mm_utils.py L730 | 未来替代，当前未被调用 | CPU（`.detach().cpu()`） |
+| `_get_chunked_prefill_embedding()` | mm_utils.py | 当前默认，标记 `TODO: To be obsoleted` | GPU |
+| `_get_chunked_prefill_embedding_for_chunked_items()` | mm_utils.py | 未来替代，当前未被调用 | CPU（`.detach().cpu()`） |
 
 切换后的主要变化：
 - Cache 从 GPU 移到 CPU，释放 GPU 显存
@@ -518,13 +530,13 @@ if embedding_per_req is None:
 
 | 函数 | 位置 | Cache 存储设备 | 状态 |
 |------|------|---------------|------|
-| `_get_chunked_prefill_embedding()` | mm_utils.py L551 | **GPU**（直接存 VIT 输出 tensor） | 当前默认路径，标记 `TODO: To be obsoleted` |
-| `_get_chunked_prefill_embedding_for_chunked_items()` | mm_utils.py L730 | **CPU**（`.detach().cpu()` 后存入） | 未来路径，当前未被调用 |
+| `_get_chunked_prefill_embedding()` | mm_utils.py | **GPU**（直接存 VIT 输出 tensor） | 当前默认路径，标记 `TODO: To be obsoleted` |
+| `_get_chunked_prefill_embedding_for_chunked_items()` | mm_utils.py | **CPU**（`.detach().cpu()` 后存入） | 未来路径，当前未被调用 |
 
 **当前默认路径**（GPU cache）：
 
 ```python
-# managers/mm_utils.py L575-580 — _get_chunked_prefill_embedding()
+- 源码锚点: `python/sglang/srt/managers/mm_utils.py`
 embedding_per_req = embedding_cache.get(item_hashes)
 if embedding_per_req is None:
     embedding_per_req = data_embedding_func(embedding_items_per_req)
@@ -534,7 +546,7 @@ if embedding_per_req is None:
 **未来路径**（CPU cache，尚未启用）：
 
 ```python
-# managers/mm_utils.py L784-799 — _get_chunked_prefill_embedding_for_chunked_items()
+- 源码锚点: `python/sglang/srt/managers/mm_utils.py`
 embedding_per_chunk = embedding_cache.get(embedding_items_hash)
 if embedding_per_chunk is None:
     embedding_per_chunk = data_embedding_func(embedding_items_per_chunk)
@@ -680,7 +692,7 @@ flowchart TB
 **代码实现**：
 
 ```python
-# multimodal/mm_utils.py L466-662
+- 源码锚点: `python/sglang/srt/multimodal/mm_utils.py`
 def run_dp_sharded_mrope_vision_model(vision_model, pixel_values, grid_thw_list, rope_type):
     tp_size = get_attention_tp_size()
     tp_rank = get_attention_tp_rank()
@@ -788,7 +800,7 @@ flowchart TB
 **关键代码**：
 
 ```python
-# managers/mm_utils.py L375-380
+- 源码锚点: `python/sglang/srt/managers/mm_utils.py`
 # 全局变量: 每个进程独立
 embedding_cache: Optional[MultiModalStaticCache] = None
 
@@ -796,7 +808,7 @@ def init_mm_embedding_cache(max_size: int = 0):
     global embedding_cache
     embedding_cache = MultiModalStaticCache(max_size)  # 进程内单例
 
-# managers/scheduler.py 初始化
+- 源码锚点: `python/sglang/srt/managers/scheduler.py`
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 ```
@@ -829,7 +841,7 @@ flowchart TB
 ### 4.4 GPU Feature Buffer (预分配 GPU 缓冲区)
 
 ```python
-# managers/mm_utils.py L44-100
+- 源码锚点: `python/sglang/srt/managers/mm_utils.py`
 _GPU_FEATURE_BUFFER: Optional[torch.Tensor] = None
 _BUFFER_OFFSET = 0
 
@@ -863,10 +875,10 @@ def try_add_to_buffer(tensor: torch.Tensor) -> torch.Tensor:
 
 | 阶段 | 路径 | 机制 | 数据格式 | 源码 |
 |------|------|------|---------|------|
-| 1. TokenizerManager → Scheduler Rank 0 | ZMQ `send_pyobj` | pickle 序列化 CPU tensor | bytes over TCP/IPC | `tokenizer_manager.py` |
-| 2. Scheduler Rank 0 → 其他 TP Rank | `broadcast_pyobj()` | pickle.dumps → ByteTensor → dist.broadcast (CPU group) | bytes via CPU process group | `common.py:1268+` |
-| 3. CPU → GPU (每个 Rank) | `prepare_for_extend()` | `.to(device, non_blocking=True)` 或 CudaIpc | async H2D copy | `schedule_batch.py:1640` |
-| 4. ViT DP 输出聚合 | `get_attention_tp_group().all_gather` | NCCL all_gather | GPU tensor (GPU-to-GPU) | `multimodal/mm_utils.py:623` |
+| 1. TokenizerManager → Scheduler Rank 0 | ZMQ `send_pyobj` | pickle 序列化 CPU tensor | bytes over TCP/IPC | `python/sglang/srt/managers/tokenizer_manager.py` |
+| 2. Scheduler Rank 0 → 其他 TP Rank | `broadcast_pyobj()` | pickle.dumps → ByteTensor → dist.broadcast (CPU group) | bytes via CPU process group | `common.py+` |
+| 3. CPU → GPU (每个 Rank) | `prepare_for_extend()` | `.to(device, non_blocking=True)` 或 CudaIpc | async H2D copy | `python/sglang/srt/managers/schedule_batch.py` |
+| 4. ViT DP 输出聚合 | `get_attention_tp_group().all_gather` | NCCL all_gather | GPU tensor (GPU-to-GPU) | `python/sglang/srt/multimodal/mm_utils.py` |
 
 只有**阶段 4** 是 GPU 直连通信，前三个阶段全部经过 CPU。
 
@@ -875,7 +887,7 @@ def try_add_to_buffer(tensor: torch.Tensor) -> torch.Tensor:
 Rank 0 收到请求后需要广播给其他 TP Rank。这里使用的是 **pickle + CPU dist.broadcast**，而非 NCCL：
 
 ```python
-# utils/common.py L1268-1297
+- 源码锚点: `python/sglang/srt/utils/common.py`
 def broadcast_pyobj(data, rank, dist_group, src=0, force_cpu_device=True):
     device = torch.device("cpu")  # force_cpu_device=True (默认)
 
@@ -910,7 +922,7 @@ def broadcast_pyobj(data, rank, dist_group, src=0, force_cpu_device=True):
 每个 Rank 收到请求后，在 `prepare_for_extend()` 中将 pixel_values 从 CPU 搬到 GPU：
 
 ```python
-# managers/schedule_batch.py L1634-1645
+- 源码锚点: `python/sglang/srt/managers/schedule_batch.py`
 for mm_input in multimodal_inputs:
     if mm_input is None:
         continue
@@ -973,7 +985,7 @@ sequenceDiagram
 #### (1) CUDA IPC Transport (`SGLANG_USE_CUDA_IPC_TRANSPORT=1`)
 
 ```python
-# multimodal/processors/base_processor.py L1071-1112
+- 源码锚点: `python/sglang/srt/multimodal/processors/base_processor.py`
 if SGL_USE_CUDA_IPC:
     for item in all_collected_items:
         if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
@@ -997,7 +1009,7 @@ if SGL_USE_CUDA_IPC:
 #### (2) Keep Feature on Device (`--keep-mm-feature-on-device`)
 
 ```python
-# multimodal/processors/base_processor.py L353-362
+- 源码锚点: `python/sglang/srt/multimodal/processors/base_processor.py`
 if not self.server_args.keep_mm_feature_on_device:
     # 默认: 预处理后移到 CPU
     for feature_name in self.FEATURE_NAMES:
@@ -1014,7 +1026,7 @@ if not self.server_args.keep_mm_feature_on_device:
 启用 `enable_broadcast_mm_inputs_process` 后，`_get_multimodal_inputs()` 会检查该标志，决定走广播路径还是各 Rank 独立构建路径：
 
 ```python
-# managers/scheduler.py L1395-1461 — _get_multimodal_inputs()
+- 源码锚点: `python/sglang/srt/managers/scheduler.py`
 def _get_multimodal_inputs(self, recv_reqs):
     if self.enable_broadcast_mm_inputs_process:
         # 广播路径: entry rank 构建一次，broadcast 给其他 TP rank
@@ -1031,7 +1043,7 @@ def _get_multimodal_inputs(self, recv_reqs):
 广播路径的核心实现：
 
 ```python
-# managers/scheduler.py — _process_and_broadcast_mm_inputs()
+- 源码锚点: `python/sglang/srt/managers/scheduler.py`
 def _process_and_broadcast_mm_inputs(self, recv_reqs):
     if self.is_entry_rank:
         # TP Rank 0: 执行 CPU 密集的 MultimodalInputs.from_dict()
@@ -1059,12 +1071,12 @@ def _process_and_broadcast_mm_inputs(self, recv_reqs):
 
 ## 5. VIT CUDA Graph
 
-> **使用范围**：当前 `qwen3_vl.py`、`qwen2_5_vl.py`、`internvl.py` 和 `layers/attention/vision.py` 使用 ViT CUDA Graph。Graph key 是 `x_3d.shape[0]`（即序列长度 / patch 总数），而非 batch size。
+> **使用范围**：当前 `python/sglang/srt/models/qwen3_vl.py`、`python/sglang/srt/models/qwen2_5_vl.py`、`python/sglang/srt/models/internvl.py` 和 `python/sglang/srt/layers/attention/vision.py` 使用 ViT CUDA Graph。Graph key 是 `x_3d.shape[0]`（即序列长度 / patch 总数），而非 batch size。
 
 ### 5.1 ViTCudaGraphRunner
 
 ```python
-# multimodal/vit_cuda_graph_runner.py L29-383
+- 源码锚点: `python/sglang/srt/multimodal/vit_cuda_graph_runner.py`
 class ViTCudaGraphRunner:
     """
     Generic ViT CUDA Graph Runner.
@@ -1076,13 +1088,13 @@ class ViTCudaGraphRunner:
     def __init__(self, vit: nn.Module):
         self.vit = vit
 
-        # graph_key -> buffers / graphs (L51-54)
+        # graph_key -> buffers / graphs 
         self.block_input: Dict[Hashable, torch.Tensor] = {}
         self.block_ws: Dict[Hashable, torch.Tensor] = {}       # workspace buffer
         self.block_graphs: Dict[Hashable, torch.cuda.CUDAGraph] = {}
         self.block_output: Dict[Hashable, torch.Tensor] = {}
 
-        # captured seqlens buffers (地址必须稳定以支持 graph replay) (L57-60)
+        # captured seqlens buffers (地址必须稳定以支持 graph replay) 
         self.cu_full_len: Dict[Hashable, torch.Tensor] = {}
         self.cu_window_len: Dict[Hashable, torch.Tensor] = {}
 
@@ -1140,17 +1152,17 @@ export SGLANG_VIT_ENABLE_CUDA_GRAPH=1
 # 不支持: flashinfer (目前)
 ```
 
-> **启用判断位置**：环境变量定义在 `environ.py` L426（`EnvBool(False)`），各模型文件在 ViT forward 入口处检查：
+> **启用判断位置**：环境变量定义在 `python/sglang/srt/environ.py` L426（`EnvBool(False)`），各模型文件在 ViT forward 入口处检查：
 >
 > ```python
-> # models/qwen3_vl.py L531
+> # models/qwen3_vl.py
 > if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
 >     return self.forward_with_cuda_graph(x, grid_thw)
 >
-> # models/qwen2_5_vl.py L334
+> # models/qwen2_5_vl.py
 > self.enable_cg = _is_cuda and envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
 >
-> # layers/attention/vision.py L304, L373
+> # layers/attention/vision.py, L373
 > if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
 >     ...  # 使用 graph-compatible 的 attention 实现
 > ```
@@ -1161,15 +1173,15 @@ export SGLANG_VIT_ENABLE_CUDA_GRAPH=1
 
 ### 6.1 融合流程 (Qwen3.5)
 
-> **重要区分**：SGLang 的嵌入融合**不在**模型的 `forward()` 中直接完成（与 HuggingFace 原始实现不同）。融合逻辑位于 `managers/mm_utils.py` 的 `embed_mm_inputs()` 中，由 `general_mm_embed_routine()` 统一调用。
+> **重要区分**：SGLang 的嵌入融合**不在**模型的 `forward()` 中直接完成（与 HuggingFace 原始实现不同）。融合逻辑位于 `python/sglang/srt/managers/mm_utils.py` 的 `embed_mm_inputs()` 中，由 `general_mm_embed_routine()` 统一调用。
 
 **实际调用链**：
 
 ```
-Qwen3VLForConditionalGeneration.forward()           # models/qwen3_vl.py L990
-  └─ general_mm_embed_routine()                      # managers/mm_utils.py L1048
-       ├─ embed_mm_inputs()                          # managers/mm_utils.py L912
-       │    ├─ get_embedding_and_mask()              # managers/mm_utils.py L858
+Qwen3VLForConditionalGeneration.forward()           # models/qwen3_vl.py
+  └─ general_mm_embed_routine()                      # managers/mm_utils.py
+       ├─ embed_mm_inputs()                          # managers/mm_utils.py
+       │    ├─ get_embedding_and_mask()              # managers/mm_utils.py
        │    │    └─ data_embedding_func()            # = self.get_image_feature()
        │    │         └─ run_dp_sharded_mrope_vision_model()  # (ViT DP 时)
        │    │              或 self.visual()           # (非 DP 时)
@@ -1181,7 +1193,7 @@ Qwen3VLForConditionalGeneration.forward()           # models/qwen3_vl.py L990
 ```
 
 ```python
-# models/qwen3_vl.py L990 — 模型 forward 入口
+- 源码锚点: `python/sglang/srt/models/qwen3_vl.py`
 def forward(self, input_ids, positions, forward_batch, ...):
     if self.is_mrope_enabled:
         positions = forward_batch.mrope_positions
@@ -1196,7 +1208,7 @@ def forward(self, input_ids, positions, forward_batch, ...):
         use_deepstack=self.use_deepstack,
     )
 
-# managers/mm_utils.py L1039-1045 — 融合的核心：scatter 替换
+- 源码锚点: `python/sglang/srt/managers/mm_utils.py`
 # 4. scatter embeddings into input embedding
 for i, modality, embedding, mask in zip(...):
     if embedding is None or mask is None:
@@ -1204,7 +1216,7 @@ for i, modality, embedding, mask in zip(...):
     indices = torch.where(mask.squeeze(dim=-1))[0]
     input_embeds[indices] = embedding.to(input_embeds.device, input_embeds.dtype)
 
-# managers/mm_utils.py L1012-1014 — clamp 防止 hash 值越界
+- 源码锚点: `python/sglang/srt/managers/mm_utils.py`
 vocab_size = input_embedding.num_embeddings
 # pad_value 来自内容 hash，可能是很大的整数，会导致 embedding lookup 崩溃
 input_ids.clamp_(min=0, max=vocab_size - 1)
@@ -1248,7 +1260,7 @@ Qwen3.5 引入 **Deepstack** 机制：在 ViT 的中间层捕获特征，注入�
 #### 6.3.1 ViT 端：中间层特征捕获
 
 ```python
-# models/qwen3_vl.py L557-578
+- 源码锚点: `python/sglang/srt/models/qwen3_vl.py`
 # ViT forward 中，在指定层捕获 deepstack 特征
 for layer_num, blk in enumerate(self.blocks):
     x = blk(x, cu_seqlens=cu_seqlens, ...)
@@ -1272,7 +1284,7 @@ hidden_states = torch.cat([x] + deepstack_feature_lists, dim=1)
 #### 6.3.2 融合端：特征分离与注入
 
 ```python
-# models/qwen3_vl.py L838-846
+- 源码锚点: `python/sglang/srt/models/qwen3_vl.py`
 def separate_deepstack_embeds(self, embedding):
     separate_index = self.config.hidden_size
     input_embeds = embedding[:, :separate_index]          # 主视觉特征
@@ -1289,7 +1301,7 @@ def separate_deepstack_embeds(self, embedding):
 ### 6.4 Chunked Prefill 的 CPU Offload 机制
 
 ```python
-# managers/mm_utils.py L1108-1122 (_get_chunked_prefill_embedding 内部)
+- 源码锚点: `python/sglang/srt/managers/mm_utils.py`
 # 融合完成后，将 GPU features offload 到 CPU
 if mm_inputs_list:
     for mm_input_obj in mm_inputs_list:
@@ -1309,7 +1321,7 @@ if mm_inputs_list:
 ### 6.5 请求完成后的 MM 内存清理
 
 ```python
-# scheduler.py L1469-1479
+- 源码锚点: `python/sglang/srt/managers/scheduler.py`
 def _maybe_clear_mm_inputs(self, batch: ScheduleBatch) -> None:
     for req in batch.reqs:
         if not req.finished() or not (mm_inputs := req.multimodal_inputs):
@@ -1334,7 +1346,7 @@ def _maybe_clear_mm_inputs(self, batch: ScheduleBatch) -> None:
 ### 7.1 模态类型
 
 ```python
-# schedule_batch.py L195-213
+- 源码锚点: `python/sglang/srt/managers/schedule_batch.py`
 class Modality(Enum):
     IMAGE = auto()
     MULTI_IMAGES = auto()  # 多图场景，与 IMAGE 共享 image_token_id
@@ -1360,25 +1372,25 @@ class Modality(Enum):
 | **Qwen3.5** | 图像, 视频 | `QwenVLImageProcessor` |
 | **Qwen2.5-VL** / **Qwen2-VL** | 图像, 视频 | `QwenVLImageProcessor` |
 | **Qwen3-Omni** | 图像, 视频, 音频 | `QwenVLImageProcessor` |
-| **Qwen2-Audio** | 音频 | `qwen2_audio.py` |
-| **Gemma3** / **Gemma3n** | 图像 | `gemma3_mm.py` / `gemma3n.py` |
+| **Qwen2-Audio** | 音频 | `python/sglang/srt/models/qwen2_audio.py` |
+| **Gemma3** / **Gemma3n** | 图像 | `python/sglang/srt/models/gemma3_mm.py` / `python/sglang/srt/multimodal/processors/gemma3n.py` |
 | **LLaVA** / **LLaVA-OneVision** | 图像, 视频 | `LLaVAImageProcessor` |
 | **InternVL** / **InternVL2.5** | 图像 | `InternVLImageProcessor` |
 | **GLM-4V** | 图像 | `GLM4VImageProcessor` |
 | **MiniCPM-V** | 图像, 视频 | `MiniCPMImageProcessor` |
-| **Pixtral** | 图像 | `pixtral.py` |
+| **Pixtral** | 图像 | `python/sglang/srt/models/pixtral.py` |
 | **Phi-3.5-Vision** / **Phi-4-MM** | 图像 | `Phi4MMImageProcessor` |
-| **MLlama** | 图像 | `mllama.py` |
-| **MLlama4** | 图像 | `mllama4.py` |
-| **KimiVL** | 图像 | `kimi_vl.py` |
-| **DeepSeek-VL2** | 图像 | `deepseek_vl_v2.py` |
-| **Janus-Pro** | 图像 | `janus_pro.py` |
-| **NVILA** / **JetVLM** | 图像 | `nvila.py` |
-| **NanoNextorVL** | 图像 | `nanonextor_vl.py` |
-| **Sarashina2Vision** | 图像 | `sarashina2_vision.py` |
-| **CLIP** | 图像 (Embedding) | `clip.py` |
-| **DotSVLM** | 图像 | `dots_vlm.py` |
-| **PaddleOCR-VL** | 图像 | `paddleocr_vlm.py` |
+| **MLlama** | 图像 | `python/sglang/srt/models/mllama.py` |
+| **MLlama4** | 图像 | `python/sglang/srt/models/mllama4.py` |
+| **KimiVL** | 图像 | `python/sglang/srt/models/kimi_vl.py` |
+| **DeepSeek-VL2** | 图像 | `python/sglang/srt/multimodal/processors/deepseek_vl_v2.py` |
+| **Janus-Pro** | 图像 | `python/sglang/srt/multimodal/processors/janus_pro.py` |
+| **NVILA** / **JetVLM** | 图像 | `python/sglang/srt/models/nvila.py` |
+| **NanoNemotronVL** | 图像 | `python/sglang/srt/models/nano_nemotron_vl.py` |
+| **Sarashina2Vision** | 图像 | `python/sglang/srt/models/sarashina2_vision.py` |
+| **CLIP** | 图像 (Embedding) | `python/sglang/srt/models/clip.py` |
+| **DotSVLM** | 图像 | `python/sglang/srt/models/dots_vlm.py` |
+| **PaddleOCR-VL** | 图像 | `python/sglang/srt/multimodal/processors/paddleocr_vlm.py` |
 
 ## 8. 优化策略
 
@@ -1445,7 +1457,7 @@ flowchart TB
 启用 `--mm-enable-dp-encoder` 后，ViT 的所有层使用 `tp_size=1, tp_rank=0` 初始化，**每个 TP Rank 持有完整的 ViT 权重副本**（而非 TP 分片）：
 
 ```python
-# models/qwen3_vl.py L80-92
+- 源码锚点: `python/sglang/srt/models/qwen3_vl.py`
 class VisionMLP(nn.Module):
     def __init__(self, ..., use_data_parallel: bool = False):
         self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
@@ -1477,7 +1489,7 @@ class VisionMLP(nn.Module):
 不同图像的 patch 数量可能差异很大，简单轮询分配会导致负载不均衡：
 
 ```python
-# multimodal/mm_utils.py L362-428
+- 源码锚点: `python/sglang/srt/multimodal/mm_utils.py`
 def get_dp_encoder_lb_assignment(
     sizes: list[int],      # 每张图像的 patch 数量
     num_gpus: int = 2,     # GPU 数量 (= tp_size)
@@ -1534,7 +1546,7 @@ def get_dp_encoder_lb_assignment(
 #### 8.3.3 完整执行流程
 
 ```python
-# multimodal/mm_utils.py L466-662
+- 源码锚点: `python/sglang/srt/multimodal/mm_utils.py`
 def run_dp_sharded_mrope_vision_model(
     vision_model: torch.nn.Module,
     pixel_values: torch.Tensor,       # [total_patches, channel]
@@ -1600,7 +1612,7 @@ def run_dp_sharded_mrope_vision_model(
 EVS（[arXiv:2510.14624](https://arxiv.org/abs/2510.14624)）是一种视频 token 裁剪优化，在 ViT 编码完成后，通过计算相邻帧之间的相似度，裁剪冗余视频帧的 token。与传统的帧采样（在 ViT 之前丢弃帧）不同，EVS 在 ViT 编码之后操作，保留了视觉信息的同时减少了 LLM 需要处理的 token 数量。
 
 ```python
-# multimodal/evs/evs_module.py
+- 源码锚点: `python/sglang/srt/multimodal/evs/evs_module.py`
 @dataclass(kw_only=True)
 class EVSEmbeddingResult(EmbeddingResult):
     """ViT 编码后的裁剪结果，包含每帧保留的 token 数。"""
@@ -1619,23 +1631,23 @@ class VideoEVSDataItem(EVSDataItem):
 ```
 
 关键组件：
-- `compute_retention_mask`（`evs_core.py`）：计算每帧的保留掩码
-- `replace_offsets_with_tokens_per_frame`（`evs_core.py`）：根据裁剪结果重新分配 placeholder
+- `compute_retention_mask`（`python/sglang/srt/multimodal/evs/evs_core.py`）：计算每帧的保留掩码
+- `replace_offsets_with_tokens_per_frame`（`python/sglang/srt/multimodal/evs/evs_core.py`）：根据裁剪结果重新分配 placeholder
 - `EVSEmbeddingResult`：携带裁剪元数据的嵌入结果，下游通过 `num_tokens_per_frame` 调整 input_ids
-- `EVS` 基类（`evs_module.py`）：模型继承此类并实现 `create_evs_config()`，当 `video_pruning_rate > 0` 时自动替换 `get_video_feature()` 为 EVS 裁剪版本
+- `EVS` 基类（`python/sglang/srt/multimodal/evs/evs_module.py`）：模型继承此类并实现 `create_evs_config()`，当 `video_pruning_rate > 0` 时自动替换 `get_video_feature()` 为 EVS 裁剪版本
 
-在 `_get_chunked_prefill_embedding()` 中，当检测到 `EVSEmbeddingResult` 时会调用 `redistribute_pruned_frames_placeholders()` 重新调整 input_ids 的 placeholder 分布（`managers/mm_utils.py` L594-604）。
+在 `_get_chunked_prefill_embedding()` 中，当检测到 `EVSEmbeddingResult` 时会调用 `redistribute_pruned_frames_placeholders()` 重新调整 input_ids 的 placeholder 分布（`python/sglang/srt/managers/mm_utils.py` L594-604）。
 
 ## 9. VIT DP 完整请求生命周期
 
-> 本节从原附录提升为独立章节，提供 ViT DP 模式下完整的端到端请求处理流程参考。注意：cache 的 get/set 操作发生在 `managers/mm_utils.py` 的 `_get_chunked_prefill_embedding()` 中（model forward 阶段），Scheduler 仅通过 `init_mm_embedding_cache()` 完成初始化。
+> 本节从原附录提升为独立章节，提供 ViT DP 模式下完整的端到端请求处理流程参考。注意：cache 的 get/set 操作发生在 `python/sglang/srt/managers/mm_utils.py` 的 `_get_chunked_prefill_embedding()` 中（model forward 阶段），Scheduler 仅通过 `init_mm_embedding_cache()` 完成初始化。
 
 ### 整体流程概览
 
 ```mermaid
 flowchart TB
     subgraph Phase1["阶段 1: HTTP 请求接收"]
-        A1["FastAPI Router<br/>v1_chat_completions()"] --> A2["GenerateReqInput"]
+        A1["FastAPI Router<br/>openai_v1_chat_completions()"] --> A2["GenerateReqInput"]
         A2 --> A3["text + images[]"]
     end
 
@@ -1837,19 +1849,19 @@ flowchart TB
 
 | 阶段 | 类/文件 | 核心函数 |
 |------|---------|----------|
-| 1. 请求接收 | `v1_chat_completions.py` | `v1_chat_completions()` |
+| 1. 请求接收 | `python/sglang/srt/entrypoints/http_server.py` | `openai_v1_chat_completions()` |
 | 2. 预处理 | `QwenVLImageProcessor` | `process_mm_data_async()` |
-| 2. 预处理 | `processors/qwen_vl.py` | `smart_resize()` |
+| 2. 预处理 | `python/sglang/srt/multimodal/processors/qwen_vl.py` | `smart_resize()` |
 | 3. 调度 | `Scheduler` | `get_next_batch_to_run()`, `pad_input_ids()` |
-| 3. 调度 | `schedule_batch.py` | `prepare_for_extend()` (H2D 搬运) |
+| 3. 调度 | `python/sglang/srt/managers/schedule_batch.py` | `prepare_for_extend()` (H2D 搬运) |
 | 4. 模型前向 | `Qwen3VLForConditionalGeneration` | `forward()` |
-| 4.7 跨进程传输 | `utils/common.py` | `broadcast_pyobj()` |
-| 5. VIT 编码 + Cache | `managers/mm_utils.py` | `_get_chunked_prefill_embedding()` (cache get/set) |
-| 5. VIT DP | `multimodal/mm_utils.py` | `get_dp_encoder_lb_assignment()` |
-| 5. VIT DP | `multimodal/mm_utils.py` | `run_dp_sharded_mrope_vision_model()` |
+| 4.7 跨进程传输 | `python/sglang/srt/utils/common.py` | `broadcast_pyobj()` |
+| 5. VIT 编码 + Cache | `python/sglang/srt/managers/mm_utils.py` | `_get_chunked_prefill_embedding()` (cache get/set) |
+| 5. VIT DP | `python/sglang/srt/multimodal/mm_utils.py` | `get_dp_encoder_lb_assignment()` |
+| 5. VIT DP | `python/sglang/srt/multimodal/mm_utils.py` | `run_dp_sharded_mrope_vision_model()` |
 | 5. VIT DP | `Qwen3VLMoeVisionModel` | `forward()` |
-| 5. VIT DP | `multimodal/mm_utils.py` | `get_attention_tp_group().all_gather()` |
-| 6. 融合 | `managers/mm_utils.py` | `embed_mm_inputs()`, `general_mm_embed_routine()` |
+| 5. VIT DP | `python/sglang/srt/multimodal/mm_utils.py` | `get_attention_tp_group().all_gather()` |
+| 6. 融合 | `python/sglang/srt/managers/mm_utils.py` | `embed_mm_inputs()`, `general_mm_embed_routine()` |
 | 6. LLM | `Qwen3LLMModel` | `forward()` |
 | 7. 采样 | `LogitsProcessor` | `forward()` |
 
@@ -1888,3 +1900,16 @@ python -m sglang.launch_server \
 ## 11. 多模态更新
 
 Qwen3.5 继承 Qwen3VL 的 Vision 架构，但 text backbone 是混合架构（Full Attention + Linear Attention + MoE）。多模态处理流程与 Qwen3-VL 基本一致，主要变化在 text backbone 的推理路径。
+
+## 与其他章节关系
+- 扩展 `01/03/08` 到多模态。
+
+
+## 最小可验证实验
+- 固定模型和负载，仅切换本章机制开关。
+- 记录 TTFT、TPOT、吞吐、显存峰值与回退率。
+- 总结收益场景、退化场景、推荐默认值。
+
+
+## 常见误解
+- 多模态仅是输入前处理问题。

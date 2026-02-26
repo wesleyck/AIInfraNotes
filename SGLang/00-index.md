@@ -6,6 +6,18 @@
 >
 > **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存 + EPLB + MTP + 线性注意力
 
+## 本章定位
+- 主题范围: 全局索引、阅读顺序、章节依赖。
+
+## 设计 Why（为什么这么设计）
+- 先建立系统依赖图，再进入模块细节，能显著降低理解偏差。
+- 核心取舍: 吞吐 vs 时延、显存 vs 计算、通用性 vs 特化。
+
+## 阅读建议（进阶）
+1. 先抓目标函数和边界条件，再读具体实现。
+2. 先看调用链和状态变化，再看局部优化细节。
+3. 源码锚点以“路径 + 类/函数”为主，避免依赖易漂移行号。
+
 ## 端到端 Pipeline
 
 ```mermaid
@@ -92,45 +104,45 @@ flowchart TD
 
 | 模块 | 关键文件 | 行号 | 说明 |
 |------|----------|------|------|
-| 入口 | `srt/entrypoints/engine.py` | ~900 | Engine 类，进程启动 |
-| 调度 | `srt/managers/scheduler.py` | 1135 | event_loop_overlap |
-| 调度 | `srt/managers/scheduler.py` | 1875 | get_next_batch_to_run |
-| 批次 | `srt/managers/schedule_batch.py` | 512 | Req 类 |
-| 批次 | `srt/managers/schedule_batch.py` | 1202 | ScheduleBatch 类 |
-| 批次 | `srt/managers/schedule_batch.py` | 2337 | ModelWorkerBatch 类 |
-| 前向 | `srt/model_executor/forward_batch_info.py` | 231 | ForwardBatch 类 |
-| 模式 | `srt/model_executor/forward_batch_info.py` | 74 | ForwardMode 枚举 |
-| 策略 | `srt/managers/schedule_policy.py` | - | 调度策略 |
-| 内存 | `srt/mem_cache/memory_pool.py` | - | KV Cache 内存池 |
-| 缓存 | `srt/mem_cache/radix_cache.py` | - | Radix 前缀缓存 |
-| 执行 | `srt/model_executor/model_runner.py` | - | 模型前向 |
-| 多模态 | `srt/multimodal/processors/qwen_vl.py` | 233 | QwenVLImageProcessor |
+| 入口 | `python/sglang/srt/entrypoints/engine.py` | ~900 | Engine 类，进程启动 |
+| 调度 | `python/sglang/srt/managers/scheduler.py` | 1135 | event_loop_overlap |
+| 调度 | `python/sglang/srt/managers/scheduler.py` | 1875 | get_next_batch_to_run |
+| 批次 | `python/sglang/srt/managers/schedule_batch.py` | 512 | Req 类 |
+| 批次 | `python/sglang/srt/managers/schedule_batch.py` | 1202 | ScheduleBatch 类 |
+| 批次 | `python/sglang/srt/managers/schedule_batch.py` | 2337 | ModelWorkerBatch 类 |
+| 前向 | `python/sglang/srt/model_executor/forward_batch_info.py` | 231 | ForwardBatch 类 |
+| 模式 | `python/sglang/srt/model_executor/forward_batch_info.py` | 74 | ForwardMode 枚举 |
+| 策略 | `python/sglang/srt/managers/schedule_policy.py` | - | 调度策略 |
+| 内存 | `python/sglang/srt/mem_cache/memory_pool.py` | - | KV Cache 内存池 |
+| 缓存 | `python/sglang/srt/mem_cache/radix_cache.py` | - | Radix 前缀缓存 |
+| 执行 | `python/sglang/srt/model_executor/model_runner.py` | - | 模型前向 |
+| 多模态 | `python/sglang/srt/multimodal/processors/qwen_vl.py` | 233 | QwenVLImageProcessor |
 | Attention | `srt/layers/attention/` | - | 各种 Attention 后端 |
-| 投机 | `srt/speculative/eagle_worker.py` | - | EAGLE 实现 |
-| 采样 | `srt/sampling/sampling_params.py` | - | SamplingParams 定义 |
-| 采样 | `srt/sampling/sampling_batch_info.py` | - | 批次采样状态 |
-| 采样 | `srt/layers/sampler.py` | - | Sampler (logits→token) |
+| 投机 | `python/sglang/srt/speculative/eagle_worker.py` | - | EAGLE 实现 |
+| 采样 | `python/sglang/srt/sampling/sampling_params.py` | - | SamplingParams 定义 |
+| 采样 | `python/sglang/srt/sampling/sampling_batch_info.py` | - | 批次采样状态 |
+| 采样 | `python/sglang/srt/layers/sampler.py` | - | Sampler (logits→token) |
 | 惩罚 | `srt/sampling/penaltylib/` | - | 频率/存在/最小长度惩罚 |
-| 约束 | `srt/constrained/base_grammar_backend.py` | - | Grammar 后端基类 |
-| 约束 | `srt/constrained/xgrammar_backend.py` | - | XGrammar 后端 |
-| 推理解析 | `srt/parser/reasoning_parser.py` | - | ReasoningParser |
-| 函数调用 | `srt/function_call/function_call_parser.py` | - | FunctionCallParser |
-| 函数调用 | `srt/function_call/base_format_detector.py` | - | 检测器基类 |
-| Embedding | `srt/layers/pooler.py` | - | Pooler, CrossEncodingPooler |
-| Embedding | `srt/entrypoints/openai/serving_embedding.py` | - | /v1/embeddings 端点 |
-| Rerank | `srt/entrypoints/openai/serving_rerank.py` | - | /v1/rerank 端点 |
-| LoRA | `srt/lora/lora_manager.py` | - | LoRA 核心管理器 |
-| LoRA | `srt/lora/lora_registry.py` | - | LoRA 注册表 (请求路由) |
-| LoRA | `srt/lora/mem_pool.py` | - | LoRA GPU 内存池 |
-| LoRA | `srt/lora/layers.py` | - | LoRA 模块替换层 |
-| 重叠 | `srt/batch_overlap/two_batch_overlap.py` | - | TBO 双批重叠 |
-| 重叠 | `srt/batch_overlap/single_batch_overlap.py` | - | SBO 单批重叠 |
-| EPLB | `srt/eplb/eplb_manager.py` | - | 专家负载均衡管理 |
-| 弹性EP | `srt/elastic_ep/elastic_ep.py` | - | 弹性专家并行 |
+| 约束 | `python/sglang/srt/constrained/base_grammar_backend.py` | - | Grammar 后端基类 |
+| 约束 | `python/sglang/srt/constrained/xgrammar_backend.py` | - | XGrammar 后端 |
+| 推理解析 | `python/sglang/srt/parser/reasoning_parser.py` | - | ReasoningParser |
+| 函数调用 | `python/sglang/srt/function_call/function_call_parser.py` | - | FunctionCallParser |
+| 函数调用 | `python/sglang/srt/function_call/base_format_detector.py` | - | 检测器基类 |
+| Embedding | `python/sglang/srt/layers/pooler.py` | - | Pooler, CrossEncodingPooler |
+| Embedding | `python/sglang/srt/entrypoints/openai/serving_embedding.py` | - | /v1/embeddings 端点 |
+| Rerank | `python/sglang/srt/entrypoints/openai/serving_rerank.py` | - | /v1/rerank 端点 |
+| LoRA | `python/sglang/srt/lora/lora_manager.py` | - | LoRA 核心管理器 |
+| LoRA | `python/sglang/srt/lora/lora_registry.py` | - | LoRA 注册表 (请求路由) |
+| LoRA | `python/sglang/srt/lora/mem_pool.py` | - | LoRA GPU 内存池 |
+| LoRA | `python/sglang/srt/lora/layers.py` | - | LoRA 模块替换层 |
+| 重叠 | `python/sglang/srt/batch_overlap/two_batch_overlap.py` | - | TBO 双批重叠 |
+| 重叠 | `python/sglang/srt/batch_overlap/single_batch_overlap.py` | - | SBO 单批重叠 |
+| EPLB | `python/sglang/srt/eplb/eplb_manager.py` | - | 专家负载均衡管理 |
+| 弹性EP | `python/sglang/srt/elastic_ep/elastic_ep.py` | - | 弹性专家并行 |
 | DLLM | `srt/dllm/` | - | 分布式 LLM |
-| SWA内存 | `srt/mem_cache/swa_memory_pool.py` | - | SWA 双池内存 |
-| SWA缓存 | `srt/mem_cache/swa_radix_cache.py` | - | SWA Radix 缓存 |
-| KV事件 | `srt/disaggregation/kv_events.py` | - | PD 分离事件系统 |
+| SWA内存 | `python/sglang/srt/mem_cache/swa_memory_pool.py` | - | SWA 双池内存 |
+| SWA缓存 | `python/sglang/srt/mem_cache/swa_radix_cache.py` | - | SWA Radix 缓存 |
+| KV事件 | `python/sglang/srt/disaggregation/kv_events.py` | - | PD 分离事件系统 |
 
 ## 学习建议
 
@@ -139,3 +151,16 @@ flowchart TD
 3. **理解 overlap 机制**: event_loop_overlap 是默认调度模式
 4. **结合测试用例**：`test/srt/` 下有大量使用示例
 5. **善用日志**：`SGLANG_LOG_LEVEL=debug` 观察运行时行为
+
+## 与其他章节关系
+- 全书入口，串联所有主题。
+
+
+## 最小可验证实验
+- 固定模型和负载，仅切换本章机制开关。
+- 记录 TTFT、TPOT、吞吐、显存峰值与回退率。
+- 总结收益场景、退化场景、推荐默认值。
+
+
+## 常见误解
+- 按文件顺序阅读一定最高效。

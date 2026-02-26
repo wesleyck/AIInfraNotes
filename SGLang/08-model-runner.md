@@ -4,12 +4,24 @@
 >
 > **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存 + EPLB + MTP + 线性注意力
 
+## 本章定位
+- 主题范围: ForwardMode、CUDA Graph、执行路径。
+
+## 设计 Why（为什么这么设计）
+- ModelRunner 将调度输入映射到高效执行路径，是性能关键点。
+- 核心取舍: 吞吐 vs 时延、显存 vs 计算、通用性 vs 特化。
+
+## 阅读建议（进阶）
+1. 先抓目标函数和边界条件，再读具体实现。
+2. 先看调用链和状态变化，再看局部优化细节。
+3. 源码锚点以“路径 + 类/函数”为主，避免依赖易漂移行号。
+
 ## 1. ModelRunner 概览
 
 **核心文件**:
-- `srt/model_executor/model_runner.py` - 模型执行器 (2688 行)
-- `srt/model_executor/cuda_graph_runner.py` - CUDA Graph 管理 (962 行)
-- `srt/model_executor/forward_batch_info.py` - ForwardBatch 定义 (1098 行)
+- `python/sglang/srt/model_executor/model_runner.py` - 模型执行器 (2688 行)
+- `python/sglang/srt/model_executor/cuda_graph_runner.py` - CUDA Graph 管理 (962 行)
+- `python/sglang/srt/model_executor/forward_batch_info.py` - ForwardBatch 定义 (1098 行)
 
 ### 1.1 职责分工
 
@@ -39,7 +51,7 @@ flowchart LR
 
 ### 1.2 TpModelWorker - Scheduler 与 ModelRunner 之间的桥梁
 
-**核心文件**: `srt/managers/tp_worker.py:206`
+**核心文件**: `python/sglang/srt/managers/tp_worker.py`
 
 `TpModelWorker` 是运行在 GPU 进程中的工作者类，负责连接 Scheduler 和 ModelRunner。
 
@@ -171,7 +183,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 > 这些对象属于 `ModelRunner`（全局唯一），但通过 `ForwardBatch` 传递到模型各层。原因：
 > 1. **避免修改模型 forward 签名**：模型层（如 `RadixAttention.forward()`）需要访问 `attn_backend` 来执行 attention 计算、需要 `token_to_kv_pool` 来写入 KV cache。如果不通过 ForwardBatch 传递，就得修改所有模型 forward 方法的签名，或者引入全局变量。
 > 2. **全局变量的问题**：使用全局变量看似简单，但在 DP（数据并行）场景下每个 rank 可能有不同的 attn_backend 配置，全局变量无法区分。ForwardBatch 是 per-request-batch 的，天然支持这种差异。
-> 3. **在 `ForwardBatch.init_new()` 中赋值**（`forward_batch_info.py`）：这些全局引用从 `model_runner` 拷贝过来，不是 per-batch 创建的新对象。
+> 3. **在 `ForwardBatch.init_new()` 中赋值**（`python/sglang/srt/model_executor/forward_batch_info.py`）：这些全局引用从 `model_runner` 拷贝过来，不是 per-batch 创建的新对象。
 
 ## 4. ModelRunner 核心方法
 
@@ -188,7 +200,7 @@ def forward(
 ) -> ModelRunnerOutput:
 ```
 
-**`ModelRunnerOutput` 数据类** (`model_runner.py:271-275`):
+**`ModelRunnerOutput` 数据类** (`python/sglang/srt/model_executor/model_runner.py`):
 
 ```python
 @dataclass
@@ -220,7 +232,7 @@ flowchart TB
     style Return fill:#90EE90
 ```
 
-**`_forward_raw()` 内部分发** (`model_runner.py:2443-2516`):
+**`_forward_raw()` 内部分发** (`python/sglang/srt/model_executor/model_runner.py`):
 
 ```mermaid
 flowchart TB
@@ -358,20 +370,20 @@ def forward_idle(self, forward_batch: ForwardBatch, pp_proxy_tensors=None):
 - **使用场景**: **仅用于投机解码 (EAGLE/EAGLE-V2)**，核心原因是 EAGLE 将"准备 attention metadata"和"执行 model forward"解耦，使得 metadata 可以提前或一次性准备，多次 forward 复用。
 
 > [!IMPORTANT]
-> `tp_worker.py:402-405` 的 FIXME 注释指出这个参数设计并不完美，未来可能被重构。
+> `python/sglang/srt/managers/tp_worker.py` 的 FIXME 注释指出这个参数设计并不完美，未来可能被重构。
 
 #### 场景 1: Draft Model 多步循环 (Multi-Step Draft)
 
 EAGLE Draft 模型在一次 `draft_forward()` 中需要连续执行 `speculative_num_steps` 步，每步生成 TopK 候选 token。所有步共享同一套 attention metadata（seq_lens 不变，只是 position +1），因此在**循环前一次性初始化**，循环内跳过：
 
 ```python
-# eagle_worker.py:549-554 (EAGLE V1)
+- 源码锚点: `python/sglang/srt/speculative/eagle_worker.py`
 if not forward_batch.forward_mode.is_idle() and self.speculative_num_steps > 1:
     self.draft_attn_backend.init_forward_metadata(forward_batch)  # 循环前初始化一次
 
 parent_list, top_scores_index, draft_tokens = self.draft_forward(forward_batch)
 
-# eagle_worker.py:653-654 (循环内每一步)
+- 源码锚点: `python/sglang/srt/speculative/eagle_worker.py`
 for i in range(num_steps):
     # ... 更新 input_ids, positions, out_cache_loc ...
     logits_output = self.draft_model_runner.forward(
@@ -379,14 +391,14 @@ for i in range(num_steps):
     ).logits_output
 ```
 
-EAGLE V2 同理 (`eagle_worker_v2.py:286-292, 394-395`)。
+EAGLE V2 同理 (`eagle_worker_v2.py, 394-395`)。
 
 #### 场景 2: Draft Extend (验证后补充 KV Cache)
 
 验证完成后，被接受的 token 需要写入 Draft Model 的 KV Cache（"draft extend"）。此时先**手动调用 `init_forward_metadata`**，然后 `forward()` 时跳过：
 
 ```python
-# eagle_worker.py:946-952 (非 CUDA Graph 路径)
+- 源码锚点: `python/sglang/srt/speculative/eagle_worker.py`
 if not forward_batch.forward_mode.is_idle():
     self.draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
 
@@ -395,14 +407,14 @@ logits_output = self.draft_model_runner.forward(
 ).logits_output
 ```
 
-V2 的 `_draft_extend_for_decode` 类似 (`eagle_worker_v2.py:518-520`)。
+V2 的 `_draft_extend_for_decode` 类似 (`python/sglang/srt/speculative/eagle_worker_v2.py`)。
 
 #### 场景 3: V2 Overlapped Verify (Target 模型验证)
 
 EAGLE V2 的核心优化：在 Draft 执行 `build_tree_kernel_efficient` 的同时，**在另一个 CUDA Stream 上提前准备 Target 模型的验证 metadata**：
 
 ```python
-# eagle_info_v2.py:244-257 (在 plan_stream 上执行)
+- 源码锚点: `python/sglang/srt/speculative/eagle_info_v2.py`
 can_run_cuda_graph = bool(
     target_worker.model_runner.graph_runner
     and target_worker.model_runner.graph_runner.can_run(verify_forward_batch)
@@ -415,7 +427,7 @@ else:
             verify_forward_batch
         )
 
-# eagle_worker_v2.py:699-703 (在 main stream 上，直接跳过)
+- 源码锚点: `python/sglang/srt/speculative/eagle_worker_v2.py`
 forward_batch_output = self.target_worker.forward_batch_generation(
     model_worker_batch=None,
     forward_batch=verify_forward_batch,
@@ -634,7 +646,7 @@ def can_run(self, forward_batch: ForwardBatch) -> bool:
 当 `can_run()` 返回 False 时：
 
 ```python
-# model_runner.py forward() 逻辑
+- 源码锚点: `python/sglang/srt/model_executor/model_runner.py`
 if forward_mode.is_cuda_graph() and self.cuda_graph_runner.can_run(batch):
     return self.cuda_graph_runner.replay(batch)  # 用 CUDA Graph
 else:
@@ -643,7 +655,7 @@ else:
 
 #### TBO (Two-Batch Overlap) 详解
 
-**核心文件**: `srt/batch_overlap/two_batch_overlap.py`
+**核心文件**: `python/sglang/srt/batch_overlap/two_batch_overlap.py`
 
 **TBO 是什么？** 将一个 batch 拆分为两个子 batch，在**不同 CUDA Stream** 上重叠执行 Attention 和 MLP，从而隐藏 MoE 通信开销。
 
@@ -726,7 +738,7 @@ flowchart TD
 
 **结果如何取出？** `replay` 返回后，输出 logits 被切片回实际大小：
 ```python
-# forward_batch_info.py - CUDA Graph 输出恢复
+- 源码锚点: `python/sglang/srt/model_executor/forward_batch_info.py`
 if forward_mode.is_decode():
     logits_output.next_token_logits = logits_output.next_token_logits[:raw_bs]
 elif forward_mode.is_extend():
@@ -798,10 +810,10 @@ flowchart TB
 
 ### 7.4 CustomOp 与 torch.compile
 
-SGLang 的自定义算子 (`CustomOp` 子类，`custom_op.py`) 在 `torch.compile` 下的行为：
+SGLang 的自定义算子 (`CustomOp` 子类，`python/sglang/srt/utils/custom_op.py`) 在 `torch.compile` 下的行为：
 
 ```python
-# custom_op.py enter_torch_compile()
+- 源码锚点: `python/sglang/srt/utils/custom_op.py`
 def enter_torch_compile(self, num_tokens: int):
     if "FusedMoE" in self.__class__.__name__:
         if num_tokens == 1:  # ← 仅 bs=1 时切换
@@ -1027,7 +1039,7 @@ Attention 和 AllReduce 的行为依赖运行时参数（seq_len、kv_indices �
 #### 9.3.2 split_ops 与分片过程
 
 ```python
-# compilation_config.py:18-22
+- 源码锚点: `python/sglang/srt/compilation/compilation_config.py`
 self.split_ops = [
     "sglang.unified_attention_with_output",  # Attention
     "sglang.gdn_with_output",               # GDN (Mamba/线性注意力)
@@ -1035,7 +1047,7 @@ self.split_ops = [
 ]
 ```
 
-`split_graph()` (`backend.py:213-256`) 将 fx 图按 `split_ops` 切割：
+`split_graph()` (`python/sglang/srt/compilation/backend.py`) 将 fx 图按 `split_ops` 切割：
 
 ```
 原始 fx 图 (一个 Transformer 层):
@@ -1068,7 +1080,7 @@ for num_tokens in self.capture_num_tokens:
     self.graphs[num_tokens] = capture_one_batch_size(num_tokens, ...)
 ```
 
-每个 piece 的捕获采用 **懒惰策略** (`cuda_piecewise_backend.py:151-190`)：
+每个 piece 的捕获采用 **懒惰策略** (`python/sglang/srt/compilation/cuda_piecewise_backend.py`)：
 1. **第 1 次调用**: warmup（不捕获），让 PyTorch 分配内部 buffer
 2. **第 2 次调用**: 实际捕获 CUDA Graph
 3. **第 3+ 次调用**: replay
@@ -1100,7 +1112,7 @@ for num_tokens in self.capture_num_tokens:
 
 > **SGLang 有独立的 VIT CUDA Graph！** 通过 `SGLANG_VIT_ENABLE_CUDA_GRAPH=1` 启用。
 
-**核心实现**: `srt/multimodal/vit_cuda_graph_runner.py`
+**核心实现**: `python/sglang/srt/multimodal/vit_cuda_graph_runner.py`
 
 ```python
 class ViTCudaGraphRunner:
@@ -1129,7 +1141,7 @@ class ViTCudaGraphRunner:
 
 **Qwen3.5 调用流程**:
 ```python
-# qwen3_vl.py forward()
+- 源码锚点: `python/sglang/srt/models/qwen3_vl.py`
 def forward(self, x, grid_thw):
     if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
         return self.forward_with_cuda_graph(x, grid_thw)
@@ -1151,7 +1163,7 @@ export SGLANG_VIT_ENABLE_CUDA_GRAPH=1
 **注意**:
 - ViTCudaGraphRunner **独立于** PiecewiseCudaGraph，使用标准 `torch.cuda.CUDAGraph`。
 - **不使用 torch.compile**。
-- 在模型内部初始化 (如 `qwen3_vl.py`)，而非 ModelRunner。
+- 在模型内部初始化 (如 `python/sglang/srt/models/qwen3_vl.py`)，而非 ModelRunner。
 - 仅支持 `triton_attn` 和 `fa3` attention backend
 - `patch_embed` 和 `pos_embed` 在图外执行
 
@@ -1346,7 +1358,7 @@ def init_piecewise_cuda_graphs(self):
 
 ## 11. 初始化流程
 
-实际上 `__init__()` 只保存参数并初始化分布式环境，真正的编排在 `initialize(min_per_gpu_memory)` 方法中 (`model_runner.py:447-629`)。
+实际上 `__init__()` 只保存参数并初始化分布式环境，真正的编排在 `initialize(min_per_gpu_memory)` 方法中 (`python/sglang/srt/model_executor/model_runner.py`)。
 
 ```mermaid
 flowchart TD
@@ -1384,7 +1396,7 @@ flowchart TD
 ### 12.1 全局图内存池
 
 ```python
-# cuda_graph_runner.py
+- 源码锚点: `python/sglang/srt/model_executor/cuda_graph_runner.py`
 global_graph_memory_pool = None
 
 def get_global_graph_memory_pool():
@@ -1459,7 +1471,7 @@ graph.replay()  # 图内部还在读旧地址 0x7f8a0000
 
 **关键代码路径**:
 ```python
-# cuda_graph_runner.py:787
+- 源码锚点: `python/sglang/srt/model_executor/cuda_graph_runner.py`
 seq_lens_cpu = buffers.populate_from_forward_batch(
     forward_batch=forward_batch,  # 新数据源（地址不固定）
     raw_bs=raw_bs,
@@ -1610,11 +1622,11 @@ python -m sglang.launch_server ... --disable-cuda-graph
 | 概念 | 要点 | 关键代码位置 |
 |------|------|-------------|
 | **三层数据结构** | ScheduleBatch → ModelWorkerBatch → ForwardBatch 的转换与设计原因 | `forward_batch_info.py:init_new()` |
-| **ForwardMode** | EXTEND/DECODE/MIXED/SPLIT_PREFILL 的区别与使用场景 | `forward_batch_info.py:74-186` |
-| **CUDA Graph 原理** | 解决 kernel launch 开销，固定地址约束 | `cuda_graph_runner.py` |
-| **GraphInputBuffers** | 预分配固定地址 buffer，replay 时 copy 数据 | `input_buffers.py` |
-| **can_run() 判断** | 5 个条件决定是否使用 CUDA Graph | `cuda_graph_runner.py:385-450` |
-| **torch.compile + CUDA Graph** | 先 compile 优化 kernel，再 capture 录制 | `cuda_graph_runner.py:141-171` |
+| **ForwardMode** | EXTEND/DECODE/MIXED/SPLIT_PREFILL 的区别与使用场景 | `python/sglang/srt/model_executor/forward_batch_info.py` |
+| **CUDA Graph 原理** | 解决 kernel launch 开销，固定地址约束 | `python/sglang/srt/model_executor/cuda_graph_runner.py` |
+| **GraphInputBuffers** | 预分配固定地址 buffer，replay 时 copy 数据 | `python/sglang/srt/model_executor/input_buffers.py` |
+| **can_run() 判断** | 5 个条件决定是否使用 CUDA Graph | `python/sglang/srt/model_executor/cuda_graph_runner.py` |
+| **torch.compile + CUDA Graph** | 先 compile 优化 kernel，再 capture 录制 | `python/sglang/srt/model_executor/cuda_graph_runner.py` |
 
 ### 关键执行路径
 
@@ -1662,7 +1674,7 @@ ModelRunner.forward()                          ← 外层: EPLB 包装
 
 ModelRunner 在 `forward()` 方法中与 `batch_overlap/` 模块协作，支持 SBO/TBO 两种重叠模式。
 
-**文件**: `srt/model_executor/model_runner.py` (2688行)
+**文件**: `python/sglang/srt/model_executor/model_runner.py` (2688行)
 
 ### 关键方法
 
@@ -1681,7 +1693,7 @@ ModelRunner 在 `forward()` 方法中与 `batch_overlap/` 模块协作，支持 
 
 ## 18. KV Cache Mixin
 
-**文件**: `srt/model_executor/model_runner_kv_cache_mixin.py` (747 行)
+**文件**: `python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py` (747 行)
 
 KV Cache 管理逻辑从 model_runner.py 抽取到独立 mixin (`ModelRunnerKVCacheMixin`)，`ModelRunner` 通过继承获得这些方法。
 
@@ -1721,13 +1733,26 @@ ModelRunner 通过一组 `@property` 方法检测当前模型的混合架构类�
 
 | 文件 | 说明 |
 |------|------|
-| `input_buffers.py` (8047行) | CUDA Graph 输入缓冲区管理（`GraphInputBuffers` 类），从 ModelRunner 重构出来 |
-| `hook_manager.py` (83行) | Hook 管理器，支持在 forward 过程中注入自定义逻辑 |
-| `cpu_graph_runner.py` | CPU Graph Runner，用于 CPU 端的图执行 |
-| `piecewise_cuda_graph_runner.py` | 分段 CUDA Graph Runner，支持更灵活的图捕获策略 |
-| `forward_batch_deepseek_mha_mixin.py` (9681行) | DeepSeek MHA 专用的 ForwardBatch 扩展 |
+| `python/sglang/srt/model_executor/input_buffers.py` (8047行) | CUDA Graph 输入缓冲区管理（`GraphInputBuffers` 类），从 ModelRunner 重构出来 |
+| `python/sglang/srt/model_executor/hook_manager.py` (83行) | Hook 管理器，支持在 forward 过程中注入自定义逻辑 |
+| `python/sglang/srt/model_executor/cpu_graph_runner.py` | CPU Graph Runner，用于 CPU 端的图执行 |
+| `python/sglang/srt/model_executor/piecewise_cuda_graph_runner.py` | 分段 CUDA Graph Runner，支持更灵活的图捕获策略 |
+| `python/sglang/srt/model_executor/forward_batch_deepseek_mha_mixin.py` (9681行) | DeepSeek MHA 专用的 ForwardBatch 扩展 |
 
 ## 20. 下一步
 
 - **09**: Attention 后端 (FlashInfer, FlashAttention, Triton)
 - **10**: 模型加载、权重处理、量化支持
+
+## 与其他章节关系
+- 承接 `03` 执行，依赖 `09/15/16`。
+
+
+## 最小可验证实验
+- 固定模型和负载，仅切换本章机制开关。
+- 记录 TTFT、TPOT、吞吐、显存峰值与回退率。
+- 总结收益场景、退化场景、推荐默认值。
+
+
+## 常见误解
+- 命中 CUDA Graph 一定最优。

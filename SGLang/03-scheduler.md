@@ -6,9 +6,21 @@
 >
 > 调度官方Blog: https://lmsys.org/blog/2024-12-04-sglang-v0-4/ 
 
+## 本章定位
+- 主题范围: 事件循环、批次调度、结果处理。
+
+## 设计 Why（为什么这么设计）
+- 调度器在吞吐、时延、公平性、显存之间做动态折中。
+- 核心取舍: 吞吐 vs 时延、显存 vs 计算、通用性 vs 特化。
+
+## 阅读建议（进阶）
+1. 先抓目标函数和边界条件，再读具体实现。
+2. 先看调用链和状态变化，再看局部优化细节。
+3. 源码锚点以“路径 + 类/函数”为主，避免依赖易漂移行号。
+
 ## 1. Scheduler 概览
 
-**文件**: `srt/managers/scheduler.py:253`
+**文件**: `python/sglang/srt/managers/scheduler.py`
 
 Scheduler 是 SGLang 的核心调度器，运行在独立的子进程中，负责：
 - 接收 tokenized 请求
@@ -111,7 +123,7 @@ flowchart LR
 
 ### 2.2 四阶段模型
 
-**文件**: `scheduler.py:1135`
+**文件**: `python/sglang/srt/managers/scheduler.py`
 
 `event_loop_overlap` 的每次迭代可分为四个阶段：
 
@@ -126,8 +138,8 @@ flowchart LR
 
 在 `forward_stream` 上的 GPU 操作开始前，都有一个显式同步点 `forward_stream.wait_stream(default_stream)`，确保 `default_stream` 上的 CPU 工作已完成：
 
-- **同步点 A** (`scheduler.py:2310`): Compute 开始前，等待 Pre Schedule 完成
-- **同步点 B** (`scheduler.py:2415`): Sample 开始前，等待 Post Schedule 完成
+- **同步点 A** (`python/sglang/srt/managers/scheduler.py`): Compute 开始前，等待 Pre Schedule 完成
+- **同步点 B** (`python/sglang/srt/managers/scheduler.py`): Sample 开始前，等待 Post Schedule 完成
 
 这两个同步点决定了精确的 overlap 关系。以下用 ASCII 时序图展示**连续三次迭代**的 CPU/GPU 重叠：
 
@@ -199,11 +211,11 @@ SGLang 使用三条 stream，但它们的创建位置不同：
 
 ```python
 # forward_stream 由 TpModelWorker 创建，通过 get_worker_info() 返回给 Scheduler
-# scheduler.py:583
+- 源码锚点: `python/sglang/srt/managers/scheduler.py`
 self.forward_stream = self.tp_worker.get_worker_info()[...]  # 来自 ModelRunner
 
 # init_overlap() 中获取 default_stream 并创建 copy_stream
-# scheduler.py:990-1002
+- 源码锚点: `python/sglang/srt/managers/scheduler.py`
 self.default_stream = self.device_module.current_stream()  # 默认 CUDA stream (stream 0)
 self.forward_stream_ctx = self.device_module.stream(self.forward_stream)  # 包装为 context manager
 self.copy_stream    = self.device_module.Stream()           # 独立 stream，用于异步数据拷贝
@@ -237,7 +249,7 @@ SGLang 的两个同步点 `forward_stream.wait_stream(default_stream)` 是 **GPU
 | `stream.synchronize()` | **CPU** | CPU 等该 stream 完成 | ✅ 破坏 |
 | `torch.cuda.Event` + `record/wait` | **GPU** | GPU 侧事件同步，**CPU 不等** | ❌ 不破坏 |
 
-具体地，`scheduler.py:2310` 的 `self.forward_stream.wait_stream(self.default_stream)` 执行时：
+具体地，`python/sglang/srt/managers/scheduler.py` 的 `self.forward_stream.wait_stream(self.default_stream)` 执行时：
 1. **CPU 执行这行后立刻返回**（只是在 forward_stream 的命令队列里插入了一个"等待 default_stream"的屏障）
 2. **GPU 的 forward_stream** 会等到 default_stream 上的操作完成后，才开始执行 `forward_batch_generation` 的 kernel
 
@@ -322,7 +334,7 @@ flowchart TD
     P6 --> P7["self.last_batch = batch<br/>继续下一轮循环 → ① Pre Schedule"]
 ```
 
-> **`is_disable_overlap_for_batch` 详解**: 当连续两个 Prefill 批次时，会禁用 overlap 以改善第一个 Prefill 的 TTFT。实际延迟的是 CPU 操作时间（~2-10ms），而非 GPU 计算时间。详见 **§22.1**。
+> **`is_disable_overlap_for_batch` 详解**: 当连续两个 Prefill 批次时，会禁用 overlap 以改善第一个 Prefill 的 TTFT。实际延迟的是 CPU 操作时间（~2-10ms），而非 GPU 计算时间。详见 **§20.1**。
 
 ### 2.6 Overlap 时序图（修正版）
 
@@ -373,7 +385,7 @@ sequenceDiagram
 ### 2.7 result_queue 机制
 
 ```python
-# scheduler.py:1137
+- 源码锚点: `python/sglang/srt/managers/scheduler.py`
 self.result_queue: Deque[Tuple[ScheduleBatch, BatchResult]] = deque()
 
 # 延迟处理: 当前批次的结果放入队列，下一轮循环处理
@@ -388,7 +400,7 @@ def pop_and_process():
 
 ### 2.8 FutureMap 详解
 
-**文件**: `srt/managers/overlap_utils.py`
+**文件**: `python/sglang/srt/managers/overlap_utils.py`
 
 FutureMap 是 Overlap 调度的核心数据结构，解决了 **GPU 异步执行下的数据依赖问题**。
 
@@ -411,7 +423,7 @@ Round N:
 使用**负数索引**作为占位符，表示"这个 token ID 将来会由第 X 个请求的采样结果填充"：
 
 ```python
-# scheduler.py:2330 - 在 overlap 模式下
+- 源码锚点: `python/sglang/srt/managers/scheduler.py`
 future_indices_or_next_token_ids = -future_indices.indices
 # 例如: tensor([-1, -2, -3, -4]) 而不是实际的 token IDs
 ```
@@ -419,7 +431,7 @@ future_indices_or_next_token_ids = -future_indices.indices
 在下一轮 forward 开始前**解析**负索引：
 
 ```python
-# overlap_utils.py:18-24
+- 源码锚点: `python/sglang/srt/managers/overlap_utils.py`
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def _resolve_future_token_ids(input_ids, future_token_ids_map):
     input_ids[:] = torch.where(
@@ -563,7 +575,7 @@ flowchart TD
 
 ### 3.2 handle_generate_request 详解
 
-**文件**: `scheduler.py:1481`
+**文件**: `python/sglang/srt/managers/scheduler.py`
 
 ```python
 def handle_generate_request(self, recv_req: TokenizedGenerateReqInput):
@@ -621,7 +633,7 @@ def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
 
 ### 4.1 get_next_batch_to_run
 
-**文件**: `scheduler.py:1875`
+**文件**: `python/sglang/srt/managers/scheduler.py`
 
 这是调度的统一入口，决定下一个要运行的batch。
 
@@ -651,7 +663,7 @@ flowchart TD
 
 ### 4.2 get_new_batch_prefill
 
-**文件**: `scheduler.py:1960`
+**文件**: `python/sglang/srt/managers/scheduler.py`
 
 从 waiting_queue 创建 prefill batch。
 
@@ -708,7 +720,7 @@ def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
 
 ### 4.3 update_running_batch
 
-**文件**: `scheduler.py:2203`
+**文件**: `python/sglang/srt/managers/scheduler.py`
 
 更新正在 decode 的批次。
 
@@ -751,7 +763,7 @@ flowchart LR
 
 ## 5. PrefillAdder
 
-**文件**: `schedule_policy.py:316`
+**文件**: `python/sglang/srt/managers/schedule_policy.py`
 
 PrefillAdder 负责选择要 prefill 的请求，管理三层 token 预算 (总预算 / 输入预算 / 分块预算)。核心流程：
 - 计算每个请求的 token 需求 (`extend_input_len + max_new_tokens`)
@@ -762,7 +774,7 @@ PrefillAdder 负责选择要 prefill 的请求，管理三层 token 预算 (总�
 
 ## 6. 调度策略 (SchedulePolicy)
 
-**文件**: `schedule_policy.py:80`
+**文件**: `python/sglang/srt/managers/schedule_policy.py`
 
 ### 6.1 策略类型
 
@@ -802,7 +814,7 @@ def calc_priority(self, waiting_queue: List[Req]) -> bool:
 
 ## 7. run_batch 执行流程
 
-**文件**: `scheduler.py:2278`
+**文件**: `python/sglang/srt/managers/scheduler.py`
 
 ```mermaid
 flowchart TD
@@ -853,7 +865,7 @@ flowchart LR
 ### 8.2 Prefill 端队列
 
 ```python
-# scheduler.py:975
+- 源码锚点: `python/sglang/srt/managers/scheduler.py`
 self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(...)
 self.disagg_prefill_inflight_queue: List[Req] = []  # 正在传输 KV 的请求
 ```
@@ -861,7 +873,7 @@ self.disagg_prefill_inflight_queue: List[Req] = []  # 正在传输 KV 的请求
 ### 8.3 Decode 端队列
 
 ```python
-# scheduler.py:920
+- 源码锚点: `python/sglang/srt/managers/scheduler.py`
 self.disagg_decode_transfer_queue = DecodeTransferQueue(...)  # 等待 KV 传输
 self.disagg_decode_prealloc_queue = DecodePreallocQueue(...)  # 预分配 KV
 ```
@@ -870,7 +882,7 @@ self.disagg_decode_prealloc_queue = DecodePreallocQueue(...)  # 预分配 KV
 
 > **完整配置参数表**: 见 **§19**
 
-**文件**: `scheduler.py:2203` - `update_running_batch()`
+**文件**: `python/sglang/srt/managers/scheduler.py` - `update_running_batch()`
 
 当 decode 阶段 KV Cache 不足时，会触发 retraction (请求回退)。
 
@@ -899,7 +911,7 @@ flowchart TD
 
 ### 9.3 new_token_ratio 动态调整
 
-**文件**: `scheduler.py:835-847, 2240-2243`
+**文件**: `scheduler.py, 2240-2243`
 
 #### 核心作用
 
@@ -950,7 +962,7 @@ self.new_token_ratio = max(
 #### OOM 回调 (retract_decode)
 
 ```python
-# schedule_batch.py retract_decode()
+- 源码锚点: `python/sglang/srt/managers/schedule_batch.py`
 new_estimate_ratio = (
     total_decoded_tokens + SGLANG_RETRACT_DECODE_STEPS * len(self.reqs)
 ) / (total_max_new_tokens + 1)
@@ -959,7 +971,7 @@ new_estimate_ratio = min(1.0, new_estimate_ratio)
 
 ### 9.4 在 PrefillAdder 中的使用
 
-**文件**: `schedule_policy.py:350-397`
+**文件**: `python/sglang/srt/managers/schedule_policy.py`
 
 PrefillAdder 初始化时，计算 running_batch 中所有请求的预留空间:
 
@@ -1039,12 +1051,12 @@ flowchart TB
 
 ## 10. 结果处理流程
 
-**文件**: `scheduler_output_processor_mixin.py`
+**文件**: `python/sglang/srt/managers/scheduler_output_processor_mixin.py`
 
 ### 10.1 process_batch_result 分发
 
 ```python
-# scheduler.py:2447
+- 源码锚点: `python/sglang/srt/managers/scheduler.py`
 def process_batch_result(self, batch, result):
     if batch.forward_mode.is_decode():          # decode 最高频，放在第一个分支
         self.process_batch_result_decode(batch, result)
@@ -1130,7 +1142,7 @@ flowchart LR
 ### 11.2 PrefillAdder 中的处理
 
 ```python
-# schedule_policy.py:317
+- 源码锚点: `python/sglang/srt/managers/schedule_policy.py`
 adder = PrefillAdder(
     ...
     mixed_with_decode_tokens=running_bs if self.is_mixed_chunk else 0,
@@ -1139,7 +1151,7 @@ adder = PrefillAdder(
 
 ## 12. Grammar Queue 机制
 
-**文件**: `scheduler.py:2450`
+**文件**: `python/sglang/srt/managers/scheduler.py`
 
 用于异步初始化 grammar (如 JSON Schema)。
 
@@ -1163,7 +1175,7 @@ flowchart TD
 
 ## 13. Priority 调度与 Preemption
 
-**文件**: `schedule_policy.py:668`
+**文件**: `python/sglang/srt/managers/schedule_policy.py`
 
 ### 13.1 优先级抢占条件
 
@@ -1194,7 +1206,7 @@ self.preempt_list.extend(preemptible_reqs)
 
 ## 14. LoRA 批次管理
 
-**文件**: `scheduler.py:2030`
+**文件**: `python/sglang/srt/managers/scheduler.py`
 
 ### 14.1 LoRA Slot 检查
 
@@ -1215,7 +1227,7 @@ for req in self.waiting_queue:
 
 ## 15. Embedding 请求处理
 
-**文件**: `scheduler.py:1810`
+**文件**: `python/sglang/srt/managers/scheduler.py`
 
 Embedding 请求与 generation 请求的区别：
 
@@ -1298,7 +1310,7 @@ logger.error(f"Grammar accept_token failed for req {req.rid}")
 
 ## 19. batch_is_full 完整逻辑
 
-**文件**: `scheduler.py`
+**文件**: `python/sglang/srt/managers/scheduler.py`
 
 `batch_is_full` 是 `running_batch` 的布尔标志，控制是否跳过 prefill 调度。
 
@@ -1325,7 +1337,7 @@ logger.error(f"Grammar accept_token failed for req {req.rid}")
 
 ## 20. is_disable_overlap_for_batch 条件
 
-**文件**: `scheduler.py:1190-1212`
+**文件**: `python/sglang/srt/managers/scheduler.py`
 
 ```python
 def is_disable_overlap_for_batch(self, batch: ScheduleBatch) -> bool:
@@ -1385,7 +1397,7 @@ Round N+1:
 #### 禁用 Overlap 后的时序
 
 ```python
-# scheduler.py L1124-1125
+- 源码锚点: `python/sglang/srt/managers/scheduler.py`
 if disable_overlap_for_batch:
     pop_and_process()  # ← 先处理上一批的结果！
 ```
@@ -1446,7 +1458,7 @@ need_grammar_sync = (
 
 ## 21. stream_output 发送机制
 
-**文件**: `scheduler_output_processor_mixin.py:788-1097`
+**文件**: `python/sglang/srt/managers/scheduler_output_processor_mixin.py`
 
 ### 21.1 流式判断
 
@@ -1481,7 +1493,7 @@ BatchTokenIDOutput(
 ### 21.3 增量解码
 
 ```python
-# Req.init_incremental_detokenize() (schedule_batch.py:901)
+# Req.init_incremental_detokenize() (schedule_batch.py)
 # 首次: 初始化 surr_offset 和 read_offset
 surr_offset = max(read_offset - 5, 0)  # INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 surr_and_decode_ids = origin_input_ids[surr_offset:] + output_ids
@@ -1493,7 +1505,7 @@ surr_and_decode_ids.extend(output_ids[cur_decode_ids_len:])
 
 ## 22. check_finished 终止条件
 
-**文件**: `schedule_batch.py:1029-1059`
+**文件**: `python/sglang/srt/managers/schedule_batch.py`
 
 检查顺序（短路逻辑，命中即返回）:
 
@@ -1527,7 +1539,7 @@ def check_finished(self, new_accepted_len: int = 1):
 
 ## 23. launch_batch_sample_if_needed
 
-**文件**: `scheduler.py:2405-2420`
+**文件**: `python/sglang/srt/managers/scheduler.py`
 
 ```python
 def launch_batch_sample_if_needed(self, batch_result: GenerationBatchResult):
@@ -1548,7 +1560,7 @@ def launch_batch_sample_if_needed(self, batch_result: GenerationBatchResult):
 
 ## 24. _prefetch_kvcache
 
-**文件**: `scheduler.py:1700-1720`
+**文件**: `python/sglang/srt/managers/scheduler.py`
 
 ```python
 def _prefetch_kvcache(self, req: Req):
@@ -1569,7 +1581,7 @@ def _prefetch_kvcache(self, req: Req):
 
 ## 25. DP Attention 对调度的影响
 
-**文件**: `scheduler_dp_attn_mixin.py`, `dp_attention.py`, `data_parallel_controller.py`
+**文件**: `python/sglang/srt/managers/scheduler_dp_attn_mixin.py`, `python/sglang/srt/layers/dp_attention.py`, `python/sglang/srt/managers/data_parallel_controller.py`
 
 ### 25.1 MLP Sync 机制
 
@@ -1615,40 +1627,26 @@ class DpPaddingMode(IntEnum):
 | `SHORTEST_QUEUE` | 最短队列 | 使用 `DPBudget` 动态追踪负载 |
 | `MINIMUM_TOKENS` | 最少 token | 已弃用，回退到 round_robin |
 
-## 26. schedule_enhancer (Prefill 空闲缩减)
+## 26. schedule_enhancer（版本核对说明）
 
-**文件**: `scheduler_enhancer.py`
+> 事实审校结论（v0.5.9 当前代码）：在 `python/sglang/srt/managers/` 下未发现 `名为 scheduler_enhancer.py 的文件`，也未检索到 `schedule_enhancer.get_schedule_decision()` 调用点。
+>
+> 这说明本节描述更可能来自旧版本/实验分支。为避免误导，当前将其标记为“历史机制待确认”。
 
-### 26.1 触发条件
+### 26.1 当前可确认事实
 
-全部满足才启用:
-- `schedule_policy == "fcfs"`
-- `enable_dp_attention == True`
-- `disaggregation_mode == "null"`（非 PD 分离）
-- `disable_overlap_schedule == False`
+- 调度主路径仍以 `python/sglang/srt/managers/scheduler.py` + mixin 体系为核心。
+- 与 DP Attention 相关的调度协作主要在 `python/sglang/srt/managers/scheduler_dp_attn_mixin.py`。
+- 与 PP 相关的调度逻辑主要在 `python/sglang/srt/managers/scheduler_pp_mixin.py`。
 
-### 26.2 核心逻辑
+### 26.2 后续核查建议
 
-```python
-def get_schedule_decision(self, running_batch):
-    tp0_info = self.get_schedule_info(running_batch)  # all_gather 各 rank 的 running_bs
-    if (
-        int(tp0_info[:, 0].min()) < self.max_running_requests
-        and int(tp0_info[:, 0].max()) == self.max_running_requests
-    ):
-        # 部分 DP rank 满、部分未满 → 跳过 prefill 避免 idle
-        self.stable_count += 1
-        if self.stable_count < 30:  # max_stable_count
-            return False  # 跳过 prefill
-    self.stable_count = 0
-    return True  # 正常 prefill
-```
-
-**集成点**: `get_new_batch_prefill()` 开头检查 `schedule_enhancer.get_schedule_decision()`，返回 False 时直接跳过 prefill 进入 decode，让满载 rank 有时间完成请求释放槽位。
+- 若你有目标 commit/tag，可按版本回溯 `schedule_enhancer` 是否曾存在。
+- 若未来代码重新引入该机制，再恢复此节并补充真实调用链。
 
 ## 27. PP (Pipeline Parallel) 对调度的影响
 
-**文件**: `scheduler_pp_mixin.py`
+**文件**: `python/sglang/srt/managers/scheduler_pp_mixin.py`
 
 ### 27.1 独立事件循环
 
@@ -1681,11 +1679,11 @@ for mb_id in range(pp_loop_size):
 
 ## 28. PrefillDelayer
 
-**文件**: `srt/managers/prefill_delayer.py` (256行)
+**文件**: `python/sglang/srt/managers/prefill_delayer.py` (256行)
 
 **为什么需要**: DP Attention 场景下，不同 worker 的 waiting_queue 深度不同。如果各 worker 独立决定 prefill 时机，会导致负载不均——一个 worker 在 prefill 大请求，另一个已经完成进入 idle，而 DP all-reduce 要求所有 worker 同步，idle 的 worker 只能空等 GPU。PrefillDelayer 通过全局协商让各 worker 对齐 prefill 时机，提升 DP workers 间的 GPU 利用率。
 
-**默认状态**: `enable_prefill_delayer = false`（`server_args.py` L342），DP Attention 场景推荐开启。
+**默认状态**: `enable_prefill_delayer = false`（`python/sglang/srt/server_args.py` L342），DP Attention 场景推荐开启。
 
 ### 28.1 核心机制
 
@@ -1706,7 +1704,7 @@ for mb_id in range(pp_loop_size):
 
 ### 28.2 与调度策略的协作
 
-PrefillDelayer 的协商逻辑嵌入在 `get_new_batch_prefill()` 的调用链中（`scheduler.py:1960-1975`）：
+PrefillDelayer 的协商逻辑嵌入在 `get_new_batch_prefill()` 的调用链中（`python/sglang/srt/managers/scheduler.py`）：
 
 ```python
 def get_new_batch_prefill(self):
@@ -1729,13 +1727,13 @@ def get_new_batch_prefill(self):
 
 ## 29. SchedulerRecvSkipper
 
-**文件**: `srt/managers/scheduler_recv_skipper.py` (38行)
+**文件**: `python/sglang/srt/managers/scheduler_recv_skipper.py` (38行)
 
 基于 ForwardMode 的加权计数器，决定是否跳过 `recv_requests()` 调用。在高负载 decode 场景下，频繁的 recv 会增加 CPU 开销，SchedulerRecvSkipper 通过计数器机制减少不必要的 recv 调用。
 
 ## 30. SchedulerRuntimeCheckerMixin
 
-**文件**: `srt/managers/scheduler_runtime_checker_mixin.py` (364行)
+**文件**: `python/sglang/srt/managers/scheduler_runtime_checker_mixin.py` (364行)
 
 运行时检查 mixin，提供：
 - **Token 使用率监控**: `_get_token_info()` 定期检查 KV Cache 的 token 使用率
@@ -1744,7 +1742,7 @@ def get_new_batch_prefill(self):
 
 ## 31. SchedulerInputBlocker
 
-**文件**: `srt/managers/scheduler_input_blocker.py` (106行)
+**文件**: `python/sglang/srt/managers/scheduler_input_blocker.py` (106行)
 
 输入阻塞逻辑，专门用于 **colocated batch generation** 场景（通过 `SGLANG_ENABLE_COLOCATED_BATCH_GEN` 环境变量启用）。在权重更新期间阻塞新请求输入，确保更新过程不受干扰。
 
@@ -1759,3 +1757,16 @@ def get_new_batch_prefill(self):
 - **05**: Chunked Prefill 分块预填充
 - **06**: 内存池设计 (ReqToTokenPool, KVCache)
 - **07**: RadixCache 前缀缓存
+
+## 与其他章节关系
+- 被 `04/05/12/14/24` 频繁依赖。
+
+
+## 最小可验证实验
+- 固定模型和负载，仅切换本章机制开关。
+- 记录 TTFT、TPOT、吞吐、显存峰值与回退率。
+- 总结收益场景、退化场景、推荐默认值。
+
+
+## 常见误解
+- 调度是静态规则而非状态机。

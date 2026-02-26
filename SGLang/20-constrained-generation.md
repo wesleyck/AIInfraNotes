@@ -6,6 +6,18 @@
 >
 > **核心组件**: Grammar Backend, Vocab Mask, Jump Forward
 
+## 本章定位
+- 主题范围: Grammar backend 与掩码应用。
+
+## 设计 Why（为什么这么设计）
+- 约束生成把合法性前移到采样阶段，减少回滚成本。
+- 核心取舍: 吞吐 vs 时延、显存 vs 计算、通用性 vs 特化。
+
+## 阅读建议（进阶）
+1. 先抓目标函数和边界条件，再读具体实现。
+2. 先看调用链和状态变化，再看局部优化细节。
+3. 源码锚点以“路径 + 类/函数”为主，避免依赖易漂移行号。
+
 ## 1. 概览
 
 约束生成（Constrained/Structured Generation）通过词表掩码（Vocab Mask）限制每一步可采样的 token，强制模型输出符合指定格式（JSON Schema、正则、EBNF）的文本。
@@ -25,12 +37,12 @@ flowchart TB
 ```
 
 **核心文件**:
-- `srt/constrained/base_grammar_backend.py` — 抽象基类、后端注册
-- `srt/constrained/xgrammar_backend.py` — XGrammar 后端 (生产推荐)
-- `srt/constrained/outlines_backend.py` — Outlines 后端
-- `srt/constrained/llguidance_backend.py` — LLGuidance 后端
-- `srt/constrained/reasoner_grammar_backend.py` — Reasoning 模型包装器
-- `srt/constrained/triton_ops/bitmask_ops.py` — GPU 掩码 kernel
+- `python/sglang/srt/constrained/base_grammar_backend.py` — 抽象基类、后端注册
+- `python/sglang/srt/constrained/xgrammar_backend.py` — XGrammar 后端 (生产推荐)
+- `python/sglang/srt/constrained/outlines_backend.py` — Outlines 后端
+- `python/sglang/srt/constrained/llguidance_backend.py` — LLGuidance 后端
+- `python/sglang/srt/constrained/reasoner_grammar_backend.py` — Reasoning 模型包装器
+- `python/sglang/srt/constrained/triton_ops/bitmask_ops.py` — GPU 掩码 kernel
 
 ## 2. 后端选择
 
@@ -46,7 +58,7 @@ SGLang 通过 `--grammar-backend` 参数选择后端：
 | **none** | 禁用 | — | 不需要约束生成 |
 
 ```python
-# srt/constrained/base_grammar_backend.py
+- 源码锚点: `python/sglang/srt/constrained/base_grammar_backend.py`
 def create_grammar_backend(server_args, tokenizer, vocab_size, eos_token_ids):
     if server_args.grammar_backend == "xgrammar":
         return XGrammarGrammarBackend(tokenizer, vocab_size, ...)
@@ -138,7 +150,7 @@ logits[mask] = float("-inf")
 # 更紧凑，GPU Triton kernel 加速
 
 # 应用 (Triton kernel)
-# srt/constrained/triton_ops/bitmask_ops.py
+- 源码锚点: `python/sglang/srt/constrained/triton_ops/bitmask_ops.py`
 apply_token_bitmask_inplace_triton(logits, bitmask, vocab_size)
 ```
 
@@ -174,7 +186,7 @@ flowchart TD
 多 rank 场景下（DP/TP），各 rank 独立轮询 grammar 编译状态，通过 `all_gather_object` 同步结果：
 
 ```python
-# grammar_manager.py:151-163
+- 源码锚点: `python/sglang/srt/constrained/grammar_manager.py`
 if self.grammar_sync_size > 1:
     all_gather_output = [None] * self.grammar_sync_size
     torch.distributed.all_gather_object(
@@ -199,7 +211,7 @@ SGLANG_GRAMMAR_MAX_POLL_ITERATIONS=10000    # 最大轮询次数 (超过则 abor
 --constrained-json-disable-any-whitespace   # 禁用 any_whitespace (XGrammar/LLGuidance)
 ```
 
-### 5.3 编译缓存
+### 5.4 编译缓存
 
 ```python
 # BaseGrammarBackend 内置缓存
@@ -254,14 +266,14 @@ def apply_logits_bias(self, logits):
 采样后，在 `process_batch_result` 中推进状态：
 
 ```python
-# scheduler_output_processor_mixin.py
+- 源码锚点: `python/sglang/srt/managers/scheduler_output_processor_mixin.py`
 if req.grammar is not None:
     req.grammar.accept_token(next_token_id)
 ```
 
 ## 7. Reasoner Grammar (思维链模型)
 
-**文件**: `srt/constrained/reasoner_grammar_backend.py`
+**文件**: `python/sglang/srt/constrained/reasoner_grammar_backend.py`
 
 为 Thinking 模型（如 Qwen3-VL-Thinking）提供特殊支持：在 thinking 阶段不应用约束，thinking 结束后才激活 grammar。
 
@@ -270,11 +282,11 @@ if req.grammar is not None:
 `maybe_init_reasoning()` 方法在 grammar 对象创建后调用，根据请求是否启用 reasoning 来设置初始状态：
 
 ```python
-# BaseGrammarObject 中 (base_grammar_backend.py L49-50)
+# BaseGrammarObject 中 (base_grammar_backend.py)
 def maybe_init_reasoning(self, reasoning: bool):
     pass  # 基类默认不做任何事
 
-# ReasonerGrammarObject 中 (reasoner_grammar_backend.py L37-38)
+# ReasonerGrammarObject 中 (reasoner_grammar_backend.py)
 def maybe_init_reasoning(self, reasoning: bool):
     self.tokens_after_think_end = -1 if reasoning else 0
     # reasoning=True:  tokens_after_think_end=-1 → thinking 阶段，不约束
@@ -306,7 +318,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
         self.transfer_state(token)            # 然后更新状态
 ```
 
-**执行顺序解析** (`reasoner_grammar_backend.py` L52-55):
+**执行顺序解析** (`python/sglang/srt/constrained/reasoner_grammar_backend.py` L52-55):
 1. **先判断当前状态**: 如果 `tokens_after_think_end >= 0`（已结束 thinking），则将 token 传给内层 grammar 的 `accept_token()`
 2. **再更新状态**: 调用 `transfer_state(token)` 更新计数器
 
@@ -336,11 +348,11 @@ if jump_str:
 | 结构化模式 | — | `("structural_pattern", pattern)` | 结构化模式约束 |
 | 结构化模式 v2 | — | `("structural_pattern_v2", pattern)` | 结构化模式约束 v2 |
 
-> **dispatch 路由** (`base_grammar_backend.py` `_init_value_dispatch`): 根据 key_type 路由到对应的 `dispatch_*` 方法。`structural_pattern` 和 `structural_pattern_v2` 是扩展类型，通过 `dispatch_structural_pattern()` / `dispatch_structural_pattern_v2()` 分发。
+> **dispatch 路由** (`python/sglang/srt/constrained/base_grammar_backend.py` `_init_value_dispatch`): 根据 key_type 路由到对应的 `dispatch_*` 方法。`structural_pattern` 和 `structural_pattern_v2` 是扩展类型，通过 `dispatch_structural_pattern()` / `dispatch_structural_pattern_v2()` 分发。
 
 ## 10. GrammarStats 性能追踪
 
-**文件**: `srt/constrained/base_grammar_backend.py` L30-39
+**文件**: `python/sglang/srt/constrained/base_grammar_backend.py` L30-39
 
 每个 `BaseGrammarObject` 实例可通过 `grammar_stats` 属性追踪语法操作的性能指标：
 
@@ -361,7 +373,7 @@ class GrammarStats:
 
 ## 11. 自定义后端注册机制
 
-**文件**: `srt/constrained/base_grammar_backend.py` L199-203
+**文件**: `python/sglang/srt/constrained/base_grammar_backend.py` L199-203
 
 SGLang 提供全局注册表 `GRAMMAR_BACKEND_REGISTRY`，允许第三方注册自定义 grammar 后端：
 
@@ -431,7 +443,7 @@ grammar.rollback(num_rejected_tokens)
 
 > 详细实现见 Section 7。本节仅保留架构图供快速参考。
 
-**文件**: `srt/constrained/reasoner_grammar_backend.py`
+**文件**: `python/sglang/srt/constrained/reasoner_grammar_backend.py`
 
 ### 13.1 架构
 
@@ -452,3 +464,16 @@ flowchart TD
 ## 14. 下一步
 
 - **21**: 推理解析与函数调用 (ReasoningParser, FunctionCallParser)
+
+## 与其他章节关系
+- 直接作用于 `19` 采样。
+
+
+## 最小可验证实验
+- 固定模型和负载，仅切换本章机制开关。
+- 记录 TTFT、TPOT、吞吐、显存峰值与回退率。
+- 总结收益场景、退化场景、推荐默认值。
+
+
+## 常见误解
+- 约束只影响正确性不影响性能。

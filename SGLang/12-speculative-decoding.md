@@ -1,5 +1,17 @@
 # SGLang 投机解码 (Speculative Decoding)
 
+## 本章定位
+- 主题范围: Speculative Decoding 流程与边界。
+
+## 设计 Why（为什么这么设计）
+- 投机解码以额外计算换并行验证收益，成败取决于接受率。
+- 核心取舍: 吞吐 vs 时延、显存 vs 计算、通用性 vs 特化。
+
+## 阅读建议（进阶）
+1. 先抓目标函数和边界条件，再读具体实现。
+2. 先看调用链和状态变化，再看局部优化细节。
+3. 源码锚点以“路径 + 类/函数”为主，避免依赖易漂移行号。
+
 ## 1. 概述
 
 投机解码 (Speculative Decoding) 是一种加速 LLM 推理的技术，通过使用小型 Draft 模型预测多个 token，然后由目标模型并行验证，从而减少解码延迟。
@@ -26,7 +38,7 @@ flowchart LR
 
 ### 1.2 支持的算法
 
-`SpeculativeAlgorithm` 是一个简单的 Python `Enum`（`spec_info.py`，143 行）：
+`SpeculativeAlgorithm` 是一个简单的 Python `Enum`（`python/sglang/srt/speculative/spec_info.py`，143 行）：
 
 | 算法 | 说明 | Draft 模型 |
 |------|------|-----------|
@@ -36,14 +48,14 @@ flowchart LR
 | `NGRAM` | 基于 N-Gram 匹配的无模型投机 | 否 |
 | `NONE` | 不启用投机解码 | — |
 
-> CLI 兼容性：`server_args.py` L2352-2353 将 `NEXTN` 自动转换为 `EAGLE`，保持向后兼容。
+> CLI 兼容性：`python/sglang/srt/server_args.py` L2352-2353 将 `NEXTN` 自动转换为 `EAGLE`，保持向后兼容。
 
 ---
 
 ## 2. 核心参数
 
 ```python
-# server_args.py 相关参数 (L467-490)
+- 源码锚点: `python/sglang/srt/server_args.py`
 
 # 基础参数
 speculative_algorithm: str           # 算法: EAGLE, EAGLE3, NEXTN, NGRAM, STANDALONE
@@ -75,7 +87,7 @@ speculative_ngram_capacity: int = 10_000_000
 
 ### 2.1 自动参数选择
 
-`auto_choose_speculative_params()`（`server_args.py` L5741-5775）根据模型架构自动选择 `(num_steps, topk, num_draft_tokens)`：
+`auto_choose_speculative_params()`（`python/sglang/srt/server_args.py` L5741-5775）根据模型架构自动选择 `(num_steps, topk, num_draft_tokens)`：
 
 | 模型架构 | num_steps | topk | num_draft_tokens |
 |----------|-----------|------|------------------|
@@ -108,7 +120,7 @@ python -m sglang.launch_server \
 SGLang 使用简单的 `Enum` + `create_worker()` 方法来管理投机解码算法。算法数量有限且各 worker 创建逻辑差异大，因此不需要复杂的注册表系统。
 
 ```python
-# spec_info.py L15-22
+- 源码锚点: `python/sglang/srt/speculative/spec_info.py`
 class SpeculativeAlgorithm(Enum):
     """Enumeration of speculative decoding algorithms."""
     EAGLE = auto()
@@ -121,7 +133,7 @@ class SpeculativeAlgorithm(Enum):
 ### 3.1 类型判断方法
 
 ```python
-# spec_info.py L36-50
+- 源码锚点: `python/sglang/srt/speculative/spec_info.py`
 def is_eagle(self) -> bool:
     # NOTE: EAGLE3 is a variant of EAGLE
     return self == SpeculativeAlgorithm.EAGLE or self == SpeculativeAlgorithm.EAGLE3
@@ -143,10 +155,10 @@ def supports_spec_v2(self) -> bool:
 
 ### 3.2 Worker 创建: `create_worker()`
 
-`create_worker(server_args)` 方法（L52-105）根据算法类型和 overlap schedule 设置返回对应的 worker 类：
+`create_worker(server_args)` 方法根据算法类型和 overlap schedule 设置返回对应的 worker 类：
 
 ```python
-# spec_info.py L52-105
+- 源码锚点: `python/sglang/srt/speculative/spec_info.py`
 def create_worker(self, server_args: ServerArgs):
     enable_overlap = not server_args.disable_overlap_schedule
 
@@ -202,7 +214,7 @@ flowchart TB
 ### 4.2 EAGLEWorker 初始化
 
 ```python
-# eagle_worker.py L78-206
+- 源码锚点: `python/sglang/srt/speculative/eagle_worker.py`
 class EAGLEWorker(TpModelWorker):
     def __init__(self, server_args, gpu_id, tp_rank, dp_rank,
                  moe_ep_rank, attn_cp_rank, moe_dp_rank, nccl_port, target_worker):
@@ -215,7 +227,7 @@ class EAGLEWorker(TpModelWorker):
             target_worker.get_memory_pool()
         )
 
-        # Hot token map 加载 (L120-132)
+        # Hot token map 加载 
         if self.speculative_algorithm.is_eagle3():
             self.hot_token_id = None  # EAGLE3 从模型权重加载
         elif server_args.speculative_token_map is not None:
@@ -224,7 +236,7 @@ class EAGLEWorker(TpModelWorker):
         else:
             self.hot_token_id = None
 
-        # 初始化 Draft Worker (L134-155)
+        # 初始化 Draft Worker 
         super().__init__(
             server_args=server_args,
             is_draft_worker=True,
@@ -232,7 +244,7 @@ class EAGLEWorker(TpModelWorker):
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
         )
 
-        # 共享 embedding 和 lm_head (L157-183)
+        # 共享 embedding 和 lm_head 
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
         if self.speculative_algorithm.is_eagle3():
             # 大部分 EAGLE3 模型不共享 lm_head，只共享 embed
@@ -251,7 +263,7 @@ class EAGLEWorker(TpModelWorker):
                 head.data = head.data[self.hot_token_id]
             self.draft_model_runner.model.set_embed_and_head(embed, head)
 
-        # eagle_use_aux_hidden_state 特性 (L192-200)
+        # eagle_use_aux_hidden_state 特性 
         # EAGLE3 默认使用 aux hidden state，可通过 eagle_config 配置
         self.eagle_use_aux_hidden_state = False
         if self.speculative_algorithm.is_eagle3():
@@ -267,7 +279,7 @@ class EAGLEWorker(TpModelWorker):
 EAGLE3 的 Draft 模型是一个轻量级的单层 Transformer：
 
 ```python
-# llama_eagle3.py
+- 源码锚点: `python/sglang/srt/models/llama_eagle3.py`
 class LlamaForCausalLMEagle3(LlamaForCausalLM):
     def __init__(self, config, quant_config=None, prefix=""):
         if self.config.num_hidden_layers != 1:
@@ -324,16 +336,16 @@ def load_weights(self, weights):
 
 ## 4.5 v2 架构: BaseSpecWorker/BaseDraftWorker 分离模式
 
-> **选择规则**：`SpeculativeAlgorithm.create_worker()`（`spec_info.py` L52-105）根据 `disable_overlap_schedule` 自动选择：
+> **选择规则**：`SpeculativeAlgorithm.create_worker()`（`python/sglang/srt/speculative/spec_info.py` L52-105）根据 `disable_overlap_schedule` 自动选择：
 > - **默认**（overlap schedule 开启）→ `EAGLEWorkerV2`（v2）— **v2 是默认行为**
 > - `--disable-overlap-schedule` → `EAGLEWorker`（v1）
 
-SGLang 投机解码现在有两套实现架构：v1（`eagle_worker.py`）和 v2（`eagle_worker_v2.py`）。v2 引入了 **BaseSpecWorker/BaseDraftWorker 分离模式**，将 target 和 draft worker 完全解耦。
+SGLang 投机解码现在有两套实现架构：v1（`python/sglang/srt/speculative/eagle_worker.py`）和 v2（`python/sglang/srt/speculative/eagle_worker_v2.py`）。v2 引入了 **BaseSpecWorker/BaseDraftWorker 分离模式**，将 target 和 draft worker 完全解耦。
 
 ### 4.5.1 v2 类层次
 
 ```python
-# base_spec_worker.py (34 行)
+- 源码锚点: `python/sglang/srt/speculative/base_spec_worker.py`
 class BaseDraftWorker(ABC):
     @abstractmethod
     def draft(): ...
@@ -355,9 +367,9 @@ class BaseSpecWorker(ABC):
 
 | 文件 | 类 | 说明 |
 |------|-----|------|
-| `eagle_worker_v2.py` (878 行) | `EagleDraftWorker(BaseDraftWorker)` | Draft model 初始化、draft forward、CUDA graph |
-| `eagle_worker_v2.py` | `EAGLEWorkerV2(BaseSpecWorker)` | 组合 target + draft，verify 逻辑，attention backend 管理 |
-| `eagle_info_v2.py` (489 行) | `assign_extend_cache_locs`, `fill_accepted_out_cache_loc`, `fill_new_verified_id` | v2 专用的 cache loc 分配和验证结果处理函数 |
+| `python/sglang/srt/speculative/eagle_worker_v2.py` (878 行) | `EagleDraftWorker(BaseDraftWorker)` | Draft model 初始化、draft forward、CUDA graph |
+| `python/sglang/srt/speculative/eagle_worker_v2.py` | `EAGLEWorkerV2(BaseSpecWorker)` | 组合 target + draft，verify 逻辑，attention backend 管理 |
+| `python/sglang/srt/speculative/eagle_info_v2.py` (489 行) | `assign_extend_cache_locs`, `fill_accepted_out_cache_loc`, `fill_new_verified_id` | v2 专用的 cache loc 分配和验证结果处理函数 |
 
 ### 4.5.3 v1 vs v2 对比
 
@@ -386,7 +398,7 @@ EAGLE3 和 MTP 都基于 EAGLE 框架，但 draft 策略完全不同：
 |------|---------------|----------------------|
 | Draft 模型层数 | 单层 | 多层（`speculative_num_steps` 层） |
 | 每步推理 | 单层 draft model 执行多步，每步 topk 展开 | 每层 draft model 执行一步 |
-| 模型文件 | `eagle_worker.py` / `eagle_worker_v2.py` | `multi_layer_eagle_worker.py` / `_v2.py` |
+| 模型文件 | `python/sglang/srt/speculative/eagle_worker.py` / `python/sglang/srt/speculative/eagle_worker_v2.py` | `python/sglang/srt/speculative/multi_layer_eagle_worker.py` / `python/sglang/srt/speculative/multi_layer_eagle_worker_v2.py` |
 | 启用参数 | `--speculative-algorithm EAGLE` | `--enable-multi-layer-eagle` |
 | 适用模型 | 通用 EAGLE draft model | DeepSeek V3 MTP、Qwen3Next MTP |
 | 注册 flags | `("EAGLE",)` 或 `("EAGLE", "EAGLE3")` | 同 EAGLE，通过 `enable_multi_layer_eagle` 切换 |
@@ -395,16 +407,16 @@ EAGLE3 和 MTP 都基于 EAGLE 框架，但 draft 策略完全不同：
 
 | 文件 | 类 | 基类 | 说明 |
 |------|-----|------|------|
-| `multi_layer_eagle_worker.py` (748 行) | `MultiLayerEagleWorker` | `TpModelWorker` | v1，继承式，target/draft 耦合 |
-| `multi_layer_eagle_worker_v2.py` (721 行) | `MultiLayerEagleDraftWorker` | `BaseDraftWorker` | v2 draft worker，组合式 |
-| `multi_layer_eagle_worker_v2.py` | `MultiLayerEagleWorkerV2` | `BaseSpecWorker` | v2 spec worker，组合 target + draft |
+| `python/sglang/srt/speculative/multi_layer_eagle_worker.py` (748 行) | `MultiLayerEagleWorker` | `TpModelWorker` | v1，继承式，target/draft 耦合 |
+| `python/sglang/srt/speculative/multi_layer_eagle_worker_v2.py` (721 行) | `MultiLayerEagleDraftWorker` | `BaseDraftWorker` | v2 draft worker，组合式 |
+| `python/sglang/srt/speculative/multi_layer_eagle_worker_v2.py` | `MultiLayerEagleWorkerV2` | `BaseSpecWorker` | v2 spec worker，组合 target + draft |
 
 ### 4.6.3 多层 Draft 核心机制
 
 与单层 EAGLE 的关键区别在于 `draft_runner_list`——每个 draft 层有独立的 ModelRunner：
 
 ```python
-# multi_layer_eagle_worker_v2.py L128
+- 源码锚点: `python/sglang/srt/speculative/multi_layer_eagle_worker_v2.py`
 self.draft_runner_list = self.draft_worker.model_runner_list  # 每层一个 runner
 
 def mtp_model_runner(self, step: int):  # L161
@@ -450,7 +462,7 @@ STANDALONE 使用独立的完整 draft 模型（而非 EAGLE 的轻量 draft hea
 ### 4.7.1 实现结构
 
 ```python
-# standalone_worker.py L24 (文件共 109 行)
+- 源码锚点: `python/sglang/srt/speculative/standalone_worker.py`
 class StandaloneWorker(EAGLEWorker):
     """继承 EAGLEWorker，复用其 draft/verify 流程，
     但使用独立加载的完整模型作为 draft model。"""
@@ -468,7 +480,7 @@ class StandaloneWorker(EAGLEWorker):
 StandaloneWorker 重写了 `__init__`，**跳过** `EAGLEWorker.__init__` 中的 `set_embed_and_head()` 调用，直接调用 `TpModelWorker.__init__()`：
 
 ```python
-# standalone_worker.py L74-90
+- 源码锚点: `python/sglang/srt/speculative/standalone_worker.py`
 # 不调用 super().__init__()，而是直接调用 TpModelWorker.__init__()
 with empty_context(), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
     TpModelWorker.__init__(
@@ -521,7 +533,7 @@ sequenceDiagram
 ### 5.2 Draft 阶段
 
 ```python
-# eagle_worker.py L532-613
+- 源码锚点: `python/sglang/srt/speculative/eagle_worker.py`
 def draft(self, batch: ScheduleBatch):
     """生成 draft tokens"""
     if batch.forward_mode.is_idle():
@@ -564,7 +576,7 @@ def draft(self, batch: ScheduleBatch):
 ### 5.3 Draft Forward 多步推理
 
 ```python
-# eagle_worker.py L615-685
+- 源码锚点: `python/sglang/srt/speculative/eagle_worker.py`
 def draft_forward(self, forward_batch: ForwardBatch):
     """多步 draft forward"""
     spec_info = forward_batch.spec_info
@@ -611,7 +623,7 @@ def draft_forward(self, forward_batch: ForwardBatch):
 ### 5.4 Verify 阶段
 
 ```python
-# eagle_worker.py L691-781
+- 源码锚点: `python/sglang/srt/speculative/eagle_worker.py`
 def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
     """验证 draft tokens"""
     seq_lens_pre_verify = batch.seq_lens.clone()
@@ -649,11 +661,11 @@ def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
 
 ### 5.5 概率验证路径
 
-验证阶段（`eagle_info.py` L300-376）支持两种验证模式：
+验证阶段（`python/sglang/srt/speculative/eagle_info.py` L300-376）支持两种验证模式：
 
 **Greedy 路径**（`is_all_greedy` 或 AMD/HIP 平台）：
 ```python
-# eagle_info.py L310-323
+- 源码锚点: `python/sglang/srt/speculative/eagle_info.py`
 target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
 predict, accept_index, accept_length = verify_tree_greedy_func(
     predicts=predict, accept_index=accept_index, accept_token_num=accept_length,
@@ -667,7 +679,7 @@ predict, accept_index, accept_length = verify_tree_greedy_func(
 
 **概率路径**（非 greedy 采样，仅 CUDA）：
 ```python
-# eagle_info.py L325-376
+- 源码锚点: `python/sglang/srt/speculative/eagle_info.py`
 # 1. Temperature scaling
 target_probs = F.softmax(logits_output.next_token_logits / expanded_temperature, dim=-1)
 # 2. Top-K renormalization
@@ -689,7 +701,7 @@ tree_speculative_sampling_target_only(
 
 ### 5.6 `organize_draft_results` 说明
 
-`eagle_utils.py` L19-38 的 `organize_draft_results()` 将多步 draft 结果整理为验证输入：
+`python/sglang/srt/speculative/eagle_utils.py` L19-38 的 `organize_draft_results()` 将多步 draft 结果整理为验证输入：
 
 ```python
 def organize_draft_results(score_list, token_list, parents_list, num_draft_token):
@@ -710,7 +722,7 @@ def organize_draft_results(score_list, token_list, parents_list, num_draft_token
 
 对于混合注意力模型（如 Qwen3.5 的 hybrid_gdn_config/mamba2_config），verify 后需要更新 Mamba 状态。
 
-`_mamba_verify_update()`（`eagle_worker.py` L783-860）的核心逻辑：
+`_mamba_verify_update()`（`python/sglang/srt/speculative/eagle_worker.py` L783-860）的核心逻辑：
 
 ```python
 # 1. 计算每个请求接受了多少步
@@ -753,7 +765,7 @@ self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify
 投机解码使用 tree attention mask 来处理 draft tokens 之间的依赖关系：
 
 ```python
-# eagle_utils.py L47-158
+- 源码锚点: `python/sglang/srt/speculative/eagle_utils.py`
 def build_tree_kernel_efficient(
     verified_id: torch.Tensor,
     parent_list: List[torch.Tensor],
@@ -823,7 +835,7 @@ flowchart TD
 ### 7.1 EagleDraftInput
 
 ```python
-# eagle_info.py L615-808
+- 源码锚点: `python/sglang/srt/speculative/eagle_info.py`
 @dataclass
 class EagleDraftInput:
     """Draft 阶段的输入数据"""
@@ -842,7 +854,7 @@ class EagleDraftInput:
 ### 7.2 EagleVerifyInput
 
 ```python
-# eagle_info.py L54-613
+- 源码锚点: `python/sglang/srt/speculative/eagle_info.py`
 @dataclass
 class EagleVerifyInput:
     """Verify 阶段的输入数据"""
@@ -866,7 +878,7 @@ class EagleVerifyInput:
 ### 7.3 EagleVerifyOutput
 
 ```python
-# eagle_info.py L810-821
+- 源码锚点: `python/sglang/srt/speculative/eagle_info.py`
 @dataclass
 class EagleVerifyOutput:
     """Verify 阶段的输出数据"""
@@ -888,7 +900,7 @@ N-Gram 是一种无需 Draft 模型的投机解码方法，基于 C++ 实现的 
 `NGRAMWorker` 是独立类，**不继承** `TpModelWorker` 或 `EAGLEWorker`，直接持有 `target_worker` 引用：
 
 ```python
-# ngram_worker.py L25-61 (文件共 286 行)
+- 源码锚点: `python/sglang/srt/speculative/ngram_worker.py`
 class NGRAMWorker:
     def __init__(self, server_args, gpu_id, tp_rank, dp_rank,
                  moe_ep_rank, attn_cp_rank, moe_dp_rank, nccl_port, target_worker):
@@ -917,7 +929,7 @@ class NGRAMWorker:
 ### 8.2 Forward 流程
 
 ```python
-# ngram_worker.py L216-286
+- 源码锚点: `python/sglang/srt/speculative/ngram_worker.py`
 def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
     # 1. 准备 draft tokens + tree mask + verify 输入
     self._prepare_for_speculative_decoding(batch)
@@ -946,7 +958,7 @@ def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResul
 | 方面 | EAGLE | NGRAM |
 |------|-------|-------|
 | Draft 来源 | 神经网络 draft model | C++ `NgramCache` 历史匹配 |
-| 验证数据结构 | `EagleVerifyInput` | `NgramVerifyInput`（`ngram_info.py`，452 行） |
+| 验证数据结构 | `EagleVerifyInput` | `NgramVerifyInput`（`python/sglang/srt/speculative/ngram_info.py`，452 行） |
 | Tree 构建 | `build_tree_kernel_efficient` (sgl_kernel) | `NgramCache.batch_get()` + `reconstruct_indices_from_tree_mask` |
 | KV Cache | Draft/Target 各有独立 KV Pool | 仅 Target KV Pool（无 draft model） |
 | Overlap 支持 | 支持 v2 overlap | 不支持（`create_worker()` 中会 raise） |
@@ -974,7 +986,7 @@ self.req_to_token_pool, self.token_to_kv_pool_allocator = (
 ### 9.2 Draft Cache 分配
 
 ```python
-# eagle_worker.py L384-521
+- 源码锚点: `python/sglang/srt/speculative/eagle_worker.py`
 def _draft_preprocess_decode(self, batch: ScheduleBatch):
     num_seqs = batch.batch_size()
     
@@ -1035,7 +1047,7 @@ flowchart LR
 ### 10.1 Draft CUDA Graph
 
 ```python
-# eagle_worker.py L232-272
+- 源码锚点: `python/sglang/srt/speculative/eagle_worker.py`
 def init_cuda_graphs(self):
     if self.server_args.disable_cuda_graph:
         return
@@ -1126,40 +1138,40 @@ python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct
 
 | 组件 | 文件 | 行数 | 说明 |
 |------|------|------|------|
-| **算法枚举** | `speculative/spec_info.py` | 143 | `SpeculativeAlgorithm` Enum + `create_worker()` |
+| **算法枚举** | `python/sglang/srt/speculative/spec_info.py` | 143 | `SpeculativeAlgorithm` Enum + `create_worker()` |
 | **v1 架构** | | | |
-| EAGLE Worker v1 | `speculative/eagle_worker.py` | 1032 | EAGLE/EAGLE3 主实现 (v1, 继承 TpModelWorker) |
-| EAGLE 数据结构 | `speculative/eagle_info.py` | 821 | `EagleDraftInput`, `EagleVerifyInput`, `EagleVerifyOutput` |
+| EAGLE Worker v1 | `python/sglang/srt/speculative/eagle_worker.py` | 1032 | EAGLE/EAGLE3 主实现 (v1, 继承 TpModelWorker) |
+| EAGLE 数据结构 | `python/sglang/srt/speculative/eagle_info.py` | 821 | `EagleDraftInput`, `EagleVerifyInput`, `EagleVerifyOutput` |
 | **v2 架构** | | | |
-| Base ABC | `speculative/base_spec_worker.py` | 34 | `BaseSpecWorker` / `BaseDraftWorker` 抽象基类 |
-| EAGLE Worker v2 | `speculative/eagle_worker_v2.py` | 878 | `EagleDraftWorker` + `EAGLEWorkerV2` 分离实现 |
-| EAGLE Info v2 | `speculative/eagle_info_v2.py` | 489 | v2 验证结果处理函数 |
-| Draft Utils | `speculative/draft_utils.py` | 249 | `DraftBackendFactory` 等 draft 工具 |
+| Base ABC | `python/sglang/srt/speculative/base_spec_worker.py` | 34 | `BaseSpecWorker` / `BaseDraftWorker` 抽象基类 |
+| EAGLE Worker v2 | `python/sglang/srt/speculative/eagle_worker_v2.py` | 878 | `EagleDraftWorker` + `EAGLEWorkerV2` 分离实现 |
+| EAGLE Info v2 | `python/sglang/srt/speculative/eagle_info_v2.py` | 489 | v2 验证结果处理函数 |
+| Draft Utils | `python/sglang/srt/speculative/draft_utils.py` | 249 | `DraftBackendFactory` 等 draft 工具 |
 | **Multi-Layer** | | | |
-| Multi-Layer Worker v1 | `speculative/multi_layer_eagle_worker.py` | 748 | 多层 EAGLE (v1, 继承 TpModelWorker) |
-| Multi-Layer Worker v2 | `speculative/multi_layer_eagle_worker_v2.py` | 721 | 多层 EAGLE (v2, 基于 BaseSpecWorker/BaseDraftWorker) |
-| Multi-Layer Utils | `speculative/multi_layer_eagle_utils.py` | 350 | Multi-Layer draft CUDA graph 等工具 |
-| Multi-Layer CG | `speculative/multi_layer_eagle_draft_extend_cuda_graph_runner.py` | 661 | Multi-Layer draft extend CUDA graph |
+| Multi-Layer Worker v1 | `python/sglang/srt/speculative/multi_layer_eagle_worker.py` | 748 | 多层 EAGLE (v1, 继承 TpModelWorker) |
+| Multi-Layer Worker v2 | `python/sglang/srt/speculative/multi_layer_eagle_worker_v2.py` | 721 | 多层 EAGLE (v2, 基于 BaseSpecWorker/BaseDraftWorker) |
+| Multi-Layer Utils | `python/sglang/srt/speculative/multi_layer_eagle_utils.py` | 350 | Multi-Layer draft CUDA graph 等工具 |
+| Multi-Layer CG | `python/sglang/srt/speculative/multi_layer_eagle_draft_extend_cuda_graph_runner.py` | 661 | Multi-Layer draft extend CUDA graph |
 | **Standalone** | | | |
-| Standalone Worker v1 | `speculative/standalone_worker.py` | 109 | 独立 Draft 模型 worker (继承 EAGLEWorker) |
-| Standalone Worker v2 | `speculative/standalone_worker_v2.py` | 185 | 独立 Draft 模型 worker (v2, 继承 EagleDraftWorker) |
+| Standalone Worker v1 | `python/sglang/srt/speculative/standalone_worker.py` | 109 | 独立 Draft 模型 worker (继承 EAGLEWorker) |
+| Standalone Worker v2 | `python/sglang/srt/speculative/standalone_worker_v2.py` | 185 | 独立 Draft 模型 worker (v2, 继承 EagleDraftWorker) |
 | **N-Gram** | | | |
-| N-Gram Worker | `speculative/ngram_worker.py` | 286 | N-Gram 投机解码 (C++ NgramCache) |
-| N-Gram 数据结构 | `speculative/ngram_info.py` | 452 | `NgramVerifyInput` 验证数据结构 |
+| N-Gram Worker | `python/sglang/srt/speculative/ngram_worker.py` | 286 | N-Gram 投机解码 (C++ NgramCache) |
+| N-Gram 数据结构 | `python/sglang/srt/speculative/ngram_info.py` | 452 | `NgramVerifyInput` 验证数据结构 |
 | **通用工具** | | | |
-| Tree 构建 | `speculative/eagle_utils.py` | 199 | `build_tree_kernel_efficient`, `organize_draft_results` |
-| Spec Utils | `speculative/spec_utils.py` | 749 | `select_top_k_tokens`, `generate_token_bitmask` 等 |
+| Tree 构建 | `python/sglang/srt/speculative/eagle_utils.py` | 199 | `build_tree_kernel_efficient`, `organize_draft_results` |
+| Spec Utils | `python/sglang/srt/speculative/spec_utils.py` | 749 | `select_top_k_tokens`, `generate_token_bitmask` 等 |
 | **CUDA Graph** | | | |
-| Draft CG | `speculative/eagle_draft_cuda_graph_runner.py` | 396 | Draft CUDA Graph Runner |
-| Draft Extend CG | `speculative/eagle_draft_extend_cuda_graph_runner.py` | 493 | Draft Extend CUDA Graph Runner |
+| Draft CG | `python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py` | 396 | Draft CUDA Graph Runner |
+| Draft Extend CG | `python/sglang/srt/speculative/eagle_draft_extend_cuda_graph_runner.py` | 493 | Draft Extend CUDA Graph Runner |
 | **模型** | | | |
-| EAGLE3 模型 | `models/llama_eagle3.py` | — | EAGLE3 Draft 模型结构 |
+| EAGLE3 模型 | `python/sglang/srt/models/llama_eagle3.py` | — | EAGLE3 Draft 模型结构 |
 
 ---
 
 ## 14. Standalone Worker V2
 
-**文件**: `srt/speculative/standalone_worker_v2.py`（185 行）
+**文件**: `python/sglang/srt/speculative/standalone_worker_v2.py`（185 行）
 
 继承 `EagleDraftWorker`（而非 `EAGLEWorker`），不共享 embeddings/lm_head，适用于 draft 模型与 target 模型架构差异较大的场景。
 
@@ -1167,8 +1179,21 @@ python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct
 
 | 文件 | 行数 | 说明 |
 |------|------|------|
-| `multi_layer_eagle_draft_extend_cuda_graph_runner.py` | 661 | 多层 EAGLE Draft Extend CUDA Graph Runner |
-| `multi_layer_eagle_utils.py` | 350 | 多层 EAGLE 工具函数 |
-| `multi_layer_eagle_worker_v2.py` | 721 | 多层 EAGLE Worker V2 |
-| `eagle_info_v2.py` | 489 | EAGLE V2 信息结构 |
-| `draft_utils.py` | 249 | Draft 工具函数 |
+| `python/sglang/srt/speculative/multi_layer_eagle_draft_extend_cuda_graph_runner.py` | 661 | 多层 EAGLE Draft Extend CUDA Graph Runner |
+| `python/sglang/srt/speculative/multi_layer_eagle_utils.py` | 350 | 多层 EAGLE 工具函数 |
+| `python/sglang/srt/speculative/multi_layer_eagle_worker_v2.py` | 721 | 多层 EAGLE Worker V2 |
+| `python/sglang/srt/speculative/eagle_info_v2.py` | 489 | EAGLE V2 信息结构 |
+| `python/sglang/srt/speculative/draft_utils.py` | 249 | Draft 工具函数 |
+
+## 与其他章节关系
+- 构建在 `03/08/19`。
+
+
+## 最小可验证实验
+- 固定模型和负载，仅切换本章机制开关。
+- 记录 TTFT、TPOT、吞吐、显存峰值与回退率。
+- 总结收益场景、退化场景、推荐默认值。
+
+
+## 常见误解
+- 投机解码总能带来加速。

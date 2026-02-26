@@ -4,6 +4,18 @@
 >
 > **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存 + EPLB + MTP + 线性注意力
 
+## 本章定位
+- 主题范围: LoRA 注册、加载与调度约束。
+
+## 设计 Why（为什么这么设计）
+- LoRA 在多租户场景需平衡动态加载、隔离性和显存效率。
+- 核心取舍: 吞吐 vs 时延、显存 vs 计算、通用性 vs 特化。
+
+## 阅读建议（进阶）
+1. 先抓目标函数和边界条件，再读具体实现。
+2. 先看调用链和状态变化，再看局部优化细节。
+3. 源码锚点以“路径 + 类/函数”为主，避免依赖易漂移行号。
+
 ## 1. 概览
 
 ### 1.1 LoRA 原理
@@ -48,14 +60,14 @@ flowchart TD
 
 | 文件 | 说明 |
 |------|------|
-| `srt/lora/lora_registry.py` | LoRARef + LoRARegistry (请求路由) |
-| `srt/lora/lora_config.py` | LoRAConfig (adapter_config.json 解析) |
-| `srt/lora/lora.py` | LoRALayer + LoRAAdapter (权重容器) |
-| `srt/lora/lora_manager.py` | LoRAManager (核心管理器) |
-| `srt/lora/mem_pool.py` | LoRAMemoryPool (GPU 内存管理) |
-| `srt/lora/layers.py` | BaseLayerWithLoRA 及各变体 (模块替换) |
+| `python/sglang/srt/lora/lora_registry.py` | LoRARef + LoRARegistry (请求路由) |
+| `python/sglang/srt/lora/lora_config.py` | LoRAConfig (adapter_config.json 解析) |
+| `python/sglang/srt/lora/lora.py` | LoRALayer + LoRAAdapter (权重容器) |
+| `python/sglang/srt/lora/lora_manager.py` | LoRAManager (核心管理器) |
+| `python/sglang/srt/lora/mem_pool.py` | LoRAMemoryPool (GPU 内存管理) |
+| `python/sglang/srt/lora/layers.py` | BaseLayerWithLoRA 及各变体 (模块替换) |
 | `srt/lora/backend/` | 各后端实现 (Triton, Chunked, Torch, Ascend) |
-| `srt/lora/eviction_policy.py` | LRU/FIFO 驱逐策略 |
+| `python/sglang/srt/lora/eviction_policy.py` | LRU/FIFO 驱逐策略 |
 
 ---
 
@@ -63,7 +75,7 @@ flowchart TD
 
 ### 2.1 LoRARef
 
-**文件**: `srt/lora/lora_registry.py:26`
+**文件**: `python/sglang/srt/lora/lora_registry.py`
 
 唯一标识一个 LoRA 适配器的引用记录：
 
@@ -80,7 +92,7 @@ class LoRARef:
 
 ### 2.2 LoRAConfig
 
-**文件**: `srt/lora/lora_config.py:21`
+**文件**: `python/sglang/srt/lora/lora_config.py`
 
 解析 `adapter_config.json`：
 
@@ -97,7 +109,7 @@ class LoRAConfig:
 
 ### 2.3 LoRAAdapter / LoRALayer
 
-**文件**: `srt/lora/lora.py`
+**文件**: `python/sglang/srt/lora/lora.py`
 
 ```python
 class LoRALayer(nn.Module):
@@ -151,7 +163,7 @@ classDiagram
 
 ## 3. LoRARegistry — 请求路由
 
-**文件**: `srt/lora/lora_registry.py:54`
+**文件**: `python/sglang/srt/lora/lora_registry.py`
 
 `LoRARegistry` 运行在 **TokenizerManager 进程**中，是所有可用 LoRA 适配器的单一数据源。
 
@@ -210,7 +222,7 @@ await registry.wait_for_unload(lora_id)  # 等待所有请求完成
 
 ## 4. LoRAManager — 权重管理
 
-**文件**: `srt/lora/lora_manager.py:50`
+**文件**: `python/sglang/srt/lora/lora_manager.py`
 
 `LoRAManager` 运行在 **Scheduler 进程**中，负责管理 LoRA 权重的加载、缓存和批次准备。
 
@@ -287,7 +299,7 @@ def prepare_lora_batch(self, forward_batch: ForwardBatch):
 
 ## 5. LoRAMemoryPool — GPU 内存管理
 
-**文件**: `srt/lora/mem_pool.py:46`
+**文件**: `python/sglang/srt/lora/mem_pool.py`
 
 ### 5.1 Buffer 结构
 
@@ -369,7 +381,7 @@ if tp_size > 1 and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES:
 
 ## 6. LoRA Layer 实现
 
-**文件**: `srt/lora/layers.py`
+**文件**: `python/sglang/srt/lora/layers.py`
 
 ### 6.1 BaseLayerWithLoRA
 
@@ -465,18 +477,18 @@ flowchart LR
 
 | 后端 | 文件 | 说明 |
 |------|------|------|
-| **Triton** (`triton`) | `triton_backend.py` | 默认后端，Triton SGEMM 内核 |
-| **Chunked SGMV** (`csgmv`) | `chunked_backend.py` | 分块 SGMV，优化大批量 |
-| **Torch Native** (`torch_native`) | `torch_backend.py` | 纯 PyTorch 实现，作为 fallback |
-| **Ascend** (`ascend`) | `ascend_backend.py` | 华为 NPU 后端 |
+| **Triton** (`triton`) | `python/sglang/srt/layers/attention/triton_backend.py` | 默认后端，Triton SGEMM 内核 |
+| **Chunked SGMV** (`csgmv`) | `python/sglang/srt/lora/backend/chunked_backend.py` | 分块 SGMV，优化大批量 |
+| **Torch Native** (`torch_native`) | `python/sglang/srt/lora/backend/torch_backend.py` | 纯 PyTorch 实现，作为 fallback |
+| **Ascend** (`ascend`) | `python/sglang/srt/lora/backend/ascend_backend.py` | 华为 NPU 后端 |
 | **FlashInfer** (`flashinfer`) | — | **已废弃** |
 
-完整的后端注册表（`lora/backend/lora_registry.py`）：
+完整的后端注册表（`python/sglang/srt/lora/backend/lora_registry.py`）：
 
 后端注册改为 **装饰器模式**，通过 `@register_lora_backend(name)` 注册工厂函数：
 
 ```python
-# lora/backend/lora_registry.py
+- 源码锚点: `python/sglang/srt/lora/backend/lora_registry.py`
 LORA_SUPPORTED_BACKENDS = {}
 
 def register_lora_backend(name):
@@ -530,7 +542,7 @@ LoRA 的核心计算是 **Segment GEMM** (分段矩阵乘法)：批内不同请�
 
 ### 7.3 LoRABatchInfo
 
-**文件**: `srt/lora/utils.py:12`
+**文件**: `python/sglang/srt/lora/utils.py`
 
 `LoRABatchInfo` 是后端执行 Segment GEMM 时的批次描述结构，由 `prepare_lora_batch` 构建：
 
@@ -555,7 +567,7 @@ class LoRABatchInfo:
 
 ## 8. Scheduler 集成
 
-**文件**: `srt/managers/scheduler.py`
+**文件**: `python/sglang/srt/managers/scheduler.py`
 
 ### 8.1 调度约束
 
@@ -600,7 +612,7 @@ req = Req(
 
 ### 8.4 validate_new_adapter 验证逻辑
 
-**文件**: `srt/lora/lora_manager.py:150-184`
+**文件**: `python/sglang/srt/lora/lora_manager.py`
 
 运行时动态加载 adapter 时，`validate_new_adapter` 执行 3 步验证，作为安全守卫防止无效或冲突的 adapter 被加载：
 
@@ -775,7 +787,7 @@ sequenceDiagram
 
 ## 12. LoRA Overlap Loader
 
-**文件**: `srt/lora/lora_overlap_loader.py`
+**文件**: `python/sglang/srt/lora/lora_overlap_loader.py`
 
 LoRA Overlap Loader 实现了 LoRA 权重的**异步重叠加载**机制：在模型推理的同时，利用独立的 CUDA Stream 异步加载下一个 LoRA 权重到 GPU 内存池，减少权重切换的延迟。
 
@@ -835,7 +847,7 @@ class LoRAOverlapLoadStatus(Enum):
 `LoRAManager` 通过 `enable_lora_overlap_loading` 参数控制是否启用重叠加载：
 
 ```python
-# lora_manager.py
+- 源码锚点: `python/sglang/srt/lora/lora_manager.py`
 self.enable_lora_overlap_loading = server_args.enable_lora_overlap_loading
 
 # 启用时，LoRA 权重在 CPU 上 pin memory 以加速 H2D 传输
@@ -849,18 +861,18 @@ if self.enable_lora_overlap_loading:
 
 **文件**: `srt/lora/backend/`
 
-backend 目录经过重构，将后端注册逻辑独立为 `lora_registry.py`：
+backend 目录经过重构，将后端注册逻辑独立为 `python/sglang/srt/lora/lora_registry.py`：
 
 | 文件 | 说明 |
 |------|------|
-| `base_backend.py` | `BaseLoRABackend` 抽象基类 |
-| `triton_backend.py` | Triton SGEMM 后端 (默认) |
-| `chunked_backend.py` | Chunked SGMV 后端 |
-| `torch_backend.py` | 纯 PyTorch fallback |
-| `ascend_backend.py` | 华为 NPU 后端 |
-| `lora_registry.py` | 后端注册表 + 工厂函数 |
+| `python/sglang/srt/lora/backend/base_backend.py` | `BaseLoRABackend` 抽象基类 |
+| `python/sglang/srt/layers/attention/triton_backend.py` | Triton SGEMM 后端 (默认) |
+| `python/sglang/srt/lora/backend/chunked_backend.py` | Chunked SGMV 后端 |
+| `python/sglang/srt/lora/backend/torch_backend.py` | 纯 PyTorch fallback |
+| `python/sglang/srt/lora/backend/ascend_backend.py` | 华为 NPU 后端 |
+| `python/sglang/srt/lora/lora_registry.py` | 后端注册表 + 工厂函数 |
 
-`lora_registry.py` 的装饰器注册模式使得添加新后端只需一个 `@register_lora_backend("name")` 装饰器，无需修改任何已有代码。
+`python/sglang/srt/lora/lora_registry.py` 的装饰器注册模式使得添加新后端只需一个 `@register_lora_backend("name")` 装饰器，无需修改任何已有代码。
 
 ---
 
@@ -868,9 +880,9 @@ backend 目录经过重构，将后端注册逻辑独立为 `lora_registry.py`�
 
 ### 14.1 eviction_policy.py 重构
 
-**文件**: `srt/lora/eviction_policy.py`
+**文件**: `python/sglang/srt/lora/eviction_policy.py`
 
-驱逐策略从 `mem_pool.py` 中独立为单独模块，采用策略模式：
+驱逐策略从 `python/sglang/srt/lora/mem_pool.py` 中独立为单独模块，采用策略模式：
 
 ```python
 class EvictionPolicy(ABC):
@@ -904,3 +916,16 @@ def get_eviction_policy(policy_name: str) -> EvictionPolicy:
 ### 14.3 lora_registry.py 更新
 
 `LoRARef` 新增 `__post_init__` 验证和 `__str__` 格式化方法，增强了数据完整性检查。
+
+## 与其他章节关系
+- 与 `03/06/07/08` 强耦合。
+
+
+## 最小可验证实验
+- 固定模型和负载，仅切换本章机制开关。
+- 记录 TTFT、TPOT、吞吐、显存峰值与回退率。
+- 总结收益场景、退化场景、推荐默认值。
+
+
+## 常见误解
+- LoRA 只是线性层增量，不涉及系统调度。

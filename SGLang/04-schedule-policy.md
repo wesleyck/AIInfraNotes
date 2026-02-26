@@ -4,9 +4,21 @@
 >
 > **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存 + EPLB + MTP + 线性注意力
 
+## 本章定位
+- 主题范围: 调度策略与 PrefillAdder 决策。
+
+## 设计 Why（为什么这么设计）
+- 策略层独立出来，便于在不同目标函数下替换排序与准入逻辑。
+- 核心取舍: 吞吐 vs 时延、显存 vs 计算、通用性 vs 特化。
+
+## 阅读建议（进阶）
+1. 先抓目标函数和边界条件，再读具体实现。
+2. 先看调用链和状态变化，再看局部优化细节。
+3. 源码锚点以“路径 + 类/函数”为主，避免依赖易漂移行号。
+
 ## 1. 调度策略概览
 
-**文件**: `srt/managers/schedule_policy.py`
+**文件**: `python/sglang/srt/managers/schedule_policy.py`
 
 调度策略决定了 waiting_queue 中请求的执行顺序，直接影响缓存命中率和系统吞吐量。
 
@@ -41,7 +53,7 @@ flowchart TB
 
 ## 2. SchedulePolicy 类
 
-**文件**: `schedule_policy.py:93`
+**文件**: `python/sglang/srt/managers/schedule_policy.py`
 
 ### 2.1 初始化
 
@@ -245,7 +257,7 @@ flowchart TB
 
 ## 6. PrefillAdder 详解
 
-**文件**: `schedule_policy.py:372`
+**文件**: `python/sglang/srt/managers/schedule_policy.py`
 
 PrefillAdder 负责从 waiting_queue 选择请求构建 prefill 批次。
 
@@ -295,7 +307,7 @@ flowchart TB
 **rem_total_token_offset 精确公式**:
 
 ```python
-# schedule_policy.py PrefillAdder.__init__
+- 源码锚点: `python/sglang/srt/managers/schedule_policy.py`
 rem_total_token_offset = 0
 for req in running_batch.reqs:
     rem_total_token_offset += min(
@@ -331,7 +343,7 @@ flowchart TB
 
 ### 6.4 _lock_node 与 Hierarchical Cache
 
-#### `_lock_node` (schedule_policy.py:619)
+#### `_lock_node` (schedule_policy.py)
 
 `_lock_node` 是一个 **context manager**，用于在 `add_one_req` 期间锁定 RadixCache 节点，防止被缓存驱逐策略淘汰：
 
@@ -355,7 +367,7 @@ def _lock_node(self, last_node: TreeNode):
 
 **为什么需要锁**: `add_one_req` 分两步检查预算（锁前粗检查 + 锁内精确检查），获取锁后 `rem_total_tokens` 可能已改变（因为 `inc_lock_ref` 会将节点标记为不可驱逐），需要重新检查。
 
-#### Hierarchical Cache: `init_load_back` (schedule_policy.py:606)
+#### Hierarchical Cache: `init_load_back` (schedule_policy.py)
 
 当启用 `enable_hicache_storage` 且请求的 `host_hit_length > 0` 时，说明在 host (CPU/SSD) 上有额外的缓存命中，需要加载回 GPU：
 
@@ -427,7 +439,7 @@ if truncation_align_size is not None:
 
 ## 8. 优先级抢占 (Priority Preemption)
 
-**文件**: `schedule_policy.py:829`
+**文件**: `python/sglang/srt/managers/schedule_policy.py`
 
 ### 8.1 preempt_to_schedule 流程
 
@@ -527,7 +539,7 @@ total_tokens = req.extend_input_len + min(
 
 ## 13. PrefillDelayer 与调度策略的协作
 
-在 DP Attention 场景下，`PrefillDelayer`（`srt/managers/prefill_delayer.py`）通过 `PrefillDelayerSinglePassExecutor` 包装后传入 `PrefillAdder`，在 `add_one_req()` 内部进行协商（`schedule_policy.py` L769-774），决定是否允许本轮 prefill。
+在 DP Attention 场景下，`PrefillDelayer`（`python/sglang/srt/managers/prefill_delayer.py`）通过 `PrefillDelayerSinglePassExecutor` 包装后传入 `PrefillAdder`，在 `add_one_req()` 内部进行协商（`python/sglang/srt/managers/schedule_policy.py` L769-774），决定是否允许本轮 prefill。
 
 `SinglePassExecutor` 保证每个 forward pass 只执行一次分布式协商（`all_gather`），即使 `add_one_req` 被 waiting_queue 中的多个请求反复调用。首次调用 `negotiate_should_allow_prefill()` 时执行实际协商并缓存结果，后续调用直接返回缓存值。
 
@@ -545,3 +557,16 @@ Llama4、Step3p5 等模型包含 SWA (Sliding Window Attention) 层，调度策�
 - **05**: Chunked Prefill 分块预填充 (chunked_prefill.md)
 - **06**: KV Cache 内存池设计 (memory_pool.py)
 - **07**: RadixCache 前缀缓存实现 (radix_cache.py)
+
+## 与其他章节关系
+- 是 `03` 的策略补充。
+
+
+## 最小可验证实验
+- 固定模型和负载，仅切换本章机制开关。
+- 记录 TTFT、TPOT、吞吐、显存峰值与回退率。
+- 总结收益场景、退化场景、推荐默认值。
+
+
+## 常见误解
+- 优先级分数高就一定应该先执行。

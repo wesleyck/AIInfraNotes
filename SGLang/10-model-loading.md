@@ -1,5 +1,17 @@
 # 10. 模型加载 (Model Loading)
 
+## 本章定位
+- 主题范围: 模型发现、构建、权重加载。
+
+## 设计 Why（为什么这么设计）
+- 加载链路决定模型可用性与后续执行稳定性。
+- 核心取舍: 吞吐 vs 时延、显存 vs 计算、通用性 vs 特化。
+
+## 阅读建议（进阶）
+1. 先抓目标函数和边界条件，再读具体实现。
+2. 先看调用链和状态变化，再看局部优化细节。
+3. 源码锚点以“路径 + 类/函数”为主，避免依赖易漂移行号。
+
 ## 1. 概述：模型加载要解决什么问题
 
 模型加载系统解决三个核心任务：
@@ -50,35 +62,35 @@
 
 | 层级 | 调用 | 位置 | 职责 |
 |------|------|------|------|
-| 1 | `Scheduler.init_model_worker()` | `scheduler.py:563` | 创建 Worker 进程/线程 |
-| 2 | `TpModelWorker.__init__()` | `tp_worker.py:209` | 构造 `ModelConfig`，持有一个或多个 `ModelRunner`（MTP/EAGLE 会有列表） |
-| 3 | `ModelRunner.__init__()` | `model_runner.py:281` | 保存配置，不做重活 |
-| 4 | `ModelRunner.init_torch_distributed()` | `model_runner.py:729` | 初始化 TP/PP/EP 分布式通信组 |
-| 5 | `initialize_model_parallel(...)` | `parallel_state.py:1595` | 建立 TP/PP/EP 组——**必须在 load_model 之前**，因为并行层构造时需要 rank/size |
-| 6 | `ModelRunner.load_model()` | `model_runner.py:895` | 5 阶段加载（见 §2.2） |
-| 7 | `get_model_loader(load_config)` | `loader.py:2718` | 按 `LoadFormat` 分发到具体加载器 |
-| 8 | `loader.load_model(...)` | 如 `loader.py:653` | 构造模型 + 加载权重 + 量化后处理 |
+| 1 | `Scheduler.init_model_worker()` | `python/sglang/srt/managers/scheduler.py` | 创建 Worker 进程/线程 |
+| 2 | `TpModelWorker.__init__()` | `python/sglang/srt/managers/tp_worker.py` | 构造 `ModelConfig`，持有一个或多个 `ModelRunner`（MTP/EAGLE 会有列表） |
+| 3 | `ModelRunner.__init__()` | `python/sglang/srt/model_executor/model_runner.py` | 保存配置，不做重活 |
+| 4 | `ModelRunner.init_torch_distributed()` | `python/sglang/srt/model_executor/model_runner.py` | 初始化 TP/PP/EP 分布式通信组 |
+| 5 | `initialize_model_parallel(...)` | `python/sglang/srt/distributed/parallel_state.py` | 建立 TP/PP/EP 组——**必须在 load_model 之前**，因为并行层构造时需要 rank/size |
+| 6 | `ModelRunner.load_model()` | `python/sglang/srt/model_executor/model_runner.py` | 5 阶段加载（见 §2.2） |
+| 7 | `get_model_loader(load_config)` | `python/sglang/srt/model_loader/loader.py` | 按 `LoadFormat` 分发到具体加载器 |
+| 8 | `loader.load_model(...)` | 如 `python/sglang/srt/model_loader/loader.py` | 构造模型 + 加载权重 + 量化后处理 |
 
 ### 2.2 `ModelRunner.load_model()` 的 5 个阶段
 
-`model_runner.py:895`，约 190 行，远不止"调 loader"那么简单：
+`python/sglang/srt/model_executor/model_runner.py`，约 190 行，远不止"调 loader"那么简单：
 
-**Stage A: 前置检查 (L895-915)**
+**Stage A: 前置检查 **
 - 记录加载前可用 GPU 内存
 - `torch.set_num_threads(1)` — 限制 PyTorch CPU 计算线程数（BLAS/OpenMP），避免与 I/O 线程竞争
 - 检查 CUDA compute capability，低于 sm80 时自动降级 dtype 到 `float16`；低于 sm75 直接报错
 - `set_cuda_arch()` 设置 CUDA 架构信息
 
 > **线程数配置说明**：SGLang 中有两个不同的线程数设置：
-> - `torch.set_num_threads(1)` (`model_runner.py:902-904`)：控制 PyTorch CPU 计算线程（BLAS/OpenMP），设为 1 防止多线程 BLAS 运算与加载 I/O 线程争抢 CPU
-> - `DEFAULT_NUM_THREADS = 8` (`loader.py:306`)：`DefaultModelLoader` 的类属性，多线程权重加载时 `ThreadPoolExecutor` 的默认线程池大小，用于并行读取多个 shard 文件
+> - `torch.set_num_threads(1)` (`python/sglang/srt/model_executor/model_runner.py`)：控制 PyTorch CPU 计算线程（BLAS/OpenMP），设为 1 防止多线程 BLAS 运算与加载 I/O 线程争抢 CPU
+> - `DEFAULT_NUM_THREADS = 8` (`python/sglang/srt/model_loader/loader.py`)：`DefaultModelLoader` 的类属性，多线程权重加载时 `ThreadPoolExecutor` 的默认线程池大小，用于并行读取多个 shard 文件
 
-**Stage B: 构建 LoadConfig (L917-945)**
+**Stage B: 构建 LoadConfig **
 - 构建 `ModelOptConfig`（量化相关配置）
 - 组装 `LoadConfig` dataclass，注入 `load_format`、`download_dir`、`tp_rank`、`draft_model_idx`、`modelopt_config`、`rl_quant_profile` 等
 - CPU 设备场景下调整 unaligned CPU TP 配置
 
-**Stage C: 获取加载器并执行 (L965-988)**
+**Stage C: 获取加载器并执行 **
 - `monkey_patch_vllm_parallel_state()` 兼容 vLLM 并行状态
 - `memory_saver_adapter.region()` 包裹加载过程，可选 CPU 权重备份（draft worker 可独立配置）
 - `get_model_loader(load_config, model_config)` → `loader.load_model(...)` 执行核心加载
@@ -87,19 +99,19 @@
 **Stage D: 核心加载（在 loader 内部）**
 - 见 §3 模型发现与构造、§4 权重物化
 
-**Stage E: 后处理 (L990-1082)**
+**Stage E: 后处理 **
 - FP8 KV cache scale 加载（`quantization_param_path` 指定时）
 - 滑动窗口大小检测（支持 SWA hybrid、attention_chunk_size 等多种来源）
 - 记录权重 GPU 内存占用
 - **RoPE 缓存预扩展**（见下方详解）
 - **屏障同步**：`dist.monitored_barrier(...)` 确保所有 TP rank 都完成加载（Mooncake 后端使用 `dist.barrier` 替代）
 
-**Stage E 详解: RoPE 缓存预扩展** (`model_runner.py:1058-1064`)
+**Stage E 详解: RoPE 缓存预扩展** (`python/sglang/srt/model_executor/model_runner.py`)
 
-模型加载完成后、CUDA Graph capture 之前，调用 `reserve_rope_cache_for_long_sequences()` (`utils/common.py:4008`) 预扩展所有 RoPE 层的 cos/sin cache：
+模型加载完成后、CUDA Graph capture 之前，调用 `reserve_rope_cache_for_long_sequences()` (`python/sglang/srt/utils/common.py`) 预扩展所有 RoPE 层的 cos/sin cache：
 
 ```python
-# utils/common.py:4008-4045
+- 源码锚点: `python/sglang/srt/utils/common.py`
 def reserve_rope_cache_for_long_sequences(model, server_args, model_config, logger=None):
     SAFETY_FACTOR = envs.SGLANG_SPEC_EXPANSION_SAFETY_FACTOR.get()
     MARGIN = envs.SGLANG_ROPE_CACHE_SAFETY_MARGIN.get()
@@ -138,7 +150,7 @@ def reserve_rope_cache_for_long_sequences(model, server_args, model_config, logg
 
 ### 2.3 关键配置类
 
-**`LoadConfig`** (`load_config.py:37`)：加载配置 dataclass
+**`LoadConfig`** (`python/sglang/srt/configs/load_config.py`)：加载配置 dataclass
 
 核心字段：
 - `load_format: LoadFormat` — 加载格式枚举
@@ -149,7 +161,7 @@ def reserve_rope_cache_for_long_sequences(model, server_args, model_config, logg
 - `modelopt_config` — ModelOpt 量化配置
 - `rl_quant_profile` — RL 量化 profile 路径
 
-**`BaseModelLoader`** (`loader.py:280`)：加载器抽象基类
+**`BaseModelLoader`** (`python/sglang/srt/model_loader/loader.py`)：加载器抽象基类
 
 ```python
 class BaseModelLoader(ABC):
@@ -169,10 +181,10 @@ class BaseModelLoader(ABC):
 `ModelRegistry` 是单例 `@dataclass`，在导入时扫描 `sglang/srt/models/` 下所有 `.py` 文件。每个模型文件通过 `EntryClass` 变量注册：
 
 ```python
-# 单个类 -- qwen3.py:587
+# 单个类 -- qwen3.py
 EntryClass = Qwen3ForCausalLM
 
-# 多个架构共享同一实现 -- llama.py:758
+# 多个架构共享同一实现 -- llama.py
 EntryClass = [LlamaForCausalLM, Phi3ForCausalLM, InternLM3ForCausalLM]
 ```
 
@@ -180,7 +192,7 @@ EntryClass = [LlamaForCausalLM, Phi3ForCausalLM, InternLM3ForCausalLM]
 
 ### 3.2 从 HF `architectures` 到 SGLang 类
 
-`python/sglang/srt/model_loader/utils.py:89`
+`python/sglang/srt/model_loader/utils.py`
 
 `get_model_architecture()` 的完整决策路径：
 
@@ -216,13 +228,13 @@ hf_config.architectures (如 ["Qwen3VLForConditionalGeneration"])
 
 ### 3.4 `_CONFIG_REGISTRY`: 自定义 HF 配置注册
 
-`python/sglang/srt/utils/hf_transformers_utils.py:80-112`
+`python/sglang/srt/utils/hf_transformers_utils.py`
 
 对于 HuggingFace 尚未合入的新模型，SGLang 维护内部配置注册表 `_CONFIG_REGISTRY`（约 20 种模型类型），通过 `AutoConfig.register()` 注册到 HF 自动检测系统，使 `AutoConfig.from_pretrained()` 能正确识别它们。
 
 ### 3.5 `_initialize_model()` 详解
 
-`python/sglang/srt/model_loader/loader.py:257`
+`python/sglang/srt/model_loader/loader.py`
 
 这是一个关键的独立函数（非 Loader 方法），负责从配置到可加载权重的 `nn.Module` 的全部构造：
 
@@ -248,7 +260,7 @@ def _initialize_model(model_config, load_config, quant_config=None) -> nn.Module
 **为什么参数直接在 GPU 上？** 调用方使用 `with target_device:` 上下文：
 
 ```python
-# loader.py:669-675
+- 源码锚点: `python/sglang/srt/model_loader/loader.py`
 with set_default_torch_dtype(model_config.dtype):
     with target_device:                           # ← PyTorch device context
         model = _initialize_model(
@@ -307,7 +319,7 @@ SGLang 提供多种权重迭代器，都是 Python generator，yield `(name, ten
 
 > **为什么有这么多迭代器？** 不同硬件和部署场景对 I/O 有不同需求：标准 NVMe 用 mmap 串行即可；大模型多 shard 文件时多线程并行读取能显著加速；有 GPU Direct Storage 硬件时可绕过 CPU 直接读到 GPU；GGUF/NPCACHE 是不同的权重序列化格式。
 
-迭代器选择逻辑在 `_get_weights_iterator()` (`loader.py:474`)：
+迭代器选择逻辑在 `_get_weights_iterator()` (`python/sglang/srt/model_loader/loader.py`)：
 
 ```
 LoadFormat.NPCACHE？
@@ -321,7 +333,7 @@ safetensors 文件？
     └─ 默认 → pt_weights_iterator
 ```
 
-**`safetensors_weights_iterator` 的 yield 机制**（`weight_utils.py:713`）：
+**`safetensors_weights_iterator` 的 yield 机制**（`python/sglang/srt/model_loader/weight_utils.py`）：
 
 ```python
 def safetensors_weights_iterator(hf_weights_files, ..., disable_mmap=False):
@@ -350,7 +362,7 @@ def safetensors_weights_iterator(hf_weights_files, ..., disable_mmap=False):
 
 ### 4.3 `model.load_weights()` 消费端
 
-以 Qwen3 为例（`qwen3.py:481`），`load_weights` 使用 Python 独特的 **for-else** 模式：
+以 Qwen3 为例（`python/sglang/srt/models/qwen3.py`），`load_weights` 使用 Python 独特的 **for-else** 模式：
 
 ```python
 def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
@@ -387,7 +399,7 @@ def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
 
 ### 4.4 `default_weight_loader` — CPU→GPU 的最终一步
 
-`weight_utils.py:1018`
+`python/sglang/srt/model_loader/weight_utils.py`
 
 ```python
 def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
@@ -409,7 +421,7 @@ def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> N
 
 ### 4.5 `WeightsMapper` 名称映射
 
-`python/sglang/srt/models/utils.py:43`
+`python/sglang/srt/models/utils.py`
 
 在迭代器和 `load_weights` 之间，部分模型（主要是 Qwen VL 系列）通过 `WeightsMapper` 做 HF → SGLang 命名转换：
 
@@ -429,7 +441,7 @@ hf_to_sglang_mapper = WeightsMapper(
 
 ### 4.6 `_get_all_weights` — primary + secondary
 
-`loader.py:563`
+`python/sglang/srt/model_loader/loader.py`
 
 ```python
 def _get_all_weights(self, model_config, model):
@@ -468,14 +480,14 @@ def _get_all_weights(self, model_config, model):
 | 场景 | 权重文件内容 | 加载时 | 后处理时 |
 |------|------------|-------|---------|
 | 预量化 (GPTQ/AWQ/W8A8) | 已打包的 int/fp8 权重 + scale | 直接加载打包格式 | Marlin repacking、转置等 |
-| 在线量化 (FP8 dynamic) | 正常 float 权重 | 正常加载 float | `per_channel_quant_fp8()` 等 |
+| 在线量化 (FP8 dynamic) | 正常 float 权重 | 正常加载 float | `per_token_group_quant_fp8()` / `sgl_per_tensor_quant_fp8()` 等 |
 
 ### 5.2 量化配置检测
 
-`_get_quantization_config()` (`loader.py:192`):
+`_get_quantization_config()` (`python/sglang/srt/model_loader/loader.py`):
 
 1. 从 `model_config.quantization` 读取量化方法名
-2. `get_quant_config()` (`weight_utils.py:179`) 从 `hf_config.quantization_config` 读取详细配置
+2. `get_quant_config()` (`python/sglang/srt/model_loader/weight_utils.py`) 从 `hf_config.quantization_config` 读取详细配置
 3. 检查设备 compute capability 是否满足量化方法的最低要求
 4. 检查 dtype 兼容性
 
@@ -483,7 +495,7 @@ def _get_all_weights(self, model_config, model):
 
 ### 5.3 `process_weights_after_loading` 后处理
 
-触发点在 `DefaultModelLoader.load_weights_and_postprocess()` (`loader.py:685`):
+触发点在 `DefaultModelLoader.load_weights_and_postprocess()` (`python/sglang/srt/model_loader/loader.py`):
 
 ```python
 model.load_weights(weights)                           # 先加载权重
@@ -509,7 +521,7 @@ for _, module in model.named_modules():
 
 ### 5.4 BitsAndBytes 特殊路径
 
-BitsAndBytes 有专门的 `BitsAndBytesModelLoader` (`loader.py:1486`)，两个关键分支：
+BitsAndBytes 有专门的 `BitsAndBytesModelLoader` (`python/sglang/srt/model_loader/loader.py`)，两个关键分支：
 - **预量化分支**：checkpoint 中已有 quant state（含 nf4/fp4），直接解析
 - **非预量化分支**：先按 TP 切片，再调用 `bitsandbytes` 4bit 量化
 
@@ -543,7 +555,7 @@ Rank 1: safetensors 全量文件 → 迭代器 yield → weight_loader 取 [shar
 | `VocabParallelEmbedding` | 词表维 | mask + all_reduce |
 | `FusedMoE` | EP+MoE-TP | 双层分片 |
 
-**`ColumnParallelLinear.weight_loader`** (`linear.py:370`)：
+**`ColumnParallelLinear.weight_loader`** (`python/sglang/srt/layers/linear.py`)：
 
 ```python
 def weight_loader(self, param, loaded_weight):
@@ -563,7 +575,7 @@ def weight_loader(self, param, loaded_weight):
 - K/V 分片用 `shard_id = tp_rank // num_kv_head_replicas`
 - 每 2 个 rank 共享一份 K/V 分片
 
-**`MergedColumnParallelLinear`** (以 `gate_up_proj` 为例, `linear.py:469`):
+**`MergedColumnParallelLinear`** (以 `gate_up_proj` 为例, `python/sglang/srt/layers/linear.py`):
 
 `output_sizes=[intermediate, intermediate]` 时：
 - `loaded_shard_id=0`（gate）：`shard_offset = 0`, `shard_size = intermediate / tp_size`
@@ -579,22 +591,22 @@ MoE 并行将 TP 组分解为两级：`tp_size = moe_ep_size * moe_tp_size`。
 
 ### 6.3 Pipeline Parallel
 
-**层分配**：`make_layers()` (`utils/common.py:621`) 计算 `start_layer`/`end_layer`，非本 rank 的层用 `PPMissingLayer` 占位。
+**层分配**：`make_layers()` (`python/sglang/srt/utils/common.py`) 计算 `start_layer`/`end_layer`，非本 rank 的层用 `PPMissingLayer` 占位。
 
-**加载时过滤**（`qwen3.py:510`）：
+**加载时过滤**（`python/sglang/srt/models/qwen3.py`）：
 ```python
 layer_id = get_layer_id(name)
 if layer_id < self.model.start_layer or layer_id >= self.model.end_layer:
     continue  # 跳过非本 PP rank 的层
 ```
 
-**`tie_word_embeddings` 跨 PP 处理**（`qwen3.py:501-507`）：
+**`tie_word_embeddings` 跨 PP 处理**（`python/sglang/srt/models/qwen3.py`）：
 - 首 rank：从 weights 中找到 `embed_tokens.weight`
 - 末 rank：用 `embed_tokens.weight` 填充 `lm_head.weight`
 
 ### 6.4 `monkey_patch_vllm_parallel_state`
 
-`model_runner.py:967`
+`python/sglang/srt/model_executor/model_runner.py`
 
 临时替换 vLLM 的并行状态函数为 SGLang 的实现，确保 vLLM 的权重加载代码（SGLang 的 linear.py 等适配自 vLLM）尊重 SGLang 的 TP 配置。加载完成后 `reverse=True` 恢复。
 
@@ -607,13 +619,13 @@ if layer_id < self.model.start_layer or layer_id >= self.model.end_layer:
 Multi-Token Prediction (MTP) / Multi-Layer EAGLE 使用多个草稿层，每个层创建独立的 `ModelRunner`。创建逻辑在 `TpModelWorker` 中分两步：
 
 ```python
-# tp_worker.py:327-347 — 主 ModelRunner（draft_model_idx=0）
+- 源码锚点: `python/sglang/srt/managers/tp_worker.py`
 def _init_model_runner(self):
     self._model_runner = ModelRunner(
         draft_model_idx=0 if self.is_multi_layer_eagle else None, ...
     )
 
-# tp_worker.py:349-373 — 额外草稿层 ModelRunner（仅 multi-layer EAGLE）
+- 源码锚点: `python/sglang/srt/managers/tp_worker.py`
 def _init_multi_layer_eagle_model_runners(self):
     self.model_runner_list.append(self.model_runner)  # 先加入主 runner
     for i in range(1, self.server_args.speculative_num_steps):
@@ -626,14 +638,14 @@ def _init_multi_layer_eagle_model_runners(self):
 
 ### 7.2 权重过滤机制
 
-`DefaultModelLoader._filter_mtp_weights()` (`loader.py:545-561`)
+`DefaultModelLoader._filter_mtp_weights()` (`python/sglang/srt/model_loader/loader.py`)
 
 checkpoint 中 MTP 权重的命名格式：`model.mtp.layers.<idx>.xxx`
 
-当 `load_config.draft_model_idx` 非空时，在 `_get_weights_iterator()` 末尾（L534-537）触发过滤：
+当 `load_config.draft_model_idx` 非空时，在 `_get_weights_iterator()` 末尾触发过滤：
 
 ```python
-# loader.py:545-561
+- 源码锚点: `python/sglang/srt/model_loader/loader.py`
 _MTP_PATTERN = re.compile(r"model\.mtp\.layers\.(\d+)\.")  # 类属性，预编译
 
 @classmethod
@@ -682,7 +694,7 @@ checkpoint 文件:
 Qwen VL 系列（Qwen2-VL、Qwen2.5-VL、Qwen3.5）需要做 HF → SGLang 命名转换，因为 HF 和 SGLang 的模块层次不同：
 
 ```python
-# qwen2_vl.py:434
+- 源码锚点: `python/sglang/srt/models/qwen2_vl.py`
 hf_to_sglang_mapper = WeightsMapper(
     orig_to_new_substr={"attn.qkv": "attn.qkv_proj"},
     orig_to_new_prefix={
@@ -703,13 +715,13 @@ SGLang 同时维护了两套 CLIP/SigLIP 实现：
 | 版本 | 来源 | 特点 | 使用场景 |
 |------|------|------|---------|
 | HF 原版 | `from transformers import CLIPVisionModel` | 不支持 TP | llava、nvila 等（单卡/不需视觉 TP） |
-| SGLang 重写版 | `sglang/srt/models/clip.py` | `ColumnParallelLinear`/`RowParallelLinear` 替换 `nn.Linear` | gemma3_mm 等需要视觉 TP 时 |
+| SGLang 重写版 | `python/sglang/srt/models/clip.py` | `ColumnParallelLinear`/`RowParallelLinear` 替换 `nn.Linear` | gemma3_mm 等需要视觉 TP 时 |
 
 选择逻辑：需要视觉编码器 TP 分片时用 SGLang 版本，否则用 HF 黑盒版本。
 
 ### 8.4 Processor 直接复用 HF
 
-`python/sglang/srt/utils/hf_transformers_utils.py:637`
+`python/sglang/srt/utils/hf_transformers_utils.py`
 
 多模态模型的 Processor 通过 `AutoProcessor.from_pretrained(...)` 直接复用 HF，少数模型有特殊处理（如 Qwen2-VL 注入默认 `size`）。
 
@@ -717,7 +729,7 @@ SGLang 同时维护了两套 CLIP/SigLIP 实现：
 
 ## 9. 特殊加载器速查
 
-`get_model_loader(...)` 入口：`loader.py:2718`
+`get_model_loader(...)` 入口：`python/sglang/srt/model_loader/loader.py`
 
 | 加载器 | LoadFormat | 核心差异 | 适用场景 |
 |-------|-----------|---------|---------|
@@ -734,7 +746,7 @@ SGLang 同时维护了两套 CLIP/SigLIP 实现：
 
 ### `LayeredModelLoader` 三步机制
 
-`loader.py:702`
+`python/sglang/srt/model_loader/loader.py`
 
 与 `DefaultModelLoader` 的区别在于**逐层物化**，降低峰值内存：
 
@@ -782,7 +794,7 @@ def load_model(self, *, model_config, device_config):
 
 ### 10.2 `TransformersForCausalLM` 桥接器
 
-`python/sglang/srt/models/transformers.py:142`
+`python/sglang/srt/models/transformers.py`
 
 让任何支持 `is_backend_compatible()` 的 HF 模型在 SGLang 中运行：
 
@@ -822,10 +834,10 @@ def load_model(self, *, model_config, device_config):
 
 | 文件 | 行数 | 说明 |
 |------|------|------|
-| `models/qwen3_5.py` | 1345 | Qwen3.5 主模型（Qwen3_5ForCausalLM L651, Qwen3_5MoeForCausalLM L828） |
-| `models/qwen3_5_mtp.py` | 347 | Qwen3.5 MTP 支持 |
-| `models/qwen3_next.py` | 1179 | Qwen3Next 模型 |
-| `models/qwen3_next_mtp.py` | 112 | Qwen3Next MTP 支持 |
+| `python/sglang/srt/models/qwen3_5.py` | 1345 | Qwen3.5 主模型（Qwen3_5ForCausalLM L651, Qwen3_5MoeForCausalLM L828） |
+| `python/sglang/srt/models/qwen3_5_mtp.py` | 347 | Qwen3.5 MTP 支持 |
+| `python/sglang/srt/models/qwen3_next.py` | 1179 | Qwen3Next 模型 |
+| `python/sglang/srt/models/qwen3_next_mtp.py` | 112 | Qwen3Next MTP 支持 |
 
 ### DeepSeek 通用模块
 
@@ -833,10 +845,10 @@ def load_model(self, *, model_config, device_config):
 
 | 文件 | 说明 |
 |------|------|
-| `attention_backend_handler.py` | Attention 后端处理器 |
+| `python/sglang/srt/models/deepseek_common/attention_backend_handler.py` | Attention 后端处理器 |
 | `attention_forward_methods/` | Attention 前向方法集合 |
-| `deepseek_weight_loader.py` | DeepSeek 权重加载器 |
-| `utils.py` | 工具函数 |
+| `python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py` | DeepSeek 权重加载器 |
+| `python/sglang/srt/disaggregation/utils.py` | 工具函数 |
 
 ### Checkpoint Engine
 
@@ -844,5 +856,18 @@ def load_model(self, *, model_config, device_config):
 
 | 文件 | 说明 |
 |------|------|
-| `checkpoint_engine_worker.py` | Checkpoint 引擎 Worker |
-| `update.py` | Checkpoint 更新逻辑 |
+| `python/sglang/srt/checkpoint_engine/checkpoint_engine_worker.py` | Checkpoint 引擎 Worker |
+| `python/sglang/srt/checkpoint_engine/update.py` | Checkpoint 更新逻辑 |
+
+## 与其他章节关系
+- 影响 `08` 可用性与初始化。
+
+
+## 最小可验证实验
+- 固定模型和负载，仅切换本章机制开关。
+- 记录 TTFT、TPOT、吞吐、显存峰值与回退率。
+- 总结收益场景、退化场景、推荐默认值。
+
+
+## 常见误解
+- 模型能加载就能稳定服务。

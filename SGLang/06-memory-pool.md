@@ -4,13 +4,25 @@
 >
 > **启用特性**: PD 分离 + Chunked Prefill + ViT DP + Overlap Schedule + 多模态缓存 + EPLB + MTP + 线性注意力
 
+## 本章定位
+- 主题范围: 内存池与分配器设计。
+
+## 设计 Why（为什么这么设计）
+- 池化与分配器让显存使用可预测，降低碎片和分配抖动。
+- 核心取舍: 吞吐 vs 时延、显存 vs 计算、通用性 vs 特化。
+
+## 阅读建议（进阶）
+1. 先抓目标函数和边界条件，再读具体实现。
+2. 先看调用链和状态变化，再看局部优化细节。
+3. 源码锚点以“路径 + 类/函数”为主，避免依赖易漂移行号。
+
 ## 1. 内存池架构概览
 
 **核心文件**:
-- `srt/mem_cache/memory_pool.py` - GPU 内存池
-- `srt/mem_cache/allocator.py` - 索引分配器
-- `srt/mem_cache/memory_pool_host.py` - Host 内存池
-- `srt/mem_cache/radix_cache.py` - 前缀缓存 (Tree Cache)
+- `python/sglang/srt/mem_cache/memory_pool.py` - GPU 内存池
+- `python/sglang/srt/mem_cache/allocator.py` - 索引分配器
+- `python/sglang/srt/mem_cache/memory_pool_host.py` - Host 内存池
+- `python/sglang/srt/mem_cache/radix_cache.py` - 前缀缓存 (Tree Cache)
 
 ```mermaid
 graph TB
@@ -243,7 +255,7 @@ flowchart TB
 
 ## 2. ReqToTokenPool
 
-**文件**: `memory_pool.py:126`
+**文件**: `python/sglang/srt/mem_cache/memory_pool.py`
 
 管理请求 ID 到 token 位置的映射。每个请求占一行，行内记录该请求各 token 在 KV Cache 中的 slot 索引。
 
@@ -276,13 +288,13 @@ class ReqToTokenPool:
 
 ```mermaid
 flowchart TB
-    KVCache["KVCache - 抽象基类<br/>memory_pool.py:601"]
+    KVCache["KVCache - 抽象基类<br/>memory_pool.py"]
     MHA["MHATokenToKVPool<br/>标准 Multi-Head Attention<br/>L697"]
     MHAFP4["MHATokenToKVPoolFP4<br/>FP4 量化版本<br/>L1040"]
     MLA["MLATokenToKVPool<br/>Multi-head Latent Attention<br/>DeepSeek V2/V3<br/>L1377"]
     MLAFP4["MLATokenToKVPoolFP4<br/>FP4 量化版本<br/>L1601"]
     NSA["NSATokenToKVPool<br/>Native Sparse Attention<br/>DeepSeek V3.2<br/>L1730"]
-    SWA["SWAKVPool<br/>Sliding Window Attention 混合池<br/>swa_memory_pool.py:20"]
+    SWA["SWAKVPool<br/>Sliding Window Attention 混合池<br/>swa_memory_pool.py"]
     Hybrid["HybridLinearKVPool<br/>Mamba/Linear Attention + Attention 混合池<br/>L1183"]
     DS["DoubleSparseTokenToKVPool<br/>稀疏注意力池<br/>L1886"]
 
@@ -529,7 +541,7 @@ flowchart TB
 
 1. **部分页填充**：请求可能上次 prefill 只用了某页的一半，extend 时要先填满这半页（用 `last_loc` 定位）
 2. **跨页边界**：decode 时新增 1 个 token，如果恰好跨页边界就需要分配整页，否则直接 `last_loc+1`
-3. **批量页分配**：多个请求各需要不同数量的新页，用 Triton kernel（`alloc_extend_kernel` `allocator.py:235` / `alloc_decode_kernel` `allocator.py:315`）并行计算每个请求的需求然后一次分配
+3. **批量页分配**：多个请求各需要不同数量的新页，用 Triton kernel（`alloc_extend_kernel` `python/sglang/srt/mem_cache/allocator.py` / `alloc_decode_kernel` `python/sglang/srt/mem_cache/allocator.py`）并行计算每个请求的需求然后一次分配
 
 ```
 page_size=1:  alloc(7) → 拿 7 个 slot，完事
@@ -549,7 +561,7 @@ page_size=4:  extend 场景示例:
 
 > **为什么需要 Triton kernel？**
 >
-> 这不只是"Python 循环慢"的问题。**核心原因是 batch 中每个请求的分配需求都不一样**（有的缺 1 个填满旧页，有的缺 3 个；有的需要 2 个新页，有的只需 0 个）。用 Triton kernel 可以在 GPU 上**并行计算所有请求的需求量**（Part 1/2/3 各需多少 slot），然后通过 `prefix_sum` 一次性从 `free_pages` 中分配，避免逐请求串行处理。`alloc_extend_kernel`（`allocator.py:235`）和 `alloc_decode_kernel`（`allocator.py:315`）都是这个模式。
+> 这不只是"Python 循环慢"的问题。**核心原因是 batch 中每个请求的分配需求都不一样**（有的缺 1 个填满旧页，有的缺 3 个；有的需要 2 个新页，有的只需 0 个）。用 Triton kernel 可以在 GPU 上**并行计算所有请求的需求量**（Part 1/2/3 各需多少 slot），然后通过 `prefix_sum` 一次性从 `free_pages` 中分配，避免逐请求串行处理。`alloc_extend_kernel`（`python/sglang/srt/mem_cache/allocator.py`）和 `alloc_decode_kernel`（`python/sglang/srt/mem_cache/allocator.py`）都是这个模式。
 
 ### 4.3 SWATokenToKVPoolAllocator
 
@@ -587,7 +599,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
 ### 5.1 MambaPool 数据结构
 
-**文件**: `memory_pool.py:186`
+**文件**: `python/sglang/srt/mem_cache/memory_pool.py`
 
 ```python
 class MambaPool:
@@ -638,12 +650,12 @@ SGLang 中 Mamba 状态的 checkpoint 保存由两个参数控制，它们的用
 | 参数 | 值 | 作用域 | 用途 |
 |------|-----|--------|------|
 | `FLA_CHUNK_SIZE` | 64 | **Prefill** | Flash Linear Attention 算法的 chunk 粒度。Prefill 时在每个 chunk 边界（64 的倍数位置）可以产生 Mamba checkpoint。这是**算法层面的最小对齐单位**。 |
-| `mamba_track_interval` | 256 (默认) | **Decode** | Decode 阶段 checkpoint 保存频率。每当 `seq_len % 256 == 0`（`schedule_batch.py:2025`）时触发 checkpoint 保存。**必须是 FLA_CHUNK_SIZE 的整数倍**（256 = 64 × 4）。 |
+| `mamba_track_interval` | 256 (默认) | **Decode** | Decode 阶段 checkpoint 保存频率。每当 `seq_len % 256 == 0`（`python/sglang/srt/managers/schedule_batch.py`）时触发 checkpoint 保存。**必须是 FLA_CHUNK_SIZE 的整数倍**（256 = 64 × 4）。 |
 
 **两者的关系**：
 - `FLA_CHUNK_SIZE` 是底层算法约束，决定 checkpoint 的**最小可能间隔**
 - `mamba_track_interval` 是上层策略选择，决定 Decode 阶段**实际保存间隔**（更大间隔 = 更少 MambaPool 占用，但 prefix miss 时重算代价更大）
-- Prefill 阶段的 checkpoint 位置由 `(extend_input_len // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE` 计算（`schedule_batch.py:1734`）
+- Prefill 阶段的 checkpoint 位置由 `(extend_input_len // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE` 计算（`python/sglang/srt/managers/schedule_batch.py`）
 
 **有效前缀长度** = `min(KV Cache 命中长度, 最近有效的 Mamba Checkpoint 位置)`
 - KV Cache 命中是 per-token 粒度，可以精确到任意位置
@@ -682,7 +694,7 @@ Radix Tree 节点：[tokens 0..229] → 有 KV cache indices
     - tokens 192..279 需要重新跑 Mamba 层
 ```
 
-这就是 `_match_prefix_helper`（`mamba_radix_cache.py:905`）中 `best_value_len` / `best_last_node` 的逻辑：沿着 radix tree 走到最远的 KV 匹配，但只返回到**最深的有 mamba_value 的节点**位置。
+这就是 `_match_prefix_helper`（`python/sglang/srt/mem_cache/mamba_radix_cache.py`）中 `best_value_len` / `best_last_node` 的逻辑：沿着 radix tree 走到最远的 KV 匹配，但只返回到**最深的有 mamba_value 的节点**位置。
 
 #### Mamba Prefix Matching 完整示例
 
@@ -707,7 +719,7 @@ match_prefix 结果:
 
 处理:
   1. COW: 复制 node A 的 mamba state (slot_3) → 请求私有 slot
-     (cow_mamba=True, mamba_radix_cache.py:998)
+     (cow_mamba=True, mamba_radix_cache.py)
   2. Prefill tokens 192..279:
      - Attention 层: tokens 192..279 的 KV 已缓存(复用)，不需要重算
      - Mamba 层: 从 position 192 的 checkpoint 开始，重新跑 tokens 192..279 更新 state
@@ -720,7 +732,7 @@ match_prefix 结果:
 
 1. **存储层面**：完全独立
    - KV cache → `TokenToKVPoolAllocator` + `KVCache` 物理 buffer
-   - Mamba state → `MambaPool`（独立的 slot 池，`memory_pool.py:186`）
+   - Mamba state → `MambaPool`（独立的 slot 池，`python/sglang/srt/mem_cache/memory_pool.py`）
    - 显存预算按比例分配：`mamba_full_memory_ratio = 0.9`（默认 Mamba 占剩余显存的 90%）
 
 2. **逐出层面**：独立的双 LRU 链表
@@ -735,7 +747,7 @@ match_prefix 结果:
 
 当 `mamba_scheduler_strategy == "extra_buffer"` 时，每个请求分配额外的 mamba state buffer 用于交替读写：
 
-> **Ping-pong buffer 数量取决于是否启用投机解码**：非投机解码时分配 **2 个** track buffer（`mamba_ping_pong_track_buffer_size = 2`），投机解码时只分配 **1 个**（`memory_pool.py:453-454`）。
+> **Ping-pong buffer 数量取决于是否启用投机解码**：非投机解码时分配 **2 个** track buffer（`mamba_ping_pong_track_buffer_size = 2`），投机解码时只分配 **1 个**（`python/sglang/srt/mem_cache/memory_pool.py`）。
 
 ```
 Chunk N:   读 buffer[0], 写 buffer[1]
@@ -744,7 +756,7 @@ Chunk N+1: 读 buffer[1], 写 buffer[0]   ← 由 get_mamba_ping_pong_other_idx 
 
 **目的**：支持 chunked prefill 的 overlap schedule。在计算当前 chunk 时，上一个 chunk 的 state 仍然可读（用于 Post Schedule 阶段缓存到 radix tree），不会因写操作被破坏。
 
-相关字段（`schedule_batch.py` Req 类）：
+相关字段（`python/sglang/srt/managers/schedule_batch.py` Req 类）：
 - `mamba_pool_idx`: 在 MambaPool 中的 slot 索引
 - `mamba_ping_pong_track_buffer`: `Tensor[2]` — 两个交替 buffer 的索引
 - `mamba_next_track_idx`: 0 或 1，当前写目标
@@ -777,7 +789,7 @@ Chunk N+1: 读 buffer[1], 写 buffer[0]   ← 由 get_mamba_ping_pong_other_idx 
 
 ## 6. Host 内存池 (Hierarchical Cache)
 
-**文件**: `memory_pool_host.py`
+**文件**: `python/sglang/srt/mem_cache/memory_pool_host.py`
 
 ### 6.1 HostKVCache
 
@@ -901,7 +913,7 @@ model = AutoModelForCausalLM.from_pretrained(...)
 #### KV Cache
 
 ```python
-# memory_pool.py - 启动时预分配
+- 源码锚点: `python/sglang/srt/mem_cache/memory_pool.py`
 self.k_buffer = [torch.zeros((size + page_size, head_num, head_dim), ...) for _ in range(layer_num)]
 self.v_buffer = [torch.zeros((size + page_size, head_num, head_dim), ...) for _ in range(layer_num)]
 ```
@@ -936,7 +948,7 @@ vit_embeddings = vit_model(pixel_values)  # 中间激活
 #### 图片像素到 CUDA
 
 ```python
-# mm_utils.py - 请求处理时
+- 源码锚点: `python/sglang/srt/managers/mm_utils.py`
 pixel_values = pixel_values.to(device)  # 动态拷贝到 GPU
 ```
 
@@ -947,7 +959,7 @@ pixel_values = pixel_values.to(device)  # 动态拷贝到 GPU
 **特点**: 可检测、可恢复
 
 ```python
-# allocator.py - 返回 None 而非触发 CUDA 错误
+- 源码锚点: `python/sglang/srt/mem_cache/allocator.py`
 def alloc(self, need_size: int):
     if need_size > len(self.free_pages):
         return None  # ← 逻辑层面的 "OOM"
@@ -1011,7 +1023,7 @@ flowchart TB
 SGLang 会根据 GPU 型号**自动计算**关键参数，用户通常不需要手动指定：
 
 ```python
-# server_args.py:1020-1063 - 自动计算 mem_fraction_static
+- 源码锚点: `python/sglang/srt/server_args.py`
 
 reserved_mem = 512  # 元数据常量 (MB)
 
@@ -1065,7 +1077,7 @@ mem_fraction_static = (gpu_mem - reserved_mem) / gpu_mem
 多模态模型需要额外降低 `mem_fraction_static`：
 
 ```python
-# server_args.py:5483-5518 - adjust_mem_fraction_for_vlm
+- 源码锚点: `python/sglang/srt/server_args.py`
 
 # 基础降低系数
 base_mem_fraction_reduction_ratio = 0.95
@@ -1149,7 +1161,7 @@ alloc(5):    拿走 [8, 9, 10, 1, 2]                           ← 跨了"原始
 #### 多模态 embedding: 可能有碎片
 
 ```python
-# multimodal_cache.py - 动态分配
+- 源码锚点: `python/sglang/srt/mem_cache/multimodal_cache.py`
 class MultiModalStaticCache:
     def set(self, mm_hash, embedding, ...):
         while self.current_size + data_size > self.max_size:
@@ -1177,7 +1189,7 @@ stats.running_req_count   # 运行请求数
 
 ## 11. SWA 内存池
 
-**文件**: `srt/mem_cache/swa_memory_pool.py` (461行)
+**文件**: `python/sglang/srt/mem_cache/swa_memory_pool.py` (461行)
 
 Llama4、Step3p5 等 SWA 混合架构模型同时包含 Full Attention 层和 SWA (Sliding Window Attention) 层，需要双池架构分别管理两种层的 KV Cache。
 
@@ -1210,16 +1222,16 @@ SWAKVPool (容器)
 
 | 子目录/文件 | 说明 |
 |------------|------|
-| `algorithms/base_algorithm.py` | 稀疏算法基类 |
-| `algorithms/deepseek_nsa.py` | DeepSeek NSA 稀疏算法 |
-| `algorithms/quest_algorithm.py` | Quest 稀疏算法 |
-| `backend/backend_adaptor.py` | 后端适配器 |
-| `core/sparse_coordinator.py` | 稀疏协调器 |
-| `factory.py` | 工厂函数 |
+| `python/sglang/srt/mem_cache/sparsity/algorithms/base_algorithm.py` | 稀疏算法基类 |
+| `python/sglang/srt/mem_cache/sparsity/algorithms/deepseek_nsa.py` | DeepSeek NSA 稀疏算法 |
+| `python/sglang/srt/mem_cache/sparsity/algorithms/quest_algorithm.py` | Quest 稀疏算法 |
+| `python/sglang/srt/mem_cache/sparsity/backend/backend_adaptor.py` | 后端适配器 |
+| `python/sglang/srt/mem_cache/sparsity/core/sparse_coordinator.py` | 稀疏协调器 |
+| `python/sglang/srt/mem_cache/sparsity/factory.py` | 工厂函数 |
 
 ## 13. Mamba/Linear Attention 状态管理
 
-Qwen3.5 的 GatedDeltaNet 层需要 Mamba 状态缓存，由 `MambaPool`（`memory_pool.py:186`）管理。
+Qwen3.5 的 GatedDeltaNet 层需要 Mamba 状态缓存，由 `MambaPool`（`python/sglang/srt/mem_cache/memory_pool.py`）管理。
 
 ### KV Cache 变体总览
 
@@ -1232,11 +1244,11 @@ Qwen3.5 的 GatedDeltaNet 层需要 Mamba 状态缓存，由 `MambaPool`（`memo
 | `MLATokenToKVPoolFP4` | L1601 | FP4 量化 MLA |
 | `NSATokenToKVPool` | L1730 | NSA 模型 |
 | `DoubleSparseTokenToKVPool` | L1886 | 双稀疏模型 |
-| `SWAKVPool` | swa_memory_pool.py:20 | SWA 层专用 |
+| `SWAKVPool` | swa_memory_pool.py | SWA 层专用 |
 
 ## 14. Host 内存池
 
-**文件**: `srt/mem_cache/memory_pool_host.py` (1190行)
+**文件**: `python/sglang/srt/mem_cache/memory_pool_host.py` (1190行)
 
 Host 内存池用于 KV Cache 的 CPU 卸载，支持 PD 分离场景下 Decode 端的 KV Cache 管理。
 
@@ -1252,3 +1264,16 @@ Host 内存池用于 KV Cache 的 CPU 卸载，支持 PD 分离场景下 Decode 
 
 - **07**: RadixCache 前缀缓存 (radix_cache.py)
 - **08**: ModelRunner 与 CUDA Graph
+
+## 与其他章节关系
+- 为 `03/08/14` 提供内存语义。
+
+
+## 最小可验证实验
+- 固定模型和负载，仅切换本章机制开关。
+- 记录 TTFT、TPOT、吞吐、显存峰值与回退率。
+- 总结收益场景、退化场景、推荐默认值。
+
+
+## 常见误解
+- OOM 只与模型权重大小相关。

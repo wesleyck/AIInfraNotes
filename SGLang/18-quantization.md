@@ -4,6 +4,18 @@
 >
 > **核心组件**: FP8/INT8/FP4/Marlin/QServe/GGUF
 
+## 本章定位
+- 主题范围: 量化路径与选择建议。
+
+## 设计 Why（为什么这么设计）
+- 量化是精度、吞吐、显存的工程折中。
+- 核心取舍: 吞吐 vs 时延、显存 vs 计算、通用性 vs 特化。
+
+## 阅读建议（进阶）
+1. 先抓目标函数和边界条件，再读具体实现。
+2. 先看调用链和状态变化，再看局部优化细节。
+3. 源码锚点以“路径 + 类/函数”为主，避免依赖易漂移行号。
+
 ## 1. 概览
 
 SGLang 提供了端到端的量化支持，涵盖了从激活量化、权重量化到 KV Cache 量化的完整链路。
@@ -107,7 +119,7 @@ FP8 是目前推断性能与精度平衡最好的格式，特别是在 H100 (SM9
 
 ### 6.2 核心算子
 ```python
-# gemm.py
+- 源码锚点: `sgl-kernel/python/sgl_kernel/gemm.py`
 sgl_per_token_quant_fp8(input, output_q, output_s)
 sgl_per_tensor_quant_fp8(input, output_q, output_s, is_static)
 sgl_per_token_group_quant_8bit(
@@ -133,7 +145,7 @@ sgl_per_token_group_quant_8bit(
 ### 6.3 FP8/INT8 GEMM 算子
 
 ```python
-# gemm.py — FP8/INT8 矩阵乘法
+- 源码锚点: `sgl-kernel/python/sgl_kernel/gemm.py`
 int8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None)
 fp8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None)
 fp8_blockwise_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype)
@@ -151,11 +163,11 @@ fp8_blockwise_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype)
 Marlin 是针对 4-bit 量化权重的高性能 GEMM 实现，支持 GPTQ 和 AWQ 格式。
 
 ```python
-# gemm.py: gptq_marlin_gemm — 高性能 4-bit GEMM
+- 源码锚点: `sgl-kernel/python/sgl_kernel/gemm.py`
 gptq_marlin_gemm(a, c, b_q_weight, b_scales, global_scale, b_zeros,
                  g_idx, perm, workspace, b_q_type, size_m, size_n, size_k, ...)
 
-# marlin.py: 权重重排 (repack) 函数
+- 源码锚点: `sgl-kernel/python/sgl_kernel/marlin.py`
 gptq_marlin_repack(b_q_weight, perm, size_k, size_n, num_bits)
 awq_marlin_repack(b_q_weight, size_k, size_n, num_bits)
 awq_marlin_moe_repack(b_q_weight, perm, size_k, size_n, num_bits)  # MoE 专用
@@ -168,7 +180,7 @@ awq_marlin_moe_repack(b_q_weight, perm, size_k, size_n, num_bits)  # MoE 专用
 除了 Marlin 优化路径，`sgl-kernel` 还保留了原始 GPTQ kernel：
 
 ```python
-# gemm.py
+- 源码锚点: `sgl-kernel/python/sgl_kernel/gemm.py`
 gptq_gemm(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_g_idx, use_shuffle, bit)
 gptq_shuffle(q_weight, q_perm, bit)  # 权重重排序 (in-place)
 ```
@@ -181,7 +193,7 @@ gptq_shuffle(q_weight, q_perm, bit)  # 权重重排序 (in-place)
 FP4 需要非常精细的缩放策略。SGLang 实现了 `scaled_fp4_quant`，每 16 个元素共享一个缩放因子。
 
 ```python
-# gemm.py: scaled_fp4_quant
+- 源码锚点: `sgl-kernel/python/sgl_kernel/gemm.py`
 output, output_scale = scaled_fp4_quant(input, input_global_scale)
 ```
 - **物理布局**: 缩放因子以特殊的经过混洗 (swizzled) 的布局存储，以匹配硬件 MMA 操作。
@@ -191,7 +203,7 @@ output, output_scale = scaled_fp4_quant(input, input_global_scale)
 除了基础的 `scaled_fp4_quant`，`sgl-kernel` 还提供了面向 MoE 场景的 FP4 分组量化算子：
 
 ```python
-# gemm.py
+- 源码锚点: `sgl-kernel/python/sgl_kernel/gemm.py`
 scaled_fp4_grouped_quant(
     input,                # [M, K] 输入张量
     input_global_scale,   # 全局缩放因子
@@ -201,7 +213,7 @@ scaled_fp4_grouped_quant(
 - **用途**: 对分组后的 MoE 输入执行 FP4 量化，支持 fused/iter masked scaled quant 模式。
 
 ```python
-# gemm.py
+- 源码锚点: `sgl-kernel/python/sgl_kernel/gemm.py`
 silu_and_mul_scaled_fp4_grouped_quant(
     input,                # [M, K] Gate+Up 投影输出
     input_global_scale,   # 全局缩放因子
@@ -211,7 +223,7 @@ silu_and_mul_scaled_fp4_grouped_quant(
 - **用途**: 融合 SiLU+Mul 与 FP4 量化的一体化 kernel (来源: `csrc` L312+)，减少中间显存读写。
 
 ```python
-# gemm.py L452-485
+- 源码锚点: `sgl-kernel/python/sgl_kernel/gemm.py`
 scaled_fp4_experts_quant(
     input,                # [total_tokens, K] 所有专家的打包输入
     input_global_scale,   # 全局缩放因子
@@ -224,14 +236,14 @@ scaled_fp4_experts_quant(
 - **用途**: 按 MoE packed 输入格式执行 FP4 专家量化，直接处理经 `moe_align_block_size` 排列后的 token 布局。
 
 ### 8.3 计算算子
-- `cutlass_scaled_fp4_mm` (`gemm.py`): 标准矩阵乘算法。
-- `cutlass_fp4_group_mm` (`moe.py`): 针对 MoE 场景的 FP4 Blockscaled Group GEMM，详见 17-moe-kernels Section 5.1。
+- `cutlass_scaled_fp4_mm` (`sgl-kernel/python/sgl_kernel/gemm.py`): 标准矩阵乘算法。
+- `cutlass_fp4_group_mm` (`sgl-kernel/python/sgl_kernel/moe.py`): 针对 MoE 场景的 FP4 Blockscaled Group GEMM，详见 17-moe-kernels Section 5.1。
 
 ## 9. DeepSeek-V3 专用 GEMM
 
 DeepSeek-V3 模型由于其独特的 MLA (Multi-head Latent Attention) + MoE 架构，在推理时有专门优化的 GEMM 算子。
 
-**来源**: `gemm.py` L422-585
+**来源**: `sgl-kernel/python/sgl_kernel/gemm.py` L422-585
 
 ```python
 # 批量 FP8 矩阵乘法 (DeepSeek-V3 专用)
@@ -280,7 +292,7 @@ QServe 是一种 W4A8 (4-bit 权重, 8-bit 激活) 的推理算法，`sgl-kernel
 **文件**: `csrc/quantization/gguf/`
 
 ```python
-# quantization/gguf.py
+- 源码锚点: `python/sglang/srt/layers/quantization/gguf.py`
 ggml_dequantize(weight, quant_type, M, N, dtype)    # 反量化: 将 GGUF 低精度权重还原为 FP16/BF16
 ggml_mul_mat_a8(weight, x, quant_type, row)          # 8-bit 激活矩阵乘 (批量)
 ggml_mul_mat_vec_a8(weight, x, quant_type, row)      # 8-bit 激活向量乘 (单 token decode)
@@ -310,3 +322,16 @@ ggml_mul_mat_vec_a8(weight, x, quant_type, row)      # 8-bit 激活向量乘 (�
 ## 13. 下一步
 
 - **19**: 采样与生成控制 (Sampling, Logits Processing)
+
+## 与其他章节关系
+- 影响 `08/15/17` 的精度性能折中。
+
+
+## 最小可验证实验
+- 固定模型和负载，仅切换本章机制开关。
+- 记录 TTFT、TPOT、吞吐、显存峰值与回退率。
+- 总结收益场景、退化场景、推荐默认值。
+
+
+## 常见误解
+- 低比特必然更快。
